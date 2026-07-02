@@ -63,9 +63,9 @@ const char* AP_PASSWORD = "12345678";
 // need a moment to recover before accepting the next request. Adjustable
 // on the Settings page; raise it if parameters right after a fast one
 // start showing errors, lower it for a faster poll cycle.
-#define DEFAULT_SLAVE_RECOVERY_DELAY_MS 20
+#define DEFAULT_SLAVE_RECOVERY_DELAY_MS 100
 #define MIN_SLAVE_RECOVERY_DELAY_MS 0
-#define MAX_SLAVE_RECOVERY_DELAY_MS 5000
+#define MAX_SLAVE_RECOVERY_DELAY_MS 1000
 #define TYPE_SCHEMA_VERSION 4
 
 // ===================== Debug Settings =====================
