@@ -42,8 +42,13 @@
 #include "freertos/semphr.h"
 #include "freertos/queue.h"
 // ===================== WiFi AP Settings =====================
-const char* AP_SSID = "ESP32_Modbus_Setup";
+// AP_SSID is only the fallback/default - the actual name used is
+// deviceConfig.apSsid (or the computed device name if apMatchesDeviceName
+// is set), both user-settable on the Settings page. See getEffectiveApSsid().
+#define DEFAULT_AP_SSID "ESP32ModbusGateWay"
 const char* AP_PASSWORD = "12345678";
+// Max length of the user-provided device-name prefix (see getDeviceName()).
+#define DEVICE_NAME_PREFIX_MAX_LEN 5
 
 // ===================== RS485 Pins =====================
 #define RXD2 D2
@@ -195,6 +200,19 @@ struct UplinkConfig {
 };
 
 UplinkConfig uplinkConfig;
+
+// ===================== Device / AP Identity =====================
+// apSsid: user-settable AP name, used as-is unless apMatchesDeviceName is set.
+// deviceNamePrefix: user-provided prefix (up to 5 chars); combined with the
+// last 5 characters of the MAC to form the device name (see getDeviceName()).
+// Empty prefix means the device name defaults to the full MAC address.
+struct DeviceConfig {
+  String apSsid;
+  String deviceNamePrefix;
+  bool apMatchesDeviceName;
+};
+
+DeviceConfig deviceConfig;
 
 // ===================== Communication Settings =====================
 uint32_t commBaudRate = 9600;
@@ -633,6 +651,35 @@ void loadUplinkConfig() {
   logMessage("========== LOAD TCP CONFIG END ==========");
 }
 
+// ===================== Device / AP Identity Save / Load =====================
+void saveDeviceConfig() {
+  preferences.begin("device", false);
+
+  preferences.putString("apssid", deviceConfig.apSsid);
+  preferences.putString("prefix", deviceConfig.deviceNamePrefix);
+  preferences.putBool("apmatch", deviceConfig.apMatchesDeviceName);
+
+  preferences.end();
+}
+
+void loadDeviceConfig() {
+  preferences.begin("device", true);
+
+  deviceConfig.apSsid = preferences.getString("apssid", DEFAULT_AP_SSID);
+  deviceConfig.deviceNamePrefix = preferences.getString("prefix", "");
+  deviceConfig.apMatchesDeviceName = preferences.getBool("apmatch", false);
+
+  preferences.end();
+
+  if (deviceConfig.apSsid.length() == 0) {
+    deviceConfig.apSsid = DEFAULT_AP_SSID;
+  }
+
+  if (deviceConfig.deviceNamePrefix.length() > DEVICE_NAME_PREFIX_MAX_LEN) {
+    deviceConfig.deviceNamePrefix = deviceConfig.deviceNamePrefix.substring(0, DEVICE_NAME_PREFIX_MAX_LEN);
+  }
+}
+
 // ===================== WiFi Uplink =====================
 void connectUplinkWiFi() {
   if (uplinkConfig.ssid.length() == 0) {
@@ -955,6 +1002,26 @@ String getDeviceMacID() {
 
   mac.replace(":", "");
   return mac;
+}
+
+// Device name shown on the Settings page and used when apMatchesDeviceName
+// is set. Defaults to the full MAC address; if the user sets a prefix (up
+// to DEVICE_NAME_PREFIX_MAX_LEN chars), it becomes prefix_<last5MACchars>.
+String getDeviceName() {
+  String mac = getDeviceMacID();
+
+  if (deviceConfig.deviceNamePrefix.length() == 0) {
+    return mac;
+  }
+
+  String macSuffix = (mac.length() >= 5) ? mac.substring(mac.length() - 5) : mac;
+  return deviceConfig.deviceNamePrefix + "_" + macSuffix;
+}
+
+// Actual SSID the AP is started/restarted with - the device name when
+// apMatchesDeviceName is checked, otherwise the independently-set apSsid.
+String getEffectiveApSsid() {
+  return deviceConfig.apMatchesDeviceName ? getDeviceName() : deviceConfig.apSsid;
 }
 
 unsigned long getTimestamp() {
@@ -1528,6 +1595,72 @@ function confirmResetModbus() {
 )rawliteral";
 
 
+  // DEVICE / AP IDENTITY FORM
+  html += "<div class='box'>";
+  html += "<h2>Device Identity</h2>";
+
+  if (server.hasArg("deviceSaved")) {
+    html += "<div class='success'>Device Settings Saved Successfully</div>";
+  }
+
+  {
+    String mac = getDeviceMacID();
+    String macSuffix = (mac.length() >= 5) ? mac.substring(mac.length() - 5) : mac;
+
+    html += "<script>";
+    html += "const macSuffix5 = \"" + jsonEscape(macSuffix) + "\";";
+    html += "const fullMac = \"" + jsonEscape(mac) + "\";";
+    html += R"rawscript(
+function updateDeviceNamePreview() {
+  let prefix = document.getElementById('devicePrefixInput').value.trim();
+  let preview = prefix.length > 0 ? (prefix + "_" + macSuffix5) : fullMac;
+  document.getElementById('deviceNamePreview').textContent = preview;
+
+  if (document.getElementById('apMatchCheckbox').checked) {
+    document.getElementById('apSsidInput').value = preview;
+  }
+}
+
+function toggleApSsidField() {
+  let matched = document.getElementById('apMatchCheckbox').checked;
+  document.getElementById('apSsidInput').disabled = matched;
+  if (matched) {
+    updateDeviceNamePreview();
+  }
+}
+)rawscript";
+    html += "</script>";
+
+    html += "<form action='/saveDevice' method='POST'>";
+    html += "<table>";
+
+    html += "<tr><th>Device Name</th><td>";
+    html += "<input type='text' id='devicePrefixInput' name='devicePrefix' maxlength='" + String(DEVICE_NAME_PREFIX_MAX_LEN) + "' placeholder='Up to " + String(DEVICE_NAME_PREFIX_MAX_LEN) + " chars' value='" + htmlEscape(deviceConfig.deviceNamePrefix) + "' oninput='updateDeviceNamePreview()'>";
+    html += "<br><small>Final Device Name: <b id='deviceNamePreview'>" + htmlEscape(getDeviceName()) + "</b>";
+    html += " (prefix + last 5 characters of the MAC address). Leave blank to use the full MAC address.</small>";
+    html += "</td></tr>";
+
+    html += "<tr><th>AP Name (SSID)</th><td>";
+    html += "<input type='text' id='apSsidInput' name='apSsid' value='" + htmlEscape(getEffectiveApSsid()) + "'";
+    if (deviceConfig.apMatchesDeviceName) {
+      html += " disabled";
+    }
+    html += ">";
+    html += "<br><label><input type='checkbox' id='apMatchCheckbox' name='apMatchDevice' onchange='toggleApSsidField()'";
+    if (deviceConfig.apMatchesDeviceName) {
+      html += " checked";
+    }
+    html += "> Match AP Name with Device Name</label>";
+    html += "</td></tr>";
+
+    html += "<tr><td colspan='2'><button type='submit'>Save Device Settings</button></td></tr>";
+    html += "</table>";
+    html += "</form>";
+  }
+
+  html += "</div>";
+
+
   // NETWORK CONFIG FORM
   html += "<div class='box'>";
   html += "<h2>WiFi &amp; TCP Configuration</h2>";
@@ -1885,6 +2018,40 @@ void handleSaveUplink() {
   server.send(303);
 }
 
+// ===================== Save Device / AP Identity =====================
+void handleSaveDevice() {
+  // Only present in the POST when the AP name field isn't disabled by the
+  // "match" checkbox client-side, so a checked box naturally leaves the
+  // stored apSsid untouched for whenever the user unchecks it later.
+  if (server.hasArg("apSsid")) {
+    deviceConfig.apSsid = server.arg("apSsid");
+  }
+
+  if (deviceConfig.apSsid.length() == 0) {
+    deviceConfig.apSsid = DEFAULT_AP_SSID;
+  }
+
+  if (server.hasArg("devicePrefix")) {
+    String prefix = server.arg("devicePrefix");
+    if (prefix.length() > DEVICE_NAME_PREFIX_MAX_LEN) {
+      prefix = prefix.substring(0, DEVICE_NAME_PREFIX_MAX_LEN);
+    }
+    deviceConfig.deviceNamePrefix = prefix;
+  }
+
+  deviceConfig.apMatchesDeviceName = server.hasArg("apMatchDevice");
+
+  saveDeviceConfig();
+
+  String apSsidToUse = getEffectiveApSsid();
+  WiFi.softAP(apSsidToUse.c_str(), AP_PASSWORD);
+
+  logKeyEvent("DEVICE SETTINGS SAVED: AP=" + apSsidToUse + " deviceName=" + getDeviceName());
+
+  server.sendHeader("Location", "/settings?deviceSaved=1");
+  server.send(303);
+}
+
 // ===================== Save Types =====================
 void handleSaveTypes() {
   int rows = server.arg("typeRowCount").toInt();
@@ -2045,6 +2212,7 @@ void setup() {
 
   loadCommunicationSettings();
   loadUplinkConfig();
+  loadDeviceConfig();
 
   Serial1.begin(
     commBaudRate,
@@ -2056,11 +2224,13 @@ void setup() {
   loadSettings();
 
   WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP(AP_SSID, AP_PASSWORD);
+
+  String apSsidToUse = getEffectiveApSsid();
+  WiFi.softAP(apSsidToUse.c_str(), AP_PASSWORD);
 
   connectUplinkWiFi();
 
-  logKeyEvent("AP STARTED: " + String(AP_SSID) + " " + WiFi.softAPIP().toString());
+  logKeyEvent("AP STARTED: " + apSsidToUse + " " + WiFi.softAPIP().toString());
   logMessage("RS485 RX=D2 TX=D3 DE/RE=D4");
   logMessage("TCP TARGET: " + uplinkConfig.serverIP + ":" + String(uplinkConfig.port));
 
@@ -2069,6 +2239,7 @@ void setup() {
   server.on("/save", HTTP_POST, handleSave);
   server.on("/saveCommunication", HTTP_POST, handleSaveCommunication);
   server.on("/saveUplink", HTTP_POST, handleSaveUplink);
+  server.on("/saveDevice", HTTP_POST, handleSaveDevice);
   server.on("/data", HTTP_GET, handleData);
   server.on("/keylog", HTTP_GET, handleKeyLog);
   server.on("/types", HTTP_GET, handleTypes);
