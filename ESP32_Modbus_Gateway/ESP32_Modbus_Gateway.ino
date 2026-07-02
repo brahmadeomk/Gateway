@@ -1264,6 +1264,7 @@ void handleRoot() {
 <thead>
 <tr>
 <th>Name</th>
+<th>Enabled</th>
 <th>Value</th>
 <th>Status</th>
 <th>Last Update</th>
@@ -1298,6 +1299,7 @@ function renderTable(){
    let staleClass = (ageSec === null || ageSec > 10) ? "stale" : "";
    body += `<tr>
    <td>${p.name}</td>
+   <td>${p.enabled ? 'Yes':'No'}</td>
    <td>${p.value ?? '-'}</td>
    <td>${p.valid ? 'OK':'ERR'}</td>
    <td class="${staleClass}">${formatAge(p.lastUpdateMs)}</td>
