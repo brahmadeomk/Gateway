@@ -56,6 +56,16 @@ const char* AP_PASSWORD = "12345678";
 #define DEFAULT_POLL_INTERVAL_MS 2000
 #define MIN_POLL_INTERVAL_MS 10
 #define MAX_POLL_INTERVAL_MS 3600000
+// Pause after each parameter's request/response is done, before starting
+// the next one. Modbus's own T3.5 bus-silence timing is already enforced
+// per-transaction inside modbusReadHoldingRegisters() regardless of this
+// value - this is purely extra settle time for slower slave devices that
+// need a moment to recover before accepting the next request. Adjustable
+// on the Settings page; raise it if parameters right after a fast one
+// start showing errors, lower it for a faster poll cycle.
+#define DEFAULT_SLAVE_RECOVERY_DELAY_MS 20
+#define MIN_SLAVE_RECOVERY_DELAY_MS 0
+#define MAX_SLAVE_RECOVERY_DELAY_MS 5000
 #define TYPE_SCHEMA_VERSION 4
 
 // ===================== Debug Settings =====================
@@ -191,6 +201,7 @@ uint32_t commBaudRate = 9600;
 String commParity = "N";
 uint8_t commStopBits = 1;
 uint32_t pollIntervalMs = DEFAULT_POLL_INTERVAL_MS;
+uint32_t slaveRecoveryDelayMs = DEFAULT_SLAVE_RECOVERY_DELAY_MS;
 
 // ===================== Parameter Type Structure =====================
 struct ParamType {
@@ -280,12 +291,6 @@ void postTransmission() {
 // ModbusMaster library, whose response timeout is a hardcoded 2000ms.
 #define MODBUS_RESPONSE_TIMEOUT_MS 3000
 #define MODBUS_RAW_BUF_SIZE 64
-// Pause between parameters in a poll cycle. T3.5 bus-silence is already
-// enforced per-transaction inside modbusReadHoldingRegisters(), so this is
-// just extra settle headroom for slave-side processing, not a bus-timing
-// requirement - kept small rather than removed to be conservative on
-// existing hardware.
-#define MODBUS_INTER_PARAM_DELAY_MS 20
 
 #define MB_SUCCESS 0x00
 #define MB_ERR_TIMEOUT 0xE2      // nothing usable arrived within MODBUS_RESPONSE_TIMEOUT_MS
@@ -537,6 +542,7 @@ void saveCommunicationSettings() {
   preferences.putString("parity", commParity);
   preferences.putUChar("stop", commStopBits);
   preferences.putUInt("pollms", pollIntervalMs);
+  preferences.putUInt("recoveryms", slaveRecoveryDelayMs);
 
   preferences.end();
 }
@@ -548,6 +554,7 @@ void loadCommunicationSettings() {
   commParity = preferences.getString("parity", "N");
   commStopBits = preferences.getUChar("stop", 1);
   pollIntervalMs = preferences.getUInt("pollms", DEFAULT_POLL_INTERVAL_MS);
+  slaveRecoveryDelayMs = preferences.getUInt("recoveryms", DEFAULT_SLAVE_RECOVERY_DELAY_MS);
 
   preferences.end();
 
@@ -565,6 +572,10 @@ void loadCommunicationSettings() {
 
   if (pollIntervalMs < MIN_POLL_INTERVAL_MS || pollIntervalMs > MAX_POLL_INTERVAL_MS) {
     pollIntervalMs = DEFAULT_POLL_INTERVAL_MS;
+  }
+
+  if (slaveRecoveryDelayMs > MAX_SLAVE_RECOVERY_DELAY_MS) {
+    slaveRecoveryDelayMs = DEFAULT_SLAVE_RECOVERY_DELAY_MS;
   }
 }
 
@@ -1188,9 +1199,11 @@ void pollModbus() {
 
     logModbusStatusChange(i);
 
+    uint32_t recoveryDelay = slaveRecoveryDelayMs;
+
     xSemaphoreGive(dataMutex);
 
-    delay(MODBUS_INTER_PARAM_DELAY_MS);
+    delay(recoveryDelay);
   }
 
   // Cycle done - signal webTask to push results over TCP.
@@ -1568,6 +1581,9 @@ function confirmResetModbus() {
 
   html += "<tr><th>Poll Interval (ms)</th><td><input type='number' name='pollInterval' min='" + String(MIN_POLL_INTERVAL_MS) + "' max='" + String(MAX_POLL_INTERVAL_MS) + "' value='" + String(pollIntervalMs) + "'></td></tr>";
 
+  html += "<tr><th>Slave Recovery Delay (ms)</th><td><input type='number' name='recoveryDelay' min='" + String(MIN_SLAVE_RECOVERY_DELAY_MS) + "' max='" + String(MAX_SLAVE_RECOVERY_DELAY_MS) + "' value='" + String(slaveRecoveryDelayMs) + "'>"
+          "<br><small>Pause after each parameter before polling the next. Lower = faster polling; raise it if parameters start erroring right after a fast one.</small></td></tr>";
+
   html += "<tr><td colspan='2'><button type='submit'>Save Communication</button></td></tr>";
   html += "</table>";
   html += "</form>";
@@ -1780,6 +1796,12 @@ void handleSaveCommunication() {
     xSemaphoreGive(dataMutex);
   }
 
+  if (server.hasArg("recoveryDelay")) {
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    slaveRecoveryDelayMs = server.arg("recoveryDelay").toInt();
+    xSemaphoreGive(dataMutex);
+  }
+
   if (commBaudRate < 300 || commBaudRate > 1000000) {
     commBaudRate = 9600;
   }
@@ -1795,6 +1817,9 @@ void handleSaveCommunication() {
   xSemaphoreTake(dataMutex, portMAX_DELAY);
   if (pollIntervalMs < MIN_POLL_INTERVAL_MS || pollIntervalMs > MAX_POLL_INTERVAL_MS) {
     pollIntervalMs = DEFAULT_POLL_INTERVAL_MS;
+  }
+  if (slaveRecoveryDelayMs > MAX_SLAVE_RECOVERY_DELAY_MS) {
+    slaveRecoveryDelayMs = DEFAULT_SLAVE_RECOVERY_DELAY_MS;
   }
   xSemaphoreGive(dataMutex);
 
@@ -1815,7 +1840,7 @@ void handleSaveCommunication() {
 
   xSemaphoreGive(serialMutex);
 
-  logKeyEvent("COMM SETTINGS SAVED: " + String(commBaudRate) + " baud, poll " + String(pollIntervalMs) + "ms");
+  logKeyEvent("COMM SETTINGS SAVED: " + String(commBaudRate) + " baud, poll " + String(pollIntervalMs) + "ms, recovery " + String(slaveRecoveryDelayMs) + "ms");
 
   server.sendHeader("Location", "/settings?commSaved=1");
   server.send(303);
