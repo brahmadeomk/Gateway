@@ -1,303 +1,35 @@
 /* ======================================================================
-   ANALYSIS / CHANGE LOG - Intermittent "response caught / response error"
+   ARCHITECTURE NOTES
    ======================================================================
+   Modbus RTU polling is the real-time-critical part of this gateway, so
+   the whole task/core layout is built around protecting it:
 
-   SYMPTOM (as reported):
-   Slave responds correctly on the wire, but the ESP32 gateway only catches
-   the response some of the time; other times it logs a Modbus error
-   (timeout / CRC / illegal response) for the exact same slave/register.
-   Slaves are fast: they start replying within ~3.5 character times
-   (~1 ms at the configured baud rate) of the request ending, as allowed
-   by the Modbus RTU spec.
-
-   ROOT CAUSE:
-   The only genuinely timing-critical instruction in this whole program is
-   the digitalWrite() that switches the MAX485/SP3485 transceiver from
-   TRANSMIT back to RECEIVE (RS485_DE_RE -> LOW) inside postTransmission().
-   It must complete BEFORE the slave's first response bit reaches the ESP32,
-   or the UART misses the start bit and the whole frame is garbled/lost.
-   With a ~1 ms turnaround budget, two things in the original code were
-   eating directly into that budget and making the outcome a coin flip:
-
-     1. postTransmission() added an extra 300 us delayMicroseconds() AFTER
-        the request was already fully transmitted (ModbusMaster's internal
-        _serial->flush() already blocks until the last stop bit is
-        physically on the wire, so this delay was pure dead time - roughly
-        30% of the whole 1 ms window - taken away from listening time).
-
-     2. modbusTask was pinned to Core 0 (MODBUS_TASK_CORE 0). On the
-        Arduino-ESP32 core, Core 0 is also where the WiFi/lwIP stack runs
-        its own internal, high-priority FreeRTOS tasks and ISRs (the
-        original in-code comment claiming Core 0 "can never be delayed by
-        HTTP traffic" only accounted for the user's own loop() task, not
-        the WiFi/TCP stack's internal tasks that also live on Core 0).
-        Whenever WiFi/TCP activity coincided with a poll (which happens
-        constantly here: sendTcpData() every 3 s, WiFi retry logic, TCP
-        client traffic), modbusTask could be preempted for anywhere from a
-        few hundred microseconds to a few milliseconds - easily enough to
-        blow through the 1 ms turnaround window and miss the start of the
-        response. This lines up exactly with the "sometimes works, sometimes
-        doesn't" symptom: it's a race between the DE/RE switch and WiFi
-        stack jitter, not a hardware/wiring problem.
-
-   FIXES APPLIED:
-     A. Removed the 300 us delay from postTransmission() - the bus is
-        released to listen mode the instant the request finishes
-        transmitting, instead of 300 us late.
-     B. Wrapped the DE/RE digitalWrite() calls in a short FreeRTOS
-        critical section (portENTER_CRITICAL/portEXIT_CRITICAL) so the
-        pin toggle itself can't be preempted mid-instruction on its own
-        core, minimizing jitter on the one line that actually matters.
-     C. Moved modbusTask from Core 0 to Core 1 (MODBUS_TASK_CORE 1), so it
-        no longer shares a core with the WiFi/lwIP stack's internal tasks.
-        Core 1 now only has modbusTask and the Arduino loop()/web server
-        task to arbitrate between.
-     D. Raised modbusTask's priority from 1 to 2 (above loop()'s default
-        priority of 1), so on Core 1 it always preempts HTTP/TCP handling
-        the instant it's ready to run, instead of possibly time-slicing
-        with it.
-
-   NOT CHANGED / NOTES FOR FURTHER INVESTIGATION:
-     - preTransmission()'s 300 us delay was left in place: it happens
-       BEFORE the request is sent and therefore does not eat into the
-       response listening window; it's just transceiver driver-enable
-       settle time.
-     - ModbusMaster's default response timeout (~1000 ms) is far larger
-       than the ~1 ms slave turnaround and is not the bottleneck here, so
-       it was left untouched.
-     - If failures still occur occasionally after this fix, check whether
-       they correlate with Settings being saved from the web UI: ESP32
-       flash (NVS/Preferences) writes require briefly disabling interrupts
-       on BOTH cores, which can also clip an in-flight Modbus transaction.
-       That is a separate, much rarer class of event than the constant
-       WiFi-driven jitter fixed above.
-     - Also verify which version of the ModbusMaster library is installed;
-       some versions call plain _serial->flush() instead of flush(true),
-       and on some arduino-esp32 core versions a full flush() can briefly
-       touch the RX side. Not modified here since the library source
-       wasn't provided, but worth checking if issues persist.
-
-   UPDATE - PRIORITY RAISED FURTHER:
-   Modbus polling is the real-time operation in this system, so
-   modbusTask's priority was raised again, from 2 to
-   (configMAX_PRIORITIES - 5) - as high as practical while still leaving a
-   safety margin below the handful of priority levels ESP-IDF reserves for
-   its own internal system tasks (e.g. cross-core IPC tasks run at
-   configMAX_PRIORITIES - 1). This is safe to do because:
-     - dataMutex/logMutex/serialMutex are real FreeRTOS mutexes
-       (xSemaphoreCreateMutex(), not binary semaphores), which have
-       priority inheritance built in - a lower-priority task briefly
-       holding one gets temporarily boosted instead of causing a
-       priority-inversion stall on modbusTask.
-     - modbusTask still yields regularly via delay(100) per parameter and
-       vTaskDelay() at the end of each poll cycle, so the idle task on
-       Core 1 always gets scheduled and the task watchdog is never at risk,
-       even at this priority.
-
-   UPDATE - TCP SEND NOW TRIGGERED BY POLL-CYCLE COMPLETION:
-   TCP push previously ran on its own independent TCP_SEND_INTERVAL (3s)
-   timer in loop(), completely decoupled from the Modbus poll cycle. That
-   meant a TCP payload could go out mid-poll-cycle (a mix of freshly
-   updated and not-yet-refreshed values for that pass) or, if pollIntervalMs
-   was larger than 3s, get sent multiple times before any new data existed.
-   Fixed by adding a binary semaphore, pollCompleteSem: modbusTask gives it
-   once, at the end of pollModbus(), after every enabled/configured record
-   has been polled for that cycle; loop() takes it (non-blocking) and only
-   then calls sendTcpData(). TCP_SEND_INTERVAL/lastTCPSend were removed as
-   they're no longer used. The network I/O in sendTcpData() (TCP connect,
-   which can block up to TCP_CONNECT_TIMEOUT_MS) still runs on the loop()
-   task, not modbusTask, so it can never stall the real-time polling - if
-   loop() is still busy sending a previous payload when the next
-   pollCompleteSem arrives, xSemaphoreGive() simply leaves the semaphore
-   set (binary, so it doesn't accumulate) and loop() picks it up on its
-   next pass.
-
-   UPDATE - RAW SLAVE RESPONSE LOGGING FOR TROUBLESHOOTING:
-   Same intermittent-response issue is still occasionally seen in the
-   field. To make it diagnosable without a bus analyzer, every RS485
-   transaction is now run through a small Stream wrapper (see
-   RS485LoggingSerial below) that transparently sits between ModbusMaster
-   and Serial1. It captures every byte actually written (the request) and
-   read (whatever the slave/bus produced) during that transaction, in
-   order, regardless of whether ModbusMaster ultimately reports success or
-   an error. On any poll error the [POLL] debug log line now also prints
-   the exact TX frame and the exact raw RX bytes captured (as hex), which
-   tells you immediately whether: nothing came back at all (RX empty ->
-   true timeout/wiring/turnaround-window miss), a full-length frame came
-   back with a bad CRC (electrical noise/reflection), a short/partial
-   frame came back (start-bit/first-byte(s) still being missed), or bytes
-   came back from the wrong device (multi-drop bus contention). This only
-   changes what gets logged; it does not change the transaction timing or
-   the pass/fail logic. Requires only Stream (Arduino core), no library
-   changes.
-
-   UPDATE - DEBUG LOGGING MOVED OFF THE REAL-TIME CORE:
-   logMessage()/logKeyEvent() used to do their full work - Serial.println()
-   (a blocking USB UART write), the debugLogs history-buffer String
-   append/trim, and the keyLog ring-buffer append - inline, in whatever
-   task called them. Called from pollModbus(), that meant this work ran on
-   modbusTask itself (Core 1, highest practical priority). It happens after
-   the RS485 transaction/serialMutex is released so it couldn't blow the
-   ~1ms turnaround window, but it still consumed real CPU time on the same
-   core as the real-time polling loop for no good reason. Per request,
-   logMessage()/logKeyEvent() now just build a small fixed-size struct
-   (timestamp + text + a key-event flag) and push it onto logQueue with a
-   non-blocking xQueueSend() - if the caller is modbusTask this is a few
-   microseconds of work, not the FreeRTOS-log the message. A dedicated
-   logTask, deliberately pinned to Core 0 (the same core the WiFi/lwIP
-   stack runs on, well away from Core 1) at low priority, drains the queue
-   and does all the actual Serial/String/keyLog work. logMessage()/
-   logKeyEvent()'s signatures are unchanged, so none of the ~30 existing
-   call sites needed to change. xQueueSend() is non-blocking and drops the
-   message if the queue is ever full, rather than stalling the caller -
-   losing an occasional log line is acceptable, blocking a real-time or
-   web-handling task on a logging queue is not.
-
-   UPDATE - CORE 1 NOW FULLY DEDICATED TO MODBUS:
-   Until now Core 1 was shared between modbusTask and the Arduino loop()
-   task (web server, TCP push, WiFi retry) - kept safe only because
-   modbusTask's priority (MODBUS_TASK_PRIORITY) let it preempt loop()
-   instantly. Per request, that sharing is now removed entirely: the body
-   of what used to be loop() moved into a new webTask, explicitly created
-   with xTaskCreatePinnedToCore(..., WEB_TASK_CORE) pinned to Core 0
-   alongside the WiFi/lwIP stack and logTask. Core 1 now runs nothing but
-   modbusTask (plus the negligible FreeRTOS idle task). Arduino's own
-   loop() function still technically exists and is still scheduled by the
-   framework on Core 1 (that's fixed by the core's own main.cpp, not
-   something a sketch can change) but its body is now empty, so it does no
-   real work. This also has a small side benefit: server.handleClient()
-   now runs on the same core as the lwIP task it talks to, instead of
-   needing cross-core calls into it from Core 1.
-
-   UPDATE - STRICT POLL -> TCP-SEND -> NEXT-POLL SEQUENCING, AND A 3s
-   ERROR-REPORTING GRACE PERIOD:
-
-   (a) Sequencing: modbusTask used to move straight on to the next poll
-   cycle as soon as pollModbus() finished, while webTask sent that cycle's
-   data over TCP in parallel (decoupled by pollCompleteSem so a slow/dead
-   TCP link could never delay real-time polling). Per request, polling
-   must now wait for that cycle's TCP send (if TCP is configured) to
-   finish before the next cycle starts. Implemented with a second binary
-   semaphore, tcpSendDoneSem: modbusTask still only signals pollCompleteSem
-   and then blocks on tcpSendDoneSem; webTask still does the actual socket
-   I/O (so Core 1 still never builds JSON or touches a socket directly),
-   but now gives tcpSendDoneSem right after sendTcpData() returns -
-   whether it actually sent, or returned immediately because TCP isn't
-   configured/WiFi is down. modbusTask always gets unblocked either way,
-   so an unconfigured TCP target can't stall polling forever, but a live,
-   slow, or reconnecting TCP link now does add to the gap between poll
-   cycles - that's an intentional, requested trade-off, not an oversight.
-
-   (b) 3-second error-reporting grace period: a single missed/garbled
-   response no longer immediately flips a parameter to an error/
-   disconnected status. ModbusParam gained a firstFailTime field; on the
-   first failed poll after a run of successes, firstFailTime is stamped,
-   and params[i].valid only actually flips to false (and errorCode is only
-   surfaced) once failures have been continuous for
-   MODBUS_ERROR_GRACE_MS (3000ms) - see pollModbus(). Until then, the
-   dashboard, /data, and the TCP JSON payload keep reporting the last
-   known good value/OK status, exactly as if nothing had happened yet.
-   This only debounces the user-facing status; the raw per-attempt
-   [POLL]/TX/RX debug log line (added earlier for troubleshooting) is
-   unaffected and still logs every single failed transaction immediately,
-   so field diagnosis isn't delayed by this. logModbusStatusChange()
-   needed no changes - it already only reacts to params[i].valid/errorCode
-   actually changing, so the key-log "MODBUS ... Status=ERROR" entry
-   naturally only appears once the grace period has elapsed too.
-   firstFailTime is reset to 0 (streak cleared) on success, when a
-   parameter is disabled, and via resetDebugState() whenever a parameter's
-   config is (re)loaded or saved.
-
-   UPDATE - EXACT 3s MODBUS RESPONSE TIMER, IMMEDIATE ERROR REPORTING, AND
-   A BOUNDED 3s TCP HANDSHAKE (full requested state machine):
-
-   Per a precise, explicit spec: (1) a timer starts the moment a request is
-   sent to a slave; if no valid response arrives within 3s, that's an
-   error; (2) a response that arrives but is corrupt (bad CRC/length) is
-   also an error; (3) after each parameter's attempt, the next configured/
-   enabled parameter is polled the same way; (4) once every record has
-   been polled, TCP delivery is attempted with its own 3s timer - success
-   signals modbusTask back immediately, but modbusTask is guaranteed to
-   move on to the next poll cycle even if TCP hasn't finished within 3s.
-
-   This could not be built on top of the ModbusMaster library: its
-   response timeout (ku16MBResponseTimeout) is a private constant hardcoded
-   to 2000ms with no public setter (confirmed against the library source),
-   so an exact, requested 3000ms budget was never reachable through it.
-   ModbusMaster and the RS485LoggingSerial Stream-wrapper (which existed
-   solely to peek inside ModbusMaster's black-box read loop for debug
-   purposes) have both been removed. In their place, modbusReadHoldingRegisters()
-   is a small, self-contained Modbus RTU master (function 0x03 only, which
-   is all this gateway needs): it builds the request frame and CRC16
-   itself, transmits it via the same preTransmission()/postTransmission()
-   D4 control used throughout this file, then reads the response with an
-   explicit MODBUS_RESPONSE_TIMEOUT_MS (3000ms) deadline, recognizing a
-   complete frame by its expected length (5 bytes for an exception
-   response, 5+qty*2 for a normal one) rather than a fixed byte count. CRC,
-   slave-ID, and byte-count are all validated before any register value is
-   ever produced, so a corrupt/mismatched response is always reported as
-   an error (MB_ERR_CRC), never accepted as good data. Raw TX/RX bytes for
-   every attempt are kept in lastModbusTx/lastModbusRx for the existing
-   [POLL] debug log line, same as RS485LoggingSerial provided before.
-
-   This also **replaces** the previously-added MODBUS_ERROR_GRACE_MS
-   (3-second sustained-failure debounce before reporting a status): the
-   two features described the same underlying "give an error after 3s"
-   intent from two different angles (one as a reporting debounce, this one
-   as the per-request wait itself), and stacking both would mean up to 6+
-   seconds before an error ever reached the dashboard/TCP JSON - contrary
-   to "if slave don't respond within 3 sec then give error" reporting
-   promptly once that single 3s wait genuinely elapses. params[i].valid/
-   errorCode are therefore set immediately from each poll's result again,
-   with no additional grace window; ModbusParam's firstFailTime field and
-   all its call sites were removed along with it.
-
-   Finally, modbusTask's wait for TCP feedback (tcpSendDoneSem) changed
-   from an unbounded portMAX_DELAY to a bounded wait of TCP_SEND_TIMEOUT_MS
-   (3000ms), matching "if tcp does not succeed even after 3 sec ... modbus
-   will continue with new polling cycle" literally - previously, a hung
-   sendTcpData() (e.g. a write() that never returns) could stall real-time
-   polling forever, which is now impossible. Because webTask might still
-   finish and give() that semaphore *after* modbusTask has already given up
-   waiting on it, modbusTask now drains any stale pending signal
-   (non-blocking take) immediately before starting its bounded wait for
-   the current cycle, so a late arrival from a previous cycle can never be
-   mistaken for the current one's feedback.
-
-   UPDATE - T3.5/T1.5 TIMING PER THE MODBUS RTU SPEC:
-   Auditing modbusReadHoldingRegisters() against "Modbus over Serial Line
-   V1.02" found two real gaps versus the standard (everything else - CRC16
-   algorithm/byte order, CRC-before-address-before-function validation
-   order, exception-frame format, slave-ID matching - was already
-   correct):
-     - T3.5 (minimum 3.5-character-time bus silence before a new frame may
-       be transmitted) was not explicitly enforced. In practice the
-       existing 100ms per-parameter delay() in pollModbus() is far more
-       than T3.5 at any baud >= ~1200, but at the low end of the
-       supported baud range (300 baud allowed by loadCommunicationSettings())
-       T3.5 is ~128ms, which *exceeds* that 100ms delay - so it was
-       possible to under-hold silence there. Fixed with an explicit,
-       baud-aware guard: lastBusActivityUs tracks the end of the last bus
-       activity (this device's own TX, or the last RX byte of a response),
-       and every new request waits out any T3.5 shortfall before
-       transmitting.
-     - T1.5 (max gap between two bytes *within* the same frame) wasn't
-       checked at all - the read loop would previously keep accumulating
-       whatever arrived up to MODBUS_RESPONSE_TIMEOUT_MS regardless of
-       gaps, meaning an abnormally-delayed continuation (bus noise/glitch)
-       could get spliced onto earlier bytes as if it were one continuous
-       frame. Fixed: once a byte has been received (rxLen > 0), a gap
-       since the previous byte exceeding T1.5 now resets rxLen to 0 and
-       restarts accumulation from that byte, per the spec's own definition
-       of a frame boundary.
-   Both T1.5/T3.5 are computed from commBaudRate on every call (via
-   modbusCharTimeUs()), using the spec's own formulas: 11-bit character
-   time assumption, T1.5 = 1.5 char times (or a fixed 750us above
-   19200 baud), T3.5 = 3.5 char times (or a fixed 1750us above 19200
-   baud). The mid-frame busy-poll (needed for T1.5's microsecond
-   precision - see the read loop) is safe specifically because Core 1 is
-   dedicated entirely to modbusTask, and is bounded to a few ms (one
-   short frame) even in the worst case.
+   - modbusTask runs alone on Core 1 at MODBUS_TASK_PRIORITY (near-max).
+     webTask (web server, TCP push, WiFi retry) and logTask both run on
+     Core 0, alongside the WiFi/lwIP stack, so neither can preempt a poll
+     mid-transaction. Sharing Core 0 with WiFi/lwIP is what used to cause
+     intermittent missed responses.
+   - The RS485_DE_RE (transceiver direction) pin toggle in postTransmission()
+     is the single most timing-critical line in the program: it must flip
+     the bus back to receive before the slave's ~1ms response window
+     starts. It's wrapped in a portENTER/EXIT_CRITICAL section and has no
+     added delay.
+   - modbusReadHoldingRegisters() is a small self-contained Modbus RTU
+     master (function 0x03 only) instead of the ModbusMaster library,
+     because the library's response timeout is a hardcoded, unconfigurable
+     2000ms. It enforces an explicit 3s response timeout
+     (MODBUS_RESPONSE_TIMEOUT_MS), plus the spec's T3.5 (inter-frame) and
+     T1.5 (inter-byte) silence rules computed from the live baud rate.
+   - Errors (timeout, bad CRC/length, wrong slave, slave exception) are
+     reported immediately with no debounce/grace period.
+   - Each poll cycle is strictly poll -> TCP send -> next poll:
+     pollModbus() signals pollCompleteSem when done; webTask sends that
+     cycle's data and gives tcpSendDoneSem; modbusTask waits on it with a
+     bounded timeout (TCP_SEND_TIMEOUT_MS) so a dead TCP link can never
+     stall polling.
+   - Logging is offloaded from modbusTask via a queue (logQueue) to a
+     dedicated low-priority logTask on Core 0, so Serial/String work never
+     steals time from the real-time core.
    ====================================================================== */
 
 #include <WiFi.h>
@@ -336,40 +68,21 @@ const char* AP_PASSWORD = "12345678";
 #define DEBUG_SUMMARY_INTERVAL_MS 10000
 #define WIFI_RETRY_INTERVAL_MS 5000
 #define TCP_CONNECT_TIMEOUT_MS 2000
-// Upper bound modbusTask will ever wait for webTask's TCP-send feedback
-// before giving up and moving on to the next poll cycle regardless - see
-// the "UPDATE" note in the analysis header at the top of this file.
+// Max wait for webTask's TCP-send feedback before moving to the next poll.
 #define TCP_SEND_TIMEOUT_MS 3000
-// Core 1 (APP_CPU), NOT Core 0: on Arduino-ESP32, Core 0 also hosts the
-// WiFi/lwIP stack's own internal high-priority tasks/ISRs. Sharing Core 0
-// with them caused scheduling jitter of up to a few ms whenever WiFi/TCP
-// activity happened, which was long enough to blow through the ~1ms
-// RS485 turnaround window these slaves use and intermittently miss the
-// start of their response. Core 1 is now dedicated to this task alone -
-// loop()/the web server were subsequently moved to Core 0 too (see
-// WEB_TASK_CORE below).
+// Core 1, not 0: Core 0 also hosts WiFi/lwIP's own high-priority tasks,
+// which can jitter enough to blow the ~1ms RS485 turnaround window.
 #define MODBUS_TASK_CORE 1
-// Real-time polling task priority: as high as practical while leaving a
-// safety margin below the top few levels ESP-IDF reserves for its own
-// internal system tasks. See the "UPDATE" note in the analysis header at
-// the top of this file for why this is safe.
+// As high as practical, below the levels ESP-IDF reserves for itself.
 #define MODBUS_TASK_PRIORITY (configMAX_PRIORITIES - 5)
 #define MODBUS_TASK_STACK 8192
-// Debug/key-event logging task: deliberately pinned to Core 0 (the WiFi/
-// lwIP core), NOT Core 1, and given a low priority - logging is diagnostic
-// only, so it's fine for it to be preempted by anything, including WiFi
-// housekeeping. This keeps every bit of Serial.println()/String work for
-// logging off Core 1, which is now dedicated entirely to modbusTask.
+// Low priority, Core 0 (WiFi core) - logging must never steal Core 1 time.
 #define LOG_TASK_CORE 0
 #define LOG_TASK_PRIORITY 1
 #define LOG_TASK_STACK 4096
 #define LOG_QUEUE_LEN 40
 #define LOG_MSG_MAX_LEN 200
-// Web server / TCP push / WiFi retry task: moved off Core 1 so that core
-// is dedicated entirely to modbusTask (see the "UPDATE" note in the
-// analysis header at the top of this file). Pinned to Core 0 alongside
-// the WiFi/lwIP stack and logTask; priority matches what the Arduino
-// loop() task it replaces used to run at.
+// Web server / TCP push / WiFi retry: Core 0, leaving Core 1 to modbusTask.
 #define WEB_TASK_CORE 0
 #define WEB_TASK_PRIORITY 1
 #define WEB_TASK_STACK 8192
@@ -385,26 +98,11 @@ unsigned long lastSummaryPrintTime = 0;
 unsigned long lastWifiAttempt = 0;
 
 // ===================== Cross-Task Synchronization =====================
-// dataMutex guards params[]/paramCount and typeList[]/typeCount, which are
-// written by webTask (Core 0) and read/written by modbusTask (Core 1 -
-// see MODBUS_TASK_CORE/WEB_TASK_CORE above; the two now run on separate,
-// dedicated cores, so this mutex is about data consistency, not about
-// arbitrating who runs when). logMutex guards debugLogs/keyLog similarly,
-// but those are only ever touched by logTask (Core 0) - see logQueue
-// below - so logMutex mainly protects against handleKeyLog() (webTask)
-// reading keyLog[] mid-update. serialMutex guards the actual RS485 UART
-// (Serial1) so webTask can never reconfigure it (baud/parity/stop) while
-// modbusTask is mid-transaction on it. pollCompleteSem/tcpSendDoneSem
-// form a two-way handshake around each cycle's TCP push: pollCompleteSem
-// is given by modbusTask once per poll cycle, after every
-// enabled/configured record has been polled, and taken (non-blocking) by
-// webTask to trigger a TCP push of that cycle's results (see
-// sendTcpData()/webTask()); modbusTask then blocks on tcpSendDoneSem,
-// which webTask gives right after that push attempt finishes (sent,
-// failed, or skipped because TCP isn't configured), so the next poll
-// cycle never starts until this cycle's data has actually been sent (or
-// a send was genuinely attempted/skipped) - see the "UPDATE" note in the
-// analysis header at the top of this file.
+// dataMutex: params[]/typeList[] (webTask writes, modbusTask reads/writes).
+// logMutex: debugLogs/keyLog, mainly guarding webTask's keyLog[] reads.
+// serialMutex: the RS485 UART, so settings can't change mid-transaction.
+// pollCompleteSem/tcpSendDoneSem: two-way handshake so each cycle's TCP
+// push finishes (or is skipped) before the next poll cycle starts.
 SemaphoreHandle_t dataMutex;
 SemaphoreHandle_t logMutex;
 SemaphoreHandle_t serialMutex;
@@ -412,10 +110,8 @@ SemaphoreHandle_t pollCompleteSem;
 SemaphoreHandle_t tcpSendDoneSem;
 TaskHandle_t modbusTaskHandle;
 
-// logQueue carries log entries from whichever task calls logMessage()/
-// logKeyEvent() (often modbusTask) over to logTask (Core 0), which does
-// the actual Serial/String/keyLog work - see LOG_TASK_CORE above and the
-// "UPDATE" note in the analysis header at the top of this file.
+// Carries log entries from any task to logTask (Core 0), which does the
+// actual Serial/String/keyLog work off the real-time core.
 QueueHandle_t logQueue;
 TaskHandle_t logTaskHandle;
 TaskHandle_t webTaskHandle;
@@ -561,48 +257,27 @@ void logKeyEvent(String msg) {
 }
 
 // ===================== RS485 Direction Control =====================
-// TIMING-CRITICAL: see the rs485Mux comment above and the analysis header
-// at the top of this file. preTransmission() is not time-critical for RX
-// (it runs before anything is sent), so its settle delay is left as-is.
-// postTransmission(), however, must flip the bus back to receive with the
-// minimum possible delay after the request finishes transmitting, because
-// these slaves can start replying in as little as ~1ms (3.5 char times).
 void preTransmission() {
   portENTER_CRITICAL(&rs485Mux);
   digitalWrite(RS485_DE_RE, HIGH);
   portEXIT_CRITICAL(&rs485Mux);
 
-  // Transceiver driver-enable settle time before the first bit goes out.
-  // Happens before transmission, so it does not cost any of the slave's
-  // response window.
+  // Transceiver driver-enable settle time, before anything is sent.
   delayMicroseconds(300);
 }
 
 void postTransmission() {
-  // Modbus RTU / "Modbus over Serial Line" standard requirement: the
-  // master must release control of the bus (driver disabled, D4 = LOW)
-  // as soon as its own transmission ends, so the line is free for the
-  // slave to respond. The T1.5/T3.5 character-time silence rules in the
-  // spec govern how a receiver detects frame boundaries; they are NOT a
-  // license for the master to hold the driver enabled any longer than
-  // necessary after its last byte - doing so just eats into the slave's
-  // turnaround window (T3.5 min, but these units start replying in
-  // ~1ms). No delay is added here on purpose: modbusReadHoldingRegisters()
-  // below calls Serial1.flush() right before calling this function, which
-  // already blocks until the last stop bit has been fully shifted out on
-  // the wire, so D4 can - and per the standard, should - go LOW immediately.
+  // No added delay: Serial1.flush() (called just before this) already
+  // blocks until the last stop bit is on the wire, so it's safe - and
+  // per spec, correct - to release the bus immediately.
   portENTER_CRITICAL(&rs485Mux);
   digitalWrite(RS485_DE_RE, LOW);
   portEXIT_CRITICAL(&rs485Mux);
 }
 
 // ===================== Modbus RTU Master (custom, exact timing) =====================
-// A small, self-contained Modbus RTU master limited to what this gateway
-// actually needs (function 0x03, Read Holding Registers). Replaces the
-// ModbusMaster library, whose response timeout is a private constant
-// hardcoded to 2000ms with no public setter - unusable for the requested
-// exact "wait up to 3s, then declare an error" behavior. See the "UPDATE"
-// note in the analysis header at the top of this file.
+// Self-contained RTU master (function 0x03 only) instead of the
+// ModbusMaster library, whose response timeout is a hardcoded 2000ms.
 #define MODBUS_RESPONSE_TIMEOUT_MS 3000
 #define MODBUS_RAW_BUF_SIZE 64
 
@@ -613,10 +288,8 @@ void postTransmission() {
 // Any other nonzero result is a raw Modbus exception code (1-11) reported
 // by the slave itself (e.g. 2 = ILLEGAL DATA ADDRESS).
 
-// Raw bytes for the most recent attempt, refreshed by every call - used by
-// pollModbus()'s [POLL] debug log line, same role RS485LoggingSerial used
-// to serve. Only ever touched from within pollModbus() while serialMutex
-// is held, so no extra locking is needed here.
+// Raw bytes for the most recent attempt, used by pollModbus()'s [POLL] debug
+// log line. Only touched while serialMutex is held, so no extra lock needed.
 uint8_t lastModbusTx[8];
 uint8_t lastModbusTxLen = 0;
 uint8_t lastModbusRx[MODBUS_RAW_BUF_SIZE];
@@ -667,17 +340,10 @@ uint16_t modbusCRC16(const uint8_t *buf, uint8_t len) {
   return crc;
 }
 
-// Reads `qty` (1-2) holding registers from `slaveId` starting at
-// `startAddr` into outRegs[0..qty-1]. Must be called with serialMutex
-// already held (mirrors the old ModbusMaster-based transaction). Enforces
-// the Modbus RTU spec's T3.5 minimum inter-frame silence before
-// transmitting, and its T1.5 max inter-character gap while receiving (see
-// modbusT35Us()/modbusT15Us() above). Blocks for up to
-// MODBUS_RESPONSE_TIMEOUT_MS waiting for a complete response, recognizing
-// "complete" by expected frame length (5 bytes for a slave exception,
-// 5 + qty*2 for a normal reply) rather than a fixed byte count. Returns
-// MB_SUCCESS, MB_ERR_TIMEOUT, MB_ERR_CRC, MB_ERR_WRONG_SLAVE, or a raw
-// 1-11 Modbus exception code from the slave.
+// Reads `qty` (1-2) holding registers from `slaveId` at `startAddr` into
+// outRegs[]. Must be called with serialMutex held. Enforces T3.5/T1.5
+// spec timing; recognizes a complete response by expected frame length
+// rather than a fixed byte count. Returns MB_SUCCESS or an MB_ERR_* code.
 uint8_t modbusReadHoldingRegisters(uint8_t slaveId, uint16_t startAddr, uint16_t qty, uint16_t *outRegs) {
   uint8_t req[8];
 
@@ -695,15 +361,7 @@ uint8_t modbusReadHoldingRegisters(uint8_t slaveId, uint16_t startAddr, uint16_t
   memcpy(lastModbusTx, req, sizeof(req));
   lastModbusTxLen = sizeof(req);
 
-  // Modbus RTU spec: at least T3.5 character times of bus silence must
-  // have elapsed since the last activity (our own previous TX, or the
-  // last byte of a previous response) before a new frame may start, so a
-  // receiver can unambiguously recognize this as the beginning of a new
-  // frame. Safe to busy-wait here (delayMicroseconds) - Core 1 is
-  // dedicated to modbusTask, and in practice this only ever adds a real
-  // wait at very low baud rates (e.g. ~128ms shortfall at 300 baud);
-  // at typical baud (9600+) the per-parameter delay(100) already in
-  // pollModbus() covers it and this is a no-op.
+  // Enforce T3.5 minimum inter-frame silence before transmitting.
   uint32_t t35 = modbusT35Us();
   uint32_t sinceActivity = micros() - lastBusActivityUs;
   if (sinceActivity < t35) {
@@ -735,11 +393,7 @@ uint8_t modbusReadHoldingRegisters(uint8_t slaveId, uint16_t startAddr, uint16_t
       uint8_t b = Serial1.read();
       uint32_t now = micros();
 
-      // Modbus RTU spec: a gap exceeding T1.5 character times between two
-      // bytes within a frame marks a frame boundary - whatever was
-      // accumulated before this byte doesn't belong with it, even if the
-      // combination would otherwise look complete. Restart from here
-      // rather than splicing them together.
+      // A gap exceeding T1.5 marks a new frame boundary - discard and restart.
       if (rxLen > 0 && (now - lastByteUs) > t15) {
         rxLen = 0;
         expectedLen = 0;
@@ -763,16 +417,10 @@ uint8_t modbusReadHoldingRegisters(uint8_t slaveId, uint16_t startAddr, uint16_t
         break;
       }
     } else if (rxLen == 0) {
-      // Not mid-frame yet, so it's safe to yield here - this could be a
-      // long wait (up to MODBUS_RESPONSE_TIMEOUT_MS), and the UART
-      // hardware FIFO buffers whatever arrives regardless of our polling
-      // cadence, so nothing is missed by not busy-spinning while idle.
+      // Not mid-frame yet, so it's safe to yield during this potentially long wait.
       vTaskDelay(1);
     }
-    // else: mid-frame (rxLen > 0) - busy-poll without yielding so the
-    // T1.5 gap check above stays accurate to the microsecond. Bounded to
-    // a few ms at most (one short frame), safe on a core dedicated to
-    // this task alone.
+    // else: mid-frame - busy-poll so the T1.5 gap check stays microsecond-accurate.
   }
 
   lastBusActivityUs = (rxLen > 0) ? lastByteUs : micros();
@@ -1438,18 +1086,11 @@ void logModbusStatusChange(int index) {
 }
 
 // ===================== Poll Modbus =====================
-// Runs entirely on modbusTask, which now has Core 1 entirely to itself -
-// webTask (web server, TCP, WiFi retry) and logTask both run on Core 0
-// instead (see the "UPDATE" notes in the analysis header at the top of
-// this file). The actual RS485 transaction (modbusReadHoldingRegisters())
-// always happens OUTSIDE dataMutex, using values snapshotted under a
-// brief lock, so slow web/data-mutex work can never stretch the time the
-// bus is held. The lock is only ever held for fast, in-RAM struct
-// reads/writes - never across a serial transaction. Per the requested
-// state machine: each parameter gets its own up-to-3s request/response
-// attempt (see MODBUS_RESPONSE_TIMEOUT_MS), a timeout or corrupt/mismatched
-// response is reported immediately (no debounce), and the next
-// configured/enabled parameter is polled right after, in order.
+// Runs entirely on modbusTask. The RS485 transaction always happens
+// OUTSIDE dataMutex, using values snapshotted under a brief lock, so the
+// bus is never held across slow web/data-mutex work. Each parameter gets
+// its own up-to-3s attempt; a timeout or corrupt response is reported
+// immediately (no debounce), then the next enabled parameter is polled.
 void pollModbus() {
   int count;
 
@@ -1488,12 +1129,8 @@ void pollModbus() {
       regLen = 2;
     }
 
-    // ---- RS485 transaction: only guarded against Serial1 reconfiguration ----
-    // (handleSaveCommunication changing baud/parity/stop). This is never held
-    // by the web/loop task during normal request handling, so ordinary HTTP
-    // traffic still can't add any delay here - only a deliberate comm-settings
-    // save can, and only for the duration of one transaction (up to
-    // MODBUS_RESPONSE_TIMEOUT_MS if the slave doesn't answer).
+    // ---- RS485 transaction: serialMutex only guards against a comm-settings
+    // save changing baud/parity/stop mid-transaction. ----
     xSemaphoreTake(serialMutex, portMAX_DELAY);
 
     uint16_t regs[2] = { 0, 0 };
@@ -1531,9 +1168,7 @@ void pollModbus() {
       params[i].errorCode = 0;
       params[i].lastUpdateTime = millis();
     } else {
-      // Reported immediately - no debounce/grace window. A single failed
-      // 3-second attempt (timeout, CRC/frame mismatch, wrong slave, or a
-      // slave exception code) is an error, per the requested behavior.
+      // Reported immediately - no debounce/grace window.
       params[i].valid = false;
       params[i].errorCode = result;
     }
@@ -1545,10 +1180,7 @@ void pollModbus() {
     delay(100);
   }
 
-  // Every enabled/configured record has now been polled for this cycle -
-  // signal webTask (Core 0) to push the fresh results over TCP. Binary
-  // semaphore: if webTask hasn't consumed the previous signal yet, this
-  // just leaves it set rather than queuing multiple sends.
+  // Cycle done - signal webTask to push results over TCP.
   xSemaphoreGive(pollCompleteSem);
 }
 
@@ -2412,17 +2044,13 @@ void setup() {
     "ModbusTask",
     MODBUS_TASK_STACK,
     NULL,
-    MODBUS_TASK_PRIORITY,  // Highest safe priority for this real-time
-                            // polling task - see MODBUS_TASK_PRIORITY
-                            // definition near the top of this file.
+    MODBUS_TASK_PRIORITY,
     &modbusTaskHandle,
     MODBUS_TASK_CORE);
 
   logKeyEvent("MODBUS POLLING STARTED (core " + String(MODBUS_TASK_CORE) + ")");
 
-  // Web server / TCP push / WiFi retry, pinned to Core 0 so Core 1 is left
-  // entirely to modbusTask above - see the "UPDATE" note in the analysis
-  // header at the top of this file.
+  // Web server / TCP push / WiFi retry, pinned to Core 0 so Core 1 stays dedicated to modbusTask.
   xTaskCreatePinnedToCore(
     webTask,
     "WebTask",
@@ -2481,33 +2109,15 @@ void printModbusSummary() {
   Serial.print(" | Disabled=");
   Serial.println(disabledCount);
 
-  // Already rate-limited to DEBUG_SUMMARY_INTERVAL_MS above, so this is a
-  // steady, short heartbeat for the field log - not per-parameter spam.
+  // Rate-limited heartbeat for the field log, not per-parameter spam.
   logKeyEvent("POLL: " + String(okCount) + "/" + String(enabledCount) + " OK" + (errorCount > 0 ? (", " + String(errorCount) + " ERR") : ""));
 #endif
 }
 
 // ===================== Modbus Task (Core 1 - dedicated) =====================
-// Runs at MODBUS_TASK_PRIORITY (configMAX_PRIORITIES - 5), deliberately the
-// highest practical priority in this program, because Modbus polling is
-// the real-time operation here. Core 1 was originally shared with the
-// Arduino loop()/web server task and kept safe purely by priority
-// preemption; it's now dedicated to modbusTask alone, with webTask (web
-// server, TCP, WiFi retry) and logTask both moved to Core 0 - see the
-// "UPDATE" notes in the analysis header at the top of this file for why
-// (Core 0 also hosts the WiFi/lwIP stack's own internal high-priority
-// tasks/ISRs, and sharing a core with them was the original source of the
-// intermittent jitter that made this task miss fast slave responses).
-// Paces itself to the user-configurable pollIntervalMs (Settings > RS485
-// Communication). By request, a full cycle is poll -> TCP send -> next
-// poll, strictly sequential: pollModbus() signals pollCompleteSem when
-// every enabled/configured record has been polled, then this task waits
-// (up to TCP_SEND_TIMEOUT_MS) on tcpSendDoneSem for webTask (Core 0) to
-// finish (or skip, if not configured) that cycle's TCP push - see the
-// "UPDATE" note in the analysis header at the top of this file. The wait
-// is bounded, not indefinite: if webTask hasn't responded within
-// TCP_SEND_TIMEOUT_MS, this task gives up and moves on to the next poll
-// cycle anyway, exactly as requested, so a hung/dead TCP link can never
+// Paces itself to pollIntervalMs. Each cycle is poll -> TCP send -> next
+// poll: pollModbus() signals pollCompleteSem, then this task waits (up to
+// TCP_SEND_TIMEOUT_MS) on tcpSendDoneSem so a hung TCP link can never
 // stall real-time polling.
 void modbusTask(void *parameter) {
   for (;;) {
@@ -2515,11 +2125,7 @@ void modbusTask(void *parameter) {
 
     pollModbus();
 
-    // Discard any stale signal left over from a previous cycle whose TCP
-    // feedback only arrived after that cycle's wait below had already
-    // timed out - otherwise it would be mistaken for *this* cycle's
-    // feedback and this wait would return immediately without actually
-    // having waited for this cycle's send.
+    // Discard any stale signal from a previous cycle's late TCP feedback.
     xSemaphoreTake(tcpSendDoneSem, 0);
 
     if (xSemaphoreTake(tcpSendDoneSem, pdMS_TO_TICKS(TCP_SEND_TIMEOUT_MS)) != pdTRUE) {
@@ -2544,12 +2150,7 @@ void modbusTask(void *parameter) {
 }
 
 // ===================== Log Task (Core 0 / WiFi core) =====================
-// Drains logQueue and performs the actual Serial.println() plus the
-// debugLogs/keyLog String work - the part of logging that involves heap
-// allocation and a (potentially blocking) USB UART write. Pinned to
-// Core 0 and given a low priority so none of it ever takes CPU time away
-// from modbusTask, which now has Core 1 entirely to itself. See the
-// "UPDATE" notes in the analysis header at the top of this file.
+// Drains logQueue and does the actual Serial.println()/String work off Core 1.
 void logTask(void *parameter) {
   LogQueueItem item;
 
@@ -2586,12 +2187,8 @@ void logTask(void *parameter) {
 }
 
 // ===================== Web / TCP / WiFi Task (Core 0) =====================
-// Everything that used to run in Arduino's loop() on Core 1 - the web
-// server, the TCP push, and WiFi retry/status handling - now runs here
-// instead, explicitly pinned to Core 0 so Core 1 is left entirely to
-// modbusTask (see the "UPDATE" note in the analysis header at the top of
-// this file). vTaskDelay(1) each pass is the equivalent of the implicit
-// yield Arduino's own loopTask gets between calls to loop().
+// Web server, TCP push, and WiFi retry - pinned to Core 0 so Core 1 stays
+// dedicated to modbusTask.
 void webTask(void *parameter) {
   for (;;) {
     server.handleClient();
@@ -2599,13 +2196,7 @@ void webTask(void *parameter) {
     handleUplinkWiFiRetry();
     checkWifiUplinkStatusChange();
 
-    // Fires once per completed Modbus poll cycle (see pollModbus()), instead
-    // of on an independent timer, so TCP always carries a fully fresh set of
-    // enabled/configured record values rather than a mix of old and new.
-    // modbusTask is blocked on tcpSendDoneSem waiting for the next line, so
-    // this must always run to completion and give it back - sendTcpData()
-    // already returns quickly on its own if TCP isn't configured or WiFi
-    // is down, so an idle/unconfigured TCP target can't stall polling.
+    // Fires once per completed poll cycle so TCP always carries fresh data.
     if (xSemaphoreTake(pollCompleteSem, 0) == pdTRUE) {
       sendTcpData();
       xSemaphoreGive(tcpSendDoneSem);
@@ -2618,12 +2209,7 @@ void webTask(void *parameter) {
 }
 
 // ===================== Main Loop (Core 1, unused) =====================
-// Intentionally empty: Arduino requires setup()/loop() to exist, and the
-// framework's own loopTask keeps calling this on Core 1 regardless (that
-// scheduling is fixed by the core's main.cpp, not overridable from a
-// sketch) - but all real work has moved to webTask (Core 0) and
-// modbusTask (Core 1), so there's nothing left for it to do. The delay
-// just avoids needlessly busy-spinning an idle task.
+// Intentionally empty: all real work has moved to webTask/modbusTask.
 void loop() {
   delay(1000);
 }
