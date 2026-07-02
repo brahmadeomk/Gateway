@@ -280,6 +280,12 @@ void postTransmission() {
 // ModbusMaster library, whose response timeout is a hardcoded 2000ms.
 #define MODBUS_RESPONSE_TIMEOUT_MS 3000
 #define MODBUS_RAW_BUF_SIZE 64
+// Pause between parameters in a poll cycle. T3.5 bus-silence is already
+// enforced per-transaction inside modbusReadHoldingRegisters(), so this is
+// just extra settle headroom for slave-side processing, not a bus-timing
+// requirement - kept small rather than removed to be conservative on
+// existing hardware.
+#define MODBUS_INTER_PARAM_DELAY_MS 20
 
 #define MB_SUCCESS 0x00
 #define MB_ERR_TIMEOUT 0xE2      // nothing usable arrived within MODBUS_RESPONSE_TIMEOUT_MS
@@ -946,6 +952,7 @@ unsigned long getTimestamp() {
 
 String buildTcpJson() {
   String json = "{";
+  json.reserve(96 + paramCount * 96);  // avoid repeated reallocation while appending below
 
   json += "\"device_id\":\"" + getDeviceMacID() + "\",";
   json += "\"timestamp\":" + String(getTimestamp()) + ",";
@@ -1017,6 +1024,11 @@ bool connectTcpServer() {
       return false;
     }
 
+    // Disable Nagle's algorithm so small JSON payloads go out immediately
+    // instead of being buffered/delayed. Must be set after connect() -
+    // some cores reset this flag to its default during connect().
+    tcpClient.setNoDelay(true);
+
     logMessage("TCP OK");
   }
 
@@ -1043,9 +1055,10 @@ void sendTcpData() {
   }
 
   String payload = buildTcpJson();
+  payload += "\n";
 
-  tcpClient.print(payload);
-  tcpClient.print("\n");
+  // Single write() call so the payload goes out as one TCP send instead of two.
+  tcpClient.write((const uint8_t *)payload.c_str(), payload.length());
 
   logMessage("TCP DATA SENT");
   logMessage(payload);
@@ -1177,7 +1190,7 @@ void pollModbus() {
 
     xSemaphoreGive(dataMutex);
 
-    delay(100);
+    delay(MODBUS_INTER_PARAM_DELAY_MS);
   }
 
   // Cycle done - signal webTask to push results over TCP.
@@ -1887,6 +1900,7 @@ void handleSaveTypes() {
 // ===================== JSON Data Endpoint =====================
 void handleData() {
   String json = "{";
+  json.reserve(96 + paramCount * 160);  // avoid repeated reallocation while appending below
   json += "\"device\":\"ESP32 Modbus RTU Gateway\",";
   json += "\"nowMs\":" + String(millis()) + ",";
 
