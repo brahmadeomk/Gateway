@@ -1032,7 +1032,9 @@ String buildTcpJson() {
   String json = "{";
   json.reserve(96 + paramCount * 96);  // avoid repeated reallocation while appending below
 
-  json += "\"device_id\":\"" + getDeviceMacID() + "\",";
+  // Same identity the user sees on the Settings page (Device Name):
+  // prefix_XXXXX when a prefix is set, full MAC otherwise.
+  json += "\"device_id\":\"" + jsonEscape(getDeviceName()) + "\",";
   json += "\"timestamp\":" + String(getTimestamp()) + ",";
   json += "\"sensors\":[";
 
