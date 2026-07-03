@@ -36,6 +36,7 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <math.h>
+#include <time.h>
 #include <WiFiClient.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -49,6 +50,17 @@
 const char* AP_PASSWORD = "12345678";
 // Max length of the user-provided device-name prefix (see getDeviceName()).
 #define DEVICE_NAME_PREFIX_MAX_LEN 5
+
+// ===================== NTP (best-effort) =====================
+// SNTP sync runs in the background once the uplink WiFi has internet.
+// If it succeeds, TCP JSON timestamps become real UTC epoch seconds;
+// until/unless it does (e.g. AP-only setup, no internet), timestamps
+// stay seconds-since-boot exactly as before. See getTimestamp().
+#define NTP_SERVER_1 "pool.ntp.org"
+#define NTP_SERVER_2 "time.nist.gov"
+// Anything below this can't be a real current date, so time() results
+// under it mean "SNTP hasn't synced yet" (epoch for 2025-01-01).
+#define MIN_VALID_EPOCH 1735689600UL
 
 // ===================== RS485 Pins =====================
 #define RXD2 D2
@@ -1024,18 +1036,30 @@ String getEffectiveApSsid() {
   return deviceConfig.apMatchesDeviceName ? getDeviceName() : deviceConfig.apSsid;
 }
 
+// True once SNTP has produced a plausible current date (see MIN_VALID_EPOCH).
+bool isTimeSynced() {
+  return time(nullptr) >= (time_t)MIN_VALID_EPOCH;
+}
+
+// UTC epoch seconds when NTP has synced; otherwise seconds-since-boot,
+// exactly the pre-NTP behavior. The JSON's time_source field tells the
+// receiver which one it is getting.
 unsigned long getTimestamp() {
+  if (isTimeSynced()) {
+    return (unsigned long)time(nullptr);
+  }
   return millis() / 1000;
 }
 
 String buildTcpJson() {
   String json = "{";
-  json.reserve(96 + paramCount * 96);  // avoid repeated reallocation while appending below
+  json.reserve(128 + paramCount * 96);  // avoid repeated reallocation while appending below
 
   // Same identity the user sees on the Settings page (Device Name):
   // prefix_XXXXX when a prefix is set, full MAC otherwise.
   json += "\"device_id\":\"" + jsonEscape(getDeviceName()) + "\",";
   json += "\"timestamp\":" + String(getTimestamp()) + ",";
+  json += "\"time_source\":\"" + String(isTimeSynced() ? "ntp" : "uptime") + "\",";
   json += "\"sensors\":[";
 
   xSemaphoreTake(dataMutex, portMAX_DELAY);
@@ -2232,6 +2256,11 @@ void setup() {
 
   connectUplinkWiFi();
 
+  // Best-effort background SNTP (UTC, no TZ offset - cloud data should be
+  // UTC). Non-blocking: syncs whenever the uplink actually has internet,
+  // and getTimestamp() keeps using uptime seconds until then.
+  configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);
+
   logKeyEvent("AP STARTED: " + apSsidToUse + " " + WiFi.softAPIP().toString());
   logMessage("RS485 RX=D2 TX=D3 DE/RE=D4");
   logMessage("TCP TARGET: " + uplinkConfig.serverIP + ":" + String(uplinkConfig.port));
@@ -2404,11 +2433,20 @@ void logTask(void *parameter) {
 // Web server, TCP push, and WiFi retry - pinned to Core 0 so Core 1 stays
 // dedicated to modbusTask.
 void webTask(void *parameter) {
+  bool ntpSyncLogged = false;
+
   for (;;) {
     server.handleClient();
 
     handleUplinkWiFiRetry();
     checkWifiUplinkStatusChange();
+
+    // One-time key-log entry the first time SNTP produces real time, so
+    // the field log shows when timestamps switched from uptime to UTC.
+    if (!ntpSyncLogged && isTimeSynced()) {
+      ntpSyncLogged = true;
+      logKeyEvent("NTP TIME SYNCED - timestamps now UTC epoch");
+    }
 
     // Fires once per completed poll cycle so TCP always carries fresh data.
     if (xSemaphoreTake(pollCompleteSem, 0) == pdTRUE) {
