@@ -14,12 +14,13 @@
      the bus back to receive before the slave's ~1ms response window
      starts. It's wrapped in a portENTER/EXIT_CRITICAL section and has no
      added delay.
-   - modbusReadHoldingRegisters() is a small self-contained Modbus RTU
-     master (function 0x03 only) instead of the ModbusMaster library,
-     because the library's response timeout is a hardcoded, unconfigurable
-     2000ms. It enforces an explicit 3s response timeout
-     (MODBUS_RESPONSE_TIMEOUT_MS), plus the spec's T3.5 (inter-frame) and
-     T1.5 (inter-byte) silence rules computed from the live baud rate.
+   - modbusRead() is a small self-contained Modbus RTU master (read
+     function codes 0x01-0x04: coils, discrete inputs, input registers,
+     holding registers) instead of the ModbusMaster library, because the
+     library's response timeout is a hardcoded, unconfigurable 2000ms. It
+     enforces an explicit 3s response timeout (MODBUS_RESPONSE_TIMEOUT_MS),
+     plus the spec's T3.5 (inter-frame) and T1.5 (inter-byte) silence
+     rules computed from the live baud rate.
    - Errors (timeout, bad CRC/length, wrong slave, slave exception) are
      reported immediately with no debounce/grace period.
    - Each poll cycle is strictly poll -> cloud send -> next poll:
@@ -124,7 +125,7 @@ const char* AP_PASSWORD = "12345678";
 #define MAX_POLL_INTERVAL_MS 3600000
 // Pause after each parameter's request/response is done, before starting
 // the next one. Modbus's own T3.5 bus-silence timing is already enforced
-// per-transaction inside modbusReadHoldingRegisters() regardless of this
+// per-transaction inside modbusRead() regardless of this
 // value - this is purely extra settle time for slower slave devices that
 // need a moment to recover before accepting the next request. Adjustable
 // on the Settings page; raise it if parameters right after a fast one
@@ -329,9 +330,23 @@ ParamType typeList[MAX_PARAM_TYPES];
 int typeCount = 0;
 
 // ===================== Modbus Parameter Structure =====================
+// Which of the four Modbus address spaces a parameter reads from. The
+// numeric order matters: 0 = holding register, so configs saved before
+// this field existed keep their old behavior. Coils/discrete inputs are
+// 1-bit; discrete inputs and input registers are read-only per the spec.
+#define AREA_HOLDING_REGISTER 0
+#define AREA_INPUT_REGISTER 1
+#define AREA_COIL 2
+#define AREA_DISCRETE_INPUT 3
+
+bool isBitArea(uint8_t area) {
+  return area == AREA_COIL || area == AREA_DISCRETE_INPUT;
+}
+
 struct ModbusParam {
   String name;
   String type;
+  uint8_t area;  // AREA_* address space (determines the read function code)
   uint8_t slaveId;
   uint16_t registerAddress;
   uint16_t registerLength;
@@ -476,15 +491,31 @@ uint16_t modbusCRC16(const uint8_t *buf, uint8_t len) {
   return crc;
 }
 
-// Reads `qty` (1-2) holding registers from `slaveId` at `startAddr` into
-// outRegs[]. Must be called with serialMutex held. Enforces T3.5/T1.5
-// spec timing; recognizes a complete response by expected frame length
-// rather than a fixed byte count. Returns MB_SUCCESS or an MB_ERR_* code.
-uint8_t modbusReadHoldingRegisters(uint8_t slaveId, uint16_t startAddr, uint16_t qty, uint16_t *outRegs) {
+// Read function code for each register area.
+uint8_t modbusFunctionForArea(uint8_t area) {
+  switch (area) {
+    case AREA_INPUT_REGISTER: return 0x04;
+    case AREA_COIL: return 0x01;
+    case AREA_DISCRETE_INPUT: return 0x02;
+    default: return 0x03;  // holding register
+  }
+}
+
+// Reads `qty` values from `slaveId` at `startAddr` into outRegs[]: 16-bit
+// registers for holding/input areas (qty 1-2), single bits (0/1) for
+// coil/discrete areas. All four read function codes share the same 8-byte
+// request frame; only the response data length differs (2 bytes per
+// register vs one packed byte per 8 bits). Must be called with serialMutex
+// held. Enforces T3.5/T1.5 spec timing; recognizes a complete response by
+// expected frame length. Returns MB_SUCCESS or an MB_ERR_* code.
+uint8_t modbusRead(uint8_t slaveId, uint8_t area, uint16_t startAddr, uint16_t qty, uint16_t *outRegs) {
+  uint8_t fc = modbusFunctionForArea(area);
+  uint8_t expectedDataBytes = isBitArea(area) ? ((qty + 7) / 8) : (qty * 2);
+
   uint8_t req[8];
 
   req[0] = slaveId;
-  req[1] = 0x03;
+  req[1] = fc;
   req[2] = highByte(startAddr);
   req[3] = lowByte(startAddr);
   req[4] = highByte(qty);
@@ -546,7 +577,7 @@ uint8_t modbusReadHoldingRegisters(uint8_t slaveId, uint16_t startAddr, uint16_t
       if (rxLen == 2) {
         // Function code with the high bit set means a slave exception -
         // a fixed, shorter frame than the normal success reply.
-        expectedLen = (rx[1] & 0x80) ? 5 : (5 + qty * 2);
+        expectedLen = (rx[1] & 0x80) ? 5 : (5 + expectedDataBytes);
       }
 
       if (expectedLen != 0 && rxLen >= expectedLen) {
@@ -584,12 +615,19 @@ uint8_t modbusReadHoldingRegisters(uint8_t slaveId, uint16_t startAddr, uint16_t
     return rx[2];  // raw Modbus exception code from the slave
   }
 
-  if (rx[1] != 0x03 || rx[2] != qty * 2) {
+  if (rx[1] != fc || rx[2] != expectedDataBytes) {
     return MB_ERR_CRC;
   }
 
-  for (uint16_t r = 0; r < qty; r++) {
-    outRegs[r] = ((uint16_t)rx[3 + r * 2] << 8) | rx[3 + r * 2 + 1];
+  if (isBitArea(area)) {
+    // Bits arrive packed LSB-first: bit r of the response's data bytes.
+    for (uint16_t r = 0; r < qty; r++) {
+      outRegs[r] = (rx[3 + r / 8] >> (r % 8)) & 0x01;
+    }
+  } else {
+    for (uint16_t r = 0; r < qty; r++) {
+      outRegs[r] = ((uint16_t)rx[3 + r * 2] << 8) | rx[3 + r * 2 + 1];
+    }
   }
 
   return MB_SUCCESS;
@@ -1026,6 +1064,7 @@ void loadDefaultSettings() {
   for (int i = 0; i < MAX_PARAMS; i++) {
     params[i].name = "";
     params[i].type = "";
+    params[i].area = AREA_HOLDING_REGISTER;
     params[i].slaveId = 1;
     params[i].registerAddress = 0;
     params[i].registerLength = 1;
@@ -1051,6 +1090,7 @@ void saveSettings() {
 
     preferences.putString(("name" + index).c_str(), params[i].name);
     preferences.putString(("type" + index).c_str(), params[i].type);
+    preferences.putUChar(("area" + index).c_str(), params[i].area);
     preferences.putUChar(("sid" + index).c_str(), params[i].slaveId);
     preferences.putUShort(("addr" + index).c_str(), params[i].registerAddress);
     preferences.putUShort(("len" + index).c_str(), params[i].registerLength);
@@ -1088,6 +1128,13 @@ void loadSettings() {
       params[i].type = typeList[0].name;
     }
 
+    // Default AREA_HOLDING_REGISTER (0): configs saved before the area
+    // field existed keep their original behavior.
+    params[i].area = preferences.getUChar(("area" + index).c_str(), AREA_HOLDING_REGISTER);
+    if (params[i].area > AREA_DISCRETE_INPUT) {
+      params[i].area = AREA_HOLDING_REGISTER;
+    }
+
     params[i].slaveId = preferences.getUChar(("sid" + index).c_str(), 1);
     params[i].registerAddress = preferences.getUShort(("addr" + index).c_str(), 0);
     params[i].registerLength = getDataLengthForType(params[i].type);
@@ -1114,6 +1161,25 @@ String getTypeOptions(String selected) {
     }
 
     html += ">" + htmlEscape(typeList[i].name) + "</option>";
+  }
+
+  return html;
+}
+
+// Display names indexed by AREA_* value - keep in sync with the defines.
+const char *AREA_NAMES[4] = { "Holding Register", "Input Register", "Coil", "Discrete Input" };
+
+String getAreaOptions(uint8_t selected) {
+  String html = "";
+
+  for (uint8_t a = 0; a < 4; a++) {
+    html += "<option value='" + String(a) + "'";
+
+    if (a == selected) {
+      html += " selected";
+    }
+
+    html += ">" + String(AREA_NAMES[a]) + "</option>";
   }
 
   return html;
@@ -1604,6 +1670,7 @@ void pollModbus() {
   for (int i = 0; i < count; i++) {
     bool enabled;
     String type;
+    uint8_t area;
     uint8_t slaveId;
     uint16_t regAddr;
     uint16_t regLen;
@@ -1611,6 +1678,7 @@ void pollModbus() {
     xSemaphoreTake(dataMutex, portMAX_DELAY);
     enabled = params[i].enabled;
     type = params[i].type;
+    area = params[i].area;
     slaveId = params[i].slaveId;
     regAddr = params[i].registerAddress;
     regLen = getDataLengthForType(type);
@@ -1622,6 +1690,12 @@ void pollModbus() {
       params[i].errorCode = 0;
       xSemaphoreGive(dataMutex);
       continue;
+    }
+
+    if (isBitArea(area)) {
+      // Coils/discrete inputs are single bits - the data type's register
+      // length doesn't apply.
+      regLen = 1;
     }
 
     if (regLen < 1) {
@@ -1650,7 +1724,7 @@ void pollModbus() {
     xSemaphoreTake(serialMutex, portMAX_DELAY);
 
     uint16_t regs[2] = { 0, 0 };
-    uint8_t result = modbusReadHoldingRegisters(slaveId, regAddr, regLen, regs);
+    uint8_t result = modbusRead(slaveId, area, regAddr, regLen, regs);
 
     // Snapshot the raw bytes before releasing serialMutex - the next
     // transaction would otherwise overwrite lastModbusTx/Rx before the
@@ -1700,7 +1774,12 @@ void pollModbus() {
     params[i].registerLength = regLen;
 
     if (result == MB_SUCCESS) {
-      params[i].value = convertValue(type, regs[0], regs[1]);
+      if (isBitArea(area)) {
+        // Bits are already 0/1 - the data type/divisor doesn't apply.
+        params[i].value = regs[0] ? 1 : 0;
+      } else {
+        params[i].value = convertValue(type, regs[0], regs[1]);
+      }
       params[i].valid = true;
       params[i].errorCode = 0;
       params[i].lastUpdateTime = millis();
@@ -1926,6 +2005,7 @@ void handleSettings() {
 <thead>
 <tr>
 <th>Name</th>
+<th>Register Area</th>
 <th>Data Type</th>
 <th>Data Length</th>
 <th>Device ID</th>
@@ -1938,10 +2018,11 @@ void handleSettings() {
 )rawliteral";
 
   for (int i = 0; i < paramCount; i++) {
-    uint16_t dlen = getDataLengthForType(params[i].type);
+    uint16_t dlen = isBitArea(params[i].area) ? 1 : getDataLengthForType(params[i].type);
 
     html += "<tr>";
     html += "<td><input name='name" + String(i) + "' value='" + htmlEscape(params[i].name) + "'></td>";
+    html += "<td><select name='area" + String(i) + "' onchange='updateAreaSelection(this)'>" + getAreaOptions(params[i].area) + "</select></td>";
     html += "<td><select name='type" + String(i) + "' onchange='updateDataLength(this)'>" + getTypeOptions(params[i].type) + "</select></td>";
     html += "<td><input class='dlen-display' value='" + String(dlen) + "' readonly></td>";
     html += "<td><input name='sid" + String(i) + "' value='" + String(params[i].slaveId) + "'></td>";
@@ -1983,11 +2064,38 @@ function buildTypeOptionsHTML(selected) {
   return opts;
 }
 
+const areaNames = ["Holding Register", "Input Register", "Coil", "Discrete Input"];
+
+function buildAreaOptionsHTML(selected) {
+  let opts = "";
+  areaNames.forEach((n, i) => {
+    opts += `<option value="${i}"${i === selected ? " selected" : ""}>${n}</option>`;
+  });
+  return opts;
+}
+
+function isBitAreaValue(v) {
+  return v == 2 || v == 3;  // Coil / Discrete Input
+}
+
 function updateDataLength(selectEl) {
   let row = selectEl.closest("tr");
+  let areaSel = row.querySelector("select[name^='area']");
   let lenInput = row.querySelector(".dlen-display");
+
+  if (areaSel && isBitAreaValue(areaSel.value)) {
+    lenInput.value = 1;  // bits are always length 1; data type doesn't apply
+    return;
+  }
+
   let info = paramTypeInfo.find(t => t.name === selectEl.value);
   lenInput.value = info ? info.length : 1;
+}
+
+function updateAreaSelection(selectEl) {
+  let row = selectEl.closest("tr");
+  let typeSel = row.querySelector("select[name^='type']");
+  updateDataLength(typeSel);
 }
 
 function buildParamRow() {
@@ -1997,6 +2105,7 @@ function buildParamRow() {
 
   row.innerHTML = `
     <td><input name="nameX" value=""></td>
+    <td><select name="areaX" onchange="updateAreaSelection(this)">${buildAreaOptionsHTML(0)}</select></td>
     <td><select name="typeX" onchange="updateDataLength(this)">${buildTypeOptionsHTML(defaultType)}</select></td>
     <td><input class="dlen-display" value="${defaultLen}" readonly></td>
     <td><input name="sidX" value="1"></td>
@@ -2034,6 +2143,7 @@ function renumberParamRows() {
 
   rows.forEach((row, index) => {
     row.querySelector("input[name^='name']").name = "name" + index;
+    row.querySelector("select[name^='area']").name = "area" + index;
     row.querySelector("select[name^='type']").name = "type" + index;
     row.querySelector("input[name^='sid']").name = "sid" + index;
     row.querySelector("input[name^='addr']").name = "addr" + index;
@@ -2400,9 +2510,14 @@ void handleSave() {
       }
     }
 
+    params[i].area = server.arg("area" + index).toInt();
+    if (params[i].area > AREA_DISCRETE_INPUT) {
+      params[i].area = AREA_HOLDING_REGISTER;
+    }
+
     params[i].slaveId = server.arg("sid" + index).toInt();
     params[i].registerAddress = server.arg("addr" + index).toInt();
-    params[i].registerLength = getDataLengthForType(params[i].type);
+    params[i].registerLength = isBitArea(params[i].area) ? 1 : getDataLengthForType(params[i].type);
     params[i].enabled = server.hasArg("en" + index);
 
     params[i].value = 0;
@@ -2768,6 +2883,7 @@ void handleData() {
     json += "{";
     json += "\"name\":\"" + jsonEscape(params[i].name) + "\",";
     json += "\"type\":\"" + jsonEscape(params[i].type) + "\",";
+    json += "\"area\":\"" + String(AREA_NAMES[params[i].area <= AREA_DISCRETE_INPUT ? params[i].area : 0]) + "\",";
     json += "\"slaveId\":" + String(params[i].slaveId) + ",";
     json += "\"registerAddress\":" + String(params[i].registerAddress) + ",";
     json += "\"registerLength\":" + String(params[i].registerLength) + ",";
