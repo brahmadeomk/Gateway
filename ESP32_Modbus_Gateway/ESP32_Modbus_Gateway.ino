@@ -52,12 +52,14 @@ const char* AP_PASSWORD = "12345678";
 #define DEVICE_NAME_PREFIX_MAX_LEN 5
 
 // ===================== NTP (best-effort) =====================
-// SNTP sync runs in the background once the uplink WiFi has internet.
-// If it succeeds, TCP JSON timestamps become real UTC epoch seconds;
-// until/unless it does (e.g. AP-only setup, no internet), timestamps
-// stay seconds-since-boot exactly as before. See getTimestamp().
+// SNTP sync runs in the background once the uplink WiFi has a route to an
+// NTP server. Priority: the user-set on-premise server (Settings page,
+// optional) is tried first, then these public servers; if none ever
+// responds, timestamps stay seconds-since-boot exactly as before. See
+// startNtp() / getTimestamp().
 #define NTP_SERVER_1 "pool.ntp.org"
 #define NTP_SERVER_2 "time.nist.gov"
+#define NTP_SERVER_MAX_LEN 64
 // Anything below this can't be a real current date, so time() results
 // under it mean "SNTP hasn't synced yet" (epoch for 2025-01-01).
 #define MIN_VALID_EPOCH 1735689600UL
@@ -209,6 +211,7 @@ struct UplinkConfig {
   String password;
   String serverIP;
   int port;
+  String ntpServer;  // optional on-premise NTP; tried before the public servers
 };
 
 UplinkConfig uplinkConfig;
@@ -624,6 +627,7 @@ void saveUplinkConfig() {
   preferences.putString("pass", uplinkConfig.password);
   preferences.putString("ip", uplinkConfig.serverIP);
   preferences.putInt("port", uplinkConfig.port);
+  preferences.putString("ntp", uplinkConfig.ntpServer);
 
   preferences.end();
 
@@ -640,6 +644,7 @@ void loadUplinkConfig() {
   uplinkConfig.password = preferences.getString("pass", "");
   uplinkConfig.serverIP = preferences.getString("ip", "");
   uplinkConfig.port = preferences.getInt("port", 0);
+  uplinkConfig.ntpServer = preferences.getString("ntp", "");
 
   preferences.end();
 
@@ -661,6 +666,24 @@ void loadUplinkConfig() {
   }
 
   logMessage("========== LOAD TCP CONFIG END ==========");
+}
+
+// ===================== NTP Start / Restart =====================
+// (Re)starts background SNTP with the configured server priority:
+// on-premise server first when one is set, then the public pool servers.
+// Static buffer because lwIP's SNTP keeps the server-name POINTER, not a
+// copy - a temporary String::c_str() here would dangle after return.
+void startNtp() {
+  static char onPremNtpBuf[NTP_SERVER_MAX_LEN];
+
+  if (uplinkConfig.ntpServer.length() > 0) {
+    uplinkConfig.ntpServer.toCharArray(onPremNtpBuf, sizeof(onPremNtpBuf));
+    configTime(0, 0, onPremNtpBuf, NTP_SERVER_1, NTP_SERVER_2);
+    logMessage("NTP PRIORITY: " + String(onPremNtpBuf) + " > " + NTP_SERVER_1 + " > " + NTP_SERVER_2);
+  } else {
+    configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);
+    logMessage("NTP PRIORITY: " + String(NTP_SERVER_1) + " > " + NTP_SERVER_2 + " (no on-premise server set)");
+  }
 }
 
 // ===================== Device / AP Identity Save / Load =====================
@@ -1701,6 +1724,9 @@ function toggleApSsidField() {
   html += "<tr><th>WiFi Password</th><td><input type='password' name='password' placeholder='Leave blank to keep unchanged'></td></tr>";
   html += "<tr><th>Master IP</th><td><input type='text' name='ip' value='" + htmlEscape(uplinkConfig.serverIP) + "'></td></tr>";
   html += "<tr><th>Master Port</th><td><input type='number' name='port' value='" + String(uplinkConfig.port) + "'></td></tr>";
+
+  html += "<tr><th>On-Premise NTP Server</th><td><input type='text' name='ntpServer' maxlength='" + String(NTP_SERVER_MAX_LEN - 1) + "' placeholder='Optional, e.g. 192.168.1.10 or ntp.local' value='" + htmlEscape(uplinkConfig.ntpServer) + "'>"
+          "<br><small>Tried first for time sync; falls back to public NTP (" + String(NTP_SERVER_1) + "), then uptime-based timestamps. Leave blank to use public NTP only.</small></td></tr>";
   html += "<tr><td colspan='2'><button type='submit'>Save Network</button></td></tr>";
   html += "</table>";
   html += "</form>";
@@ -2027,6 +2053,15 @@ void handleSaveUplink() {
     uplinkConfig.port = server.arg("port").toInt();
   }
 
+  if (server.hasArg("ntpServer")) {
+    String ntp = server.arg("ntpServer");
+    ntp.trim();
+    if (ntp.length() >= NTP_SERVER_MAX_LEN) {
+      ntp = ntp.substring(0, NTP_SERVER_MAX_LEN - 1);
+    }
+    uplinkConfig.ntpServer = ntp;
+  }
+
   if (uplinkConfig.port <= 0 || uplinkConfig.port > 65535) {
     uplinkConfig.port = 5000;
   }
@@ -2038,7 +2073,12 @@ void handleSaveUplink() {
 
   connectUplinkWiFi();
 
-  logKeyEvent("NETWORK CONFIG SAVED: ssid=" + uplinkConfig.ssid + " tcp=" + uplinkConfig.serverIP + ":" + String(uplinkConfig.port));
+  // Re-arm SNTP so a changed/cleared on-premise server takes effect
+  // immediately, not just after the next reboot.
+  startNtp();
+
+  logKeyEvent("NETWORK CONFIG SAVED: ssid=" + uplinkConfig.ssid + " tcp=" + uplinkConfig.serverIP + ":" + String(uplinkConfig.port)
+              + (uplinkConfig.ntpServer.length() > 0 ? (" ntp=" + uplinkConfig.ntpServer) : ""));
 
   server.sendHeader("Location", "/settings?uplinkSaved=1");
   server.send(303);
@@ -2257,9 +2297,9 @@ void setup() {
   connectUplinkWiFi();
 
   // Best-effort background SNTP (UTC, no TZ offset - cloud data should be
-  // UTC). Non-blocking: syncs whenever the uplink actually has internet,
+  // UTC). Non-blocking: syncs whenever a configured server is reachable,
   // and getTimestamp() keeps using uptime seconds until then.
-  configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);
+  startNtp();
 
   logKeyEvent("AP STARTED: " + apSsidToUse + " " + WiFi.softAPIP().toString());
   logMessage("RS485 RX=D2 TX=D3 DE/RE=D4");
