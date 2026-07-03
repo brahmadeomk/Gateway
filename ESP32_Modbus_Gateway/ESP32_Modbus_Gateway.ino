@@ -31,6 +31,13 @@
    - Logging is offloaded from modbusTask via a queue (logQueue) to a
      dedicated low-priority logTask on Core 0, so Serial/String work never
      steals time from the real-time core.
+   - Store & forward: payloads that can't be delivered are queued in a
+     RAM ring buffer (SF_MAX_ENTRIES/SF_MAX_BYTES, oldest dropped) and
+     replayed in order once the uplink recovers - see sendCloudData().
+   - Per-slave backoff: after SLAVE_BACKOFF_FAIL_THRESHOLD consecutive
+     timeouts a slave's parameters are skipped for SLAVE_BACKOFF_MS and
+     then re-probed, so one dead slave can't stretch every poll cycle by
+     3s per parameter - see pollModbus()/slaveHealth[].
    ====================================================================== */
 
 #include <WiFi.h>
@@ -83,6 +90,26 @@ const char* AP_PASSWORD = "12345678";
 #define MQTT_RETRY_INTERVAL_MS 10000
 #define MQTT_HANDSHAKE_TIMEOUT_S 10
 #define MQTT_SOCKET_TIMEOUT_S 5
+
+// ===================== Store & Forward =====================
+// When the uplink (TCP or MQTT) is down, each poll cycle's payload is
+// queued in a RAM ring buffer and replayed in order once the uplink
+// recovers - timestamps are already inside each payload, so history
+// arrives intact. Oldest entries are dropped when the caps are hit.
+#define SF_MAX_ENTRIES 64
+#define SF_MAX_BYTES 32768
+// Max backlog replays per poll cycle, so a big drain can't stall the web
+// UI for long; the rest goes out on the following cycles.
+#define SF_MAX_DRAIN_PER_CYCLE 8
+
+// ===================== Per-Slave Backoff =====================
+// After this many consecutive TIMEOUTS (no response at all - CRC errors
+// and Modbus exceptions mean the slave is alive), a slave is considered
+// offline and its parameters are skipped for SLAVE_BACKOFF_MS, then
+// re-probed. Caps a dead slave's cost at one 3s timeout per backoff
+// window instead of 3s per parameter on every cycle.
+#define SLAVE_BACKOFF_FAIL_THRESHOLD 3
+#define SLAVE_BACKOFF_MS 30000
 
 // ===================== RS485 Pins =====================
 #define RXD2 D2
@@ -326,7 +353,7 @@ int paramCount = 0;
 void resetDebugState(int index);
 String htmlEscape(String text);
 String jsonEscape(String text);
-void sendTcpData();
+void sendCloudData();
 
 // ===================== Logger =====================
 // Builds a small fixed-size item and hands it to logTask (Core 0) - see
@@ -383,8 +410,19 @@ void postTransmission() {
 #define MB_ERR_TIMEOUT 0xE2      // nothing usable arrived within MODBUS_RESPONSE_TIMEOUT_MS
 #define MB_ERR_CRC 0xE3          // frame length/byte-count/CRC didn't check out
 #define MB_ERR_WRONG_SLAVE 0xE0  // a well-formed frame arrived, but from a different slave ID
+#define MB_ERR_BACKOFF 0xE4      // not polled: slave is in its offline backoff window
 // Any other nonzero result is a raw Modbus exception code (1-11) reported
 // by the slave itself (e.g. 2 = ILLEGAL DATA ADDRESS).
+
+// Per-slave health for the offline backoff, indexed by slave ID. Only
+// ever touched by modbusTask, so no locking needed. backoffUntil == 0
+// means "not in backoff"; nonzero is the millis() deadline of the window.
+struct SlaveHealth {
+  uint8_t consecTimeouts;
+  unsigned long backoffUntil;
+};
+
+SlaveHealth slaveHealth[256] = {};
 
 // Raw bytes for the most recent attempt, used by pollModbus()'s [POLL] debug
 // log line. Only touched while serialMutex is held, so no extra lock needed.
@@ -1289,19 +1327,29 @@ void checkTcpUplinkStatusChange() {
   }
 }
 
-void sendTcpData() {
+// Sends one payload (newline-framed) over raw TCP. Returns false when the
+// connection is down or the write comes up short, so the caller can queue
+// the payload for store & forward instead of losing it.
+bool sendPayloadTcp(const String &payload) {
   if (!connectTcpServer()) {
-    return;
+    return false;
   }
 
-  String payload = buildTcpJson();
-  payload += "\n";
+  String framed = payload;
+  framed += "\n";
 
   // Single write() call so the payload goes out as one TCP send instead of two.
-  tcpClient.write((const uint8_t *)payload.c_str(), payload.length());
+  size_t written = tcpClient.write((const uint8_t *)framed.c_str(), framed.length());
+
+  if (written != framed.length()) {
+    logMessage("TCP SEND INCOMPLETE (" + String(written) + "/" + String(framed.length()) + ")");
+    tcpClient.stop();
+    return false;
+  }
 
   logMessage("TCP DATA SENT");
   logMessage(payload);
+  return true;
 }
 
 // ===================== MQTT / AWS IoT Uplink =====================
@@ -1390,12 +1438,12 @@ void checkMqttUplinkStatusChange() {
   }
 }
 
-void sendMqttData() {
+// Publishes one payload over MQTT. Returns false on connect/alloc/publish
+// failure so the caller can queue the payload for store & forward.
+bool sendPayloadMqtt(const String &payload) {
   if (!connectMqtt()) {
-    return;
+    return false;
   }
-
-  String payload = buildTcpJson();
 
   // PubSubClient's default packet buffer (256 bytes) is far too small for
   // this payload - grow it to fit before every publish (no-op when already
@@ -1403,24 +1451,106 @@ void sendMqttData() {
   uint16_t needed = payload.length() + cloudConfig.topic.length() + 16;
   if (!mqttClient.setBufferSize(needed)) {
     logMessage("MQTT BUFFER ALLOC FAILED (" + String(needed) + " bytes)");
+    return false;
+  }
+
+  if (!mqttClient.publish(cloudConfig.topic.c_str(), payload.c_str())) {
+    logMessage("MQTT PUBLISH FAILED");
+    return false;
+  }
+
+  logMessage("MQTT DATA SENT: " + cloudConfig.topic);
+  logMessage(payload);
+  return true;
+}
+
+bool sendPayload(const String &payload) {
+  if (cloudConfig.mode == UPLINK_MODE_MQTT) {
+    return sendPayloadMqtt(payload);
+  }
+  return sendPayloadTcp(payload);
+}
+
+// True when the active uplink mode has a target configured at all - an
+// unconfigured uplink shouldn't fill the store & forward buffer.
+bool uplinkConfigured() {
+  if (cloudConfig.mode == UPLINK_MODE_MQTT) {
+    return cloudConfig.endpoint.length() > 0;
+  }
+  return uplinkConfig.serverIP.length() > 0 && uplinkConfig.port != 0;
+}
+
+// ===================== Store & Forward =====================
+// RAM ring buffer of undelivered payloads. webTask-only, so no locking.
+String sfBuffer[SF_MAX_ENTRIES];
+int sfHead = 0;
+int sfCount = 0;
+size_t sfBytes = 0;
+unsigned long lastSfLogTime = 0;
+
+void sfPush(const String &payload) {
+  if (payload.length() > SF_MAX_BYTES) {
     return;
   }
 
-  if (mqttClient.publish(cloudConfig.topic.c_str(), payload.c_str())) {
-    logMessage("MQTT DATA SENT: " + cloudConfig.topic);
-    logMessage(payload);
-  } else {
-    logMessage("MQTT PUBLISH FAILED");
+  // Drop oldest entries until the new payload fits both caps.
+  while (sfCount > 0 && (sfBytes + payload.length() > SF_MAX_BYTES || sfCount >= SF_MAX_ENTRIES)) {
+    sfBytes -= sfBuffer[sfHead].length();
+    sfBuffer[sfHead] = "";
+    sfHead = (sfHead + 1) % SF_MAX_ENTRIES;
+    sfCount--;
+  }
+
+  int tail = (sfHead + sfCount) % SF_MAX_ENTRIES;
+  sfBuffer[tail] = payload;
+  sfBytes += payload.length();
+  sfCount++;
+
+  if (millis() - lastSfLogTime >= DEBUG_ERROR_REPEAT_MS) {
+    lastSfLogTime = millis();
+    logKeyEvent("UPLINK DOWN - buffering data (" + String(sfCount) + " payloads, " + String(sfBytes) + " bytes queued)");
   }
 }
 
-// One entry point for the per-cycle cloud push - dispatches to raw TCP or
-// MQTT depending on the configured uplink mode.
+// One entry point for the per-cycle cloud push. Replays any backlog first
+// (bounded per cycle) so the receiver always gets data in order; the fresh
+// payload is queued behind a remaining backlog rather than jumping it.
 void sendCloudData() {
-  if (cloudConfig.mode == UPLINK_MODE_MQTT) {
-    sendMqttData();
-  } else {
-    sendTcpData();
+  if (!uplinkConfigured()) {
+    if (cloudConfig.mode == UPLINK_MODE_MQTT) {
+      logMessage("MQTT TARGET NOT CONFIGURED");
+    } else {
+      logMessage("TCP TARGET NOT CONFIGURED");
+    }
+    return;
+  }
+
+  String payload = buildTcpJson();
+
+  int drained = 0;
+  while (sfCount > 0 && drained < SF_MAX_DRAIN_PER_CYCLE) {
+    if (!sendPayload(sfBuffer[sfHead])) {
+      break;
+    }
+    sfBytes -= sfBuffer[sfHead].length();
+    sfBuffer[sfHead] = "";
+    sfHead = (sfHead + 1) % SF_MAX_ENTRIES;
+    sfCount--;
+    drained++;
+  }
+
+  if (drained > 0) {
+    logKeyEvent("STORE&FORWARD: replayed " + String(drained) + " payload(s)" + (sfCount > 0 ? (", " + String(sfCount) + " still queued") : " - backlog clear"));
+  }
+
+  if (sfCount > 0) {
+    // Backlog remains (uplink still down, or drain cap hit) - keep order.
+    sfPush(payload);
+    return;
+  }
+
+  if (!sendPayload(payload)) {
+    sfPush(payload);
   }
 }
 
@@ -1502,6 +1632,19 @@ void pollModbus() {
       regLen = 2;
     }
 
+    // Slave still inside its offline backoff window: skip the transaction
+    // entirely (no 3s timeout burned), mark the parameter accordingly.
+    SlaveHealth &health = slaveHealth[slaveId];
+
+    if (health.backoffUntil != 0 && (long)(millis() - health.backoffUntil) < 0) {
+      xSemaphoreTake(dataMutex, portMAX_DELAY);
+      params[i].valid = false;
+      params[i].errorCode = MB_ERR_BACKOFF;
+      logModbusStatusChange(i);
+      xSemaphoreGive(dataMutex);
+      continue;
+    }
+
     // ---- RS485 transaction: serialMutex only guards against a comm-settings
     // save changing baud/parity/stop mid-transaction. ----
     xSemaphoreTake(serialMutex, portMAX_DELAY);
@@ -1517,6 +1660,27 @@ void pollModbus() {
 
     xSemaphoreGive(serialMutex);
     // ---- End RS485 transaction ----
+
+    // Per-slave backoff accounting. Only a full timeout counts - a CRC
+    // error or a Modbus exception means the slave IS responding.
+    if (result == MB_ERR_TIMEOUT) {
+      if (health.consecTimeouts < 255) {
+        health.consecTimeouts++;
+      }
+      if (health.consecTimeouts >= SLAVE_BACKOFF_FAIL_THRESHOLD) {
+        bool enteringBackoff = (health.backoffUntil == 0);
+        health.backoffUntil = millis() + SLAVE_BACKOFF_MS;
+        if (enteringBackoff) {
+          logKeyEvent("SLAVE " + String(slaveId) + " NOT RESPONDING - pausing its polls for " + String(SLAVE_BACKOFF_MS / 1000) + "s");
+        }
+      }
+    } else {
+      if (health.backoffUntil != 0) {
+        logKeyEvent("SLAVE " + String(slaveId) + " BACK ONLINE");
+      }
+      health.consecTimeouts = 0;
+      health.backoffUntil = 0;
+    }
 
 #if DEBUG_ENABLED
     if (result == MB_SUCCESS) {
@@ -1610,6 +1774,11 @@ void handleRoot() {
     html += " (Target " + htmlEscape(uplinkConfig.serverIP) + ":" + String(uplinkConfig.port) + ")<br>";
   }
   html += "<b>Poll Interval:</b> " + String(pollIntervalMs) + " ms";
+
+  // Only shown while there is an undelivered backlog (uplink outage).
+  if (sfCount > 0) {
+    html += "<br><b>Buffered (offline):</b> " + String(sfCount) + " payloads / " + String(sfBytes) + " bytes";
+  }
   html += "</div>";
 
   html += R"rawliteral(
