@@ -22,11 +22,12 @@
      T1.5 (inter-byte) silence rules computed from the live baud rate.
    - Errors (timeout, bad CRC/length, wrong slave, slave exception) are
      reported immediately with no debounce/grace period.
-   - Each poll cycle is strictly poll -> TCP send -> next poll:
-     pollModbus() signals pollCompleteSem when done; webTask sends that
-     cycle's data and gives tcpSendDoneSem; modbusTask waits on it with a
-     bounded timeout (TCP_SEND_TIMEOUT_MS) so a dead TCP link can never
-     stall polling.
+   - Each poll cycle is strictly poll -> cloud send -> next poll:
+     pollModbus() signals pollCompleteSem when done; webTask pushes that
+     cycle's data (raw TCP or MQTT/TLS to AWS IoT, selectable in Settings)
+     and gives tcpSendDoneSem; modbusTask waits on it with a bounded
+     timeout (TCP_SEND_TIMEOUT_MS) so a dead uplink can never stall
+     polling.
    - Logging is offloaded from modbusTask via a queue (logQueue) to a
      dedicated low-priority logTask on Core 0, so Serial/String work never
      steals time from the real-time core.
@@ -38,6 +39,10 @@
 #include <math.h>
 #include <time.h>
 #include <WiFiClient.h>
+#include <WiFiClientSecure.h>
+// External library: "PubSubClient" by Nick O'Leary, v2.8+ (Arduino Library
+// Manager). v2.8 is required for setBufferSize() at runtime.
+#include <PubSubClient.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -63,6 +68,21 @@ const char* AP_PASSWORD = "12345678";
 // Anything below this can't be a real current date, so time() results
 // under it mean "SNTP hasn't synced yet" (epoch for 2025-01-01).
 #define MIN_VALID_EPOCH 1735689600UL
+
+// ===================== Cloud Uplink (MQTT / AWS IoT) =====================
+// Uplink mode is selectable on the Settings page: raw TCP (the original
+// behavior, default) or MQTT over TLS with X.509 client certs - the
+// transport AWS IoT Core requires (port 8883). Certificates are pasted
+// into the web UI and stored in flash. See connectMqtt()/sendCloudData().
+#define UPLINK_MODE_TCP 0
+#define UPLINK_MODE_MQTT 1
+#define DEFAULT_MQTT_PORT 8883
+#define DEFAULT_MQTT_TOPIC "gateway/data"
+// Min gap between MQTT connect attempts - a TLS handshake can block
+// webTask for several seconds, so failed attempts must not spin.
+#define MQTT_RETRY_INTERVAL_MS 10000
+#define MQTT_HANDSHAKE_TIMEOUT_S 10
+#define MQTT_SOCKET_TIMEOUT_S 5
 
 // ===================== RS485 Pins =====================
 #define RXD2 D2
@@ -121,10 +141,13 @@ WebServer server(80);
 
 Preferences preferences;
 WiFiClient tcpClient;
+WiFiClientSecure tlsClient;
+PubSubClient mqttClient(tlsClient);
 
 // ===================== Timers =====================
 unsigned long lastSummaryPrintTime = 0;
 unsigned long lastWifiAttempt = 0;
+unsigned long lastMqttAttempt = 0;
 
 // ===================== Cross-Task Synchronization =====================
 // dataMutex: params[]/typeList[] (webTask writes, modbusTask reads/writes).
@@ -202,8 +225,10 @@ int keyLogCount = 0;
 
 bool lastWifiUplinkConnected = false;
 bool lastTcpConnectedState = false;
+bool lastMqttConnectedState = false;
 unsigned long lastTcpFailLogTime = 0;
 unsigned long lastWifiFailLogTime = 0;
+unsigned long lastMqttFailLogTime = 0;
 
 // ===================== TCP / WiFi Uplink Config =====================
 struct UplinkConfig {
@@ -215,6 +240,27 @@ struct UplinkConfig {
 };
 
 UplinkConfig uplinkConfig;
+
+// ===================== Cloud Uplink Config =====================
+// clientId blank means "use the Device Name" (also the AWS Thing name
+// convention). The three PEM certs live as globals because
+// WiFiClientSecure::setCACert()/setCertificate()/setPrivateKey() store the
+// POINTER, not a copy - these Strings must stay alive and unmodified while
+// a TLS session exists. They are only reassigned from the web handler
+// (webTask), the same task that runs the MQTT client, so that's safe.
+struct CloudConfig {
+  uint8_t mode;  // UPLINK_MODE_TCP / UPLINK_MODE_MQTT
+  String endpoint;
+  int port;
+  String clientId;
+  String topic;
+};
+
+CloudConfig cloudConfig;
+
+String certRootCA = "";
+String certDevice = "";
+String certPrivKey = "";
 
 // ===================== Device / AP Identity =====================
 // apSsid: user-settable AP name, used as-is unless apMatchesDeviceName is set.
@@ -684,6 +730,65 @@ void startNtp() {
     configTime(0, 0, NTP_SERVER_1, NTP_SERVER_2);
     logMessage("NTP PRIORITY: " + String(NTP_SERVER_1) + " > " + NTP_SERVER_2 + " (no on-premise server set)");
   }
+}
+
+// ===================== Cloud Uplink Config Save / Load =====================
+void saveCloudConfig() {
+  preferences.begin("cloud", false);
+
+  preferences.putUChar("mode", cloudConfig.mode);
+  preferences.putString("ep", cloudConfig.endpoint);
+  preferences.putInt("port", cloudConfig.port);
+  preferences.putString("cid", cloudConfig.clientId);
+  preferences.putString("topic", cloudConfig.topic);
+
+  preferences.end();
+}
+
+void loadCloudConfig() {
+  preferences.begin("cloud", true);
+
+  cloudConfig.mode = preferences.getUChar("mode", UPLINK_MODE_TCP);
+  cloudConfig.endpoint = preferences.getString("ep", "");
+  cloudConfig.port = preferences.getInt("port", DEFAULT_MQTT_PORT);
+  cloudConfig.clientId = preferences.getString("cid", "");
+  cloudConfig.topic = preferences.getString("topic", DEFAULT_MQTT_TOPIC);
+
+  preferences.end();
+
+  if (cloudConfig.mode != UPLINK_MODE_MQTT) {
+    cloudConfig.mode = UPLINK_MODE_TCP;
+  }
+
+  if (cloudConfig.port <= 0 || cloudConfig.port > 65535) {
+    cloudConfig.port = DEFAULT_MQTT_PORT;
+  }
+
+  if (cloudConfig.topic.length() == 0) {
+    cloudConfig.topic = DEFAULT_MQTT_TOPIC;
+  }
+}
+
+// Certs are in their own namespace: PEM blocks are ~1.2-1.7KB each, well
+// within the NVS per-string limit but worth keeping apart from small keys.
+void saveCerts() {
+  preferences.begin("certs", false);
+
+  preferences.putString("ca", certRootCA);
+  preferences.putString("cert", certDevice);
+  preferences.putString("key", certPrivKey);
+
+  preferences.end();
+}
+
+void loadCerts() {
+  preferences.begin("certs", true);
+
+  certRootCA = preferences.getString("ca", "");
+  certDevice = preferences.getString("cert", "");
+  certPrivKey = preferences.getString("key", "");
+
+  preferences.end();
 }
 
 // ===================== Device / AP Identity Save / Load =====================
@@ -1191,6 +1296,126 @@ void sendTcpData() {
   logMessage(payload);
 }
 
+// ===================== MQTT / AWS IoT Uplink =====================
+// Runs entirely on webTask (Core 0), like the raw-TCP path, so a slow TLS
+// handshake can never disturb Modbus polling. A failed attempt backs off
+// for MQTT_RETRY_INTERVAL_MS so the handshake cost isn't paid every cycle.
+bool connectMqtt() {
+  if (cloudConfig.endpoint.length() == 0) {
+    logMessage("MQTT TARGET NOT CONFIGURED");
+    return false;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    logMessage("MQTT SKIP: WIFI NOT CONNECTED");
+    return false;
+  }
+
+  if (mqttClient.connected()) {
+    return true;
+  }
+
+  if (certRootCA.length() == 0 || certDevice.length() == 0 || certPrivKey.length() == 0) {
+    if (millis() - lastMqttFailLogTime >= DEBUG_ERROR_REPEAT_MS) {
+      lastMqttFailLogTime = millis();
+      logKeyEvent("MQTT CERTS NOT CONFIGURED - paste them on the Settings page");
+    }
+    return false;
+  }
+
+  // TLS certificate validation compares the cert's validity window against
+  // the system clock - with an unsynced clock (1970) every handshake would
+  // fail, so wait for NTP instead of burning a doomed attempt.
+  if (!isTimeSynced()) {
+    if (millis() - lastMqttFailLogTime >= DEBUG_ERROR_REPEAT_MS) {
+      lastMqttFailLogTime = millis();
+      logKeyEvent("MQTT WAITING FOR NTP TIME SYNC (TLS needs a valid clock)");
+    }
+    return false;
+  }
+
+  if (millis() - lastMqttAttempt < MQTT_RETRY_INTERVAL_MS) {
+    return false;
+  }
+  lastMqttAttempt = millis();
+
+  // Re-point TLS/MQTT at the current cert/endpoint Strings on every
+  // attempt - both libraries store pointers, and the Strings may have
+  // been replaced by a settings save since the last attempt.
+  tlsClient.stop();
+  tlsClient.setCACert(certRootCA.c_str());
+  tlsClient.setCertificate(certDevice.c_str());
+  tlsClient.setPrivateKey(certPrivKey.c_str());
+  tlsClient.setHandshakeTimeout(MQTT_HANDSHAKE_TIMEOUT_S);
+
+  mqttClient.setServer(cloudConfig.endpoint.c_str(), cloudConfig.port);
+  mqttClient.setSocketTimeout(MQTT_SOCKET_TIMEOUT_S);
+  mqttClient.setKeepAlive(30);
+
+  String clientId = (cloudConfig.clientId.length() > 0) ? cloudConfig.clientId : getDeviceName();
+
+  logMessage("MQTT TRY " + cloudConfig.endpoint + ":" + String(cloudConfig.port) + " as " + clientId);
+
+  if (!mqttClient.connect(clientId.c_str())) {
+    if (millis() - lastMqttFailLogTime >= DEBUG_ERROR_REPEAT_MS) {
+      lastMqttFailLogTime = millis();
+      logKeyEvent("MQTT CONNECT FAILED (state " + String(mqttClient.state()) + "): " + cloudConfig.endpoint);
+    }
+    return false;
+  }
+
+  logMessage("MQTT OK");
+  return true;
+}
+
+// Logs a key event only on MQTT connect/disconnect transitions.
+void checkMqttUplinkStatusChange() {
+  bool connected = mqttClient.connected();
+
+  if (connected != lastMqttConnectedState) {
+    if (connected) {
+      logKeyEvent("MQTT CONNECTED: " + cloudConfig.endpoint);
+    } else {
+      logKeyEvent("MQTT DISCONNECTED");
+    }
+    lastMqttConnectedState = connected;
+  }
+}
+
+void sendMqttData() {
+  if (!connectMqtt()) {
+    return;
+  }
+
+  String payload = buildTcpJson();
+
+  // PubSubClient's default packet buffer (256 bytes) is far too small for
+  // this payload - grow it to fit before every publish (no-op when already
+  // large enough).
+  uint16_t needed = payload.length() + cloudConfig.topic.length() + 16;
+  if (!mqttClient.setBufferSize(needed)) {
+    logMessage("MQTT BUFFER ALLOC FAILED (" + String(needed) + " bytes)");
+    return;
+  }
+
+  if (mqttClient.publish(cloudConfig.topic.c_str(), payload.c_str())) {
+    logMessage("MQTT DATA SENT: " + cloudConfig.topic);
+    logMessage(payload);
+  } else {
+    logMessage("MQTT PUBLISH FAILED");
+  }
+}
+
+// One entry point for the per-cycle cloud push - dispatches to raw TCP or
+// MQTT depending on the configured uplink mode.
+void sendCloudData() {
+  if (cloudConfig.mode == UPLINK_MODE_MQTT) {
+    sendMqttData();
+  } else {
+    sendTcpData();
+  }
+}
+
 // ===================== Modbus Debug =====================
 void logModbusStatusChange(int index) {
 #if DEBUG_ENABLED && DEBUG_MODBUS_CHANGE_LOG
@@ -1367,9 +1592,15 @@ void handleRoot() {
     html += "Not Connected<br>";
   }
 
-  html += "<b>TCP:</b> ";
-  html += tcpClient.connected() ? "Connected" : "Disconnected";
-  html += " (Target " + htmlEscape(uplinkConfig.serverIP) + ":" + String(uplinkConfig.port) + ")<br>";
+  if (cloudConfig.mode == UPLINK_MODE_MQTT) {
+    html += "<b>MQTT:</b> ";
+    html += mqttClient.connected() ? "Connected" : "Disconnected";
+    html += " (Endpoint " + htmlEscape(cloudConfig.endpoint) + ":" + String(cloudConfig.port) + ")<br>";
+  } else {
+    html += "<b>TCP:</b> ";
+    html += tcpClient.connected() ? "Connected" : "Disconnected";
+    html += " (Target " + htmlEscape(uplinkConfig.serverIP) + ":" + String(uplinkConfig.port) + ")<br>";
+  }
   html += "<b>Poll Interval:</b> " + String(pollIntervalMs) + " ms";
   html += "</div>";
 
@@ -1728,6 +1959,52 @@ function toggleApSsidField() {
   html += "<tr><th>On-Premise NTP Server</th><td><input type='text' name='ntpServer' maxlength='" + String(NTP_SERVER_MAX_LEN - 1) + "' placeholder='Optional, e.g. 192.168.1.10 or ntp.local' value='" + htmlEscape(uplinkConfig.ntpServer) + "'>"
           "<br><small>Tried first for time sync; falls back to public NTP (" + String(NTP_SERVER_1) + "), then uptime-based timestamps. Leave blank to use public NTP only.</small></td></tr>";
   html += "<tr><td colspan='2'><button type='submit'>Save Network</button></td></tr>";
+  html += "</table>";
+  html += "</form>";
+  html += "</div>";
+
+
+  // CLOUD UPLINK FORM (raw TCP vs AWS IoT MQTT)
+  html += "<div class='box'>";
+  html += "<h2>Cloud Uplink</h2>";
+
+  if (server.hasArg("cloudSaved")) {
+    html += "<div class='success'>Cloud Settings Saved Successfully</div>";
+  }
+
+  html += "<form action='/saveCloud' method='POST'>";
+  html += "<table>";
+
+  html += "<tr><th>Uplink Mode</th><td><select name='uplinkMode'>";
+  html += "<option value='tcp'";
+  if (cloudConfig.mode == UPLINK_MODE_TCP) html += " selected";
+  html += ">Raw TCP (Master IP/Port above)</option>";
+  html += "<option value='mqtt'";
+  if (cloudConfig.mode == UPLINK_MODE_MQTT) html += " selected";
+  html += ">AWS IoT MQTT over TLS</option>";
+  html += "</select></td></tr>";
+
+  html += "<tr><th>MQTT Endpoint</th><td><input type='text' name='mqttEndpoint' placeholder='xxxx-ats.iot.region.amazonaws.com' value='" + htmlEscape(cloudConfig.endpoint) + "'></td></tr>";
+  html += "<tr><th>MQTT Port</th><td><input type='number' name='mqttPort' value='" + String(cloudConfig.port) + "'></td></tr>";
+  html += "<tr><th>MQTT Client ID</th><td><input type='text' name='mqttClientId' placeholder='Blank = Device Name (" + htmlEscape(getDeviceName()) + ")' value='" + htmlEscape(cloudConfig.clientId) + "'>"
+          "<br><small>Should match the AWS IoT Thing name / policy.</small></td></tr>";
+  html += "<tr><th>Publish Topic</th><td><input type='text' name='mqttTopic' value='" + htmlEscape(cloudConfig.topic) + "'></td></tr>";
+
+  // Certs: never echoed back - blank field keeps the stored value, same
+  // pattern as the WiFi password above.
+  html += "<tr><th>Root CA (PEM)</th><td><textarea name='caCert' rows='4' style='width:95%' placeholder='";
+  html += (certRootCA.length() > 0) ? "(stored, " + String(certRootCA.length()) + " bytes - paste to replace)" : "Paste Amazon Root CA 1 PEM here";
+  html += "'></textarea></td></tr>";
+
+  html += "<tr><th>Device Certificate (PEM)</th><td><textarea name='devCert' rows='4' style='width:95%' placeholder='";
+  html += (certDevice.length() > 0) ? "(stored, " + String(certDevice.length()) + " bytes - paste to replace)" : "Paste device certificate PEM here";
+  html += "'></textarea></td></tr>";
+
+  html += "<tr><th>Private Key (PEM)</th><td><textarea name='privKey' rows='4' style='width:95%' placeholder='";
+  html += (certPrivKey.length() > 0) ? "(stored, " + String(certPrivKey.length()) + " bytes - paste to replace)" : "Paste device private key PEM here";
+  html += "'></textarea></td></tr>";
+
+  html += "<tr><td colspan='2'><button type='submit'>Save Cloud Settings</button></td></tr>";
   html += "</table>";
   html += "</form>";
   html += "</div>";
@@ -2118,6 +2395,81 @@ void handleSaveDevice() {
   server.send(303);
 }
 
+// ===================== Save Cloud Uplink =====================
+void handleSaveCloud() {
+  if (server.hasArg("uplinkMode")) {
+    cloudConfig.mode = (server.arg("uplinkMode") == "mqtt") ? UPLINK_MODE_MQTT : UPLINK_MODE_TCP;
+  }
+
+  if (server.hasArg("mqttEndpoint")) {
+    cloudConfig.endpoint = server.arg("mqttEndpoint");
+    cloudConfig.endpoint.trim();
+  }
+
+  if (server.hasArg("mqttPort")) {
+    cloudConfig.port = server.arg("mqttPort").toInt();
+  }
+
+  if (cloudConfig.port <= 0 || cloudConfig.port > 65535) {
+    cloudConfig.port = DEFAULT_MQTT_PORT;
+  }
+
+  if (server.hasArg("mqttClientId")) {
+    cloudConfig.clientId = server.arg("mqttClientId");
+    cloudConfig.clientId.trim();
+  }
+
+  if (server.hasArg("mqttTopic")) {
+    cloudConfig.topic = server.arg("mqttTopic");
+    cloudConfig.topic.trim();
+  }
+
+  if (cloudConfig.topic.length() == 0) {
+    cloudConfig.topic = DEFAULT_MQTT_TOPIC;
+  }
+
+  saveCloudConfig();
+
+  // Blank cert fields keep the stored values (same pattern as the WiFi
+  // password) so re-saving other cloud settings never wipes the certs.
+  bool certsChanged = false;
+
+  if (server.hasArg("caCert") && server.arg("caCert").length() > 0) {
+    certRootCA = server.arg("caCert");
+    certsChanged = true;
+  }
+
+  if (server.hasArg("devCert") && server.arg("devCert").length() > 0) {
+    certDevice = server.arg("devCert");
+    certsChanged = true;
+  }
+
+  if (server.hasArg("privKey") && server.arg("privKey").length() > 0) {
+    certPrivKey = server.arg("privKey");
+    certsChanged = true;
+  }
+
+  if (certsChanged) {
+    saveCerts();
+  }
+
+  // Drop any live session so the next cycle reconnects with the new
+  // endpoint/certs/mode. Safe here: this handler and the MQTT client both
+  // run on webTask, so nothing is mid-publish while we do this.
+  if (mqttClient.connected()) {
+    mqttClient.disconnect();
+  }
+  tlsClient.stop();
+  lastMqttAttempt = 0;  // let the next cycle try immediately, skip backoff
+
+  logKeyEvent("CLOUD CONFIG SAVED: mode=" + String(cloudConfig.mode == UPLINK_MODE_MQTT ? "mqtt" : "tcp")
+              + (cloudConfig.endpoint.length() > 0 ? (" endpoint=" + cloudConfig.endpoint) : "")
+              + (certsChanged ? " (certs updated)" : ""));
+
+  server.sendHeader("Location", "/settings?cloudSaved=1");
+  server.send(303);
+}
+
 // ===================== Save Types =====================
 void handleSaveTypes() {
   int rows = server.arg("typeRowCount").toInt();
@@ -2279,6 +2631,8 @@ void setup() {
   loadCommunicationSettings();
   loadUplinkConfig();
   loadDeviceConfig();
+  loadCloudConfig();
+  loadCerts();
 
   Serial1.begin(
     commBaudRate,
@@ -2311,6 +2665,7 @@ void setup() {
   server.on("/saveCommunication", HTTP_POST, handleSaveCommunication);
   server.on("/saveUplink", HTTP_POST, handleSaveUplink);
   server.on("/saveDevice", HTTP_POST, handleSaveDevice);
+  server.on("/saveCloud", HTTP_POST, handleSaveCloud);
   server.on("/data", HTTP_GET, handleData);
   server.on("/keylog", HTTP_GET, handleKeyLog);
   server.on("/types", HTTP_GET, handleTypes);
@@ -2488,13 +2843,22 @@ void webTask(void *parameter) {
       logKeyEvent("NTP TIME SYNCED - timestamps now UTC epoch");
     }
 
-    // Fires once per completed poll cycle so TCP always carries fresh data.
+    // Fires once per completed poll cycle so the cloud push (TCP or MQTT)
+    // always carries fresh data.
     if (xSemaphoreTake(pollCompleteSem, 0) == pdTRUE) {
-      sendTcpData();
+      sendCloudData();
       xSemaphoreGive(tcpSendDoneSem);
     }
 
-    checkTcpUplinkStatusChange();
+    if (cloudConfig.mode == UPLINK_MODE_MQTT) {
+      // Services MQTT keepalive pings and inbound packets between publishes.
+      if (mqttClient.connected()) {
+        mqttClient.loop();
+      }
+      checkMqttUplinkStatusChange();
+    } else {
+      checkTcpUplinkStatusChange();
+    }
 
     vTaskDelay(pdMS_TO_TICKS(1));
   }
