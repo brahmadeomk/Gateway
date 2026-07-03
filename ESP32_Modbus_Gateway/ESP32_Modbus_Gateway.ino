@@ -262,6 +262,14 @@ String certRootCA = "";
 String certDevice = "";
 String certPrivKey = "";
 
+// Per-request accumulators for cert FILE uploads on /saveCloud (multipart
+// form). Filled by handleCertUpload() during upload parsing, consumed and
+// cleared by handleSaveCloud() right after. webTask-only, so no locking.
+#define CERT_UPLOAD_MAX_LEN 8192
+String uploadCaCert = "";
+String uploadDevCert = "";
+String uploadPrivKey = "";
+
 // ===================== Device / AP Identity =====================
 // apSsid: user-settable AP name, used as-is unless apMatchesDeviceName is set.
 // deviceNamePrefix: user-provided prefix (up to 5 chars); combined with the
@@ -1972,7 +1980,9 @@ function toggleApSsidField() {
     html += "<div class='success'>Cloud Settings Saved Successfully</div>";
   }
 
-  html += "<form action='/saveCloud' method='POST'>";
+  // multipart so the cert file-upload inputs work; ordinary fields still
+  // arrive via server.arg() as usual.
+  html += "<form action='/saveCloud' method='POST' enctype='multipart/form-data'>";
   html += "<table>";
 
   html += "<tr><th>Uplink Mode</th><td><select name='uplinkMode'>";
@@ -1990,18 +2000,29 @@ function toggleApSsidField() {
           "<br><small>Should match the AWS IoT Thing name / policy.</small></td></tr>";
   html += "<tr><th>Publish Topic</th><td><input type='text' name='mqttTopic' value='" + htmlEscape(cloudConfig.topic) + "'></td></tr>";
 
-  // Certs: never echoed back - blank field keeps the stored value, same
-  // pattern as the WiFi password above.
-  html += "<tr><th>Root CA (PEM)</th><td><textarea name='caCert' rows='4' style='width:95%' placeholder='";
-  html += (certRootCA.length() > 0) ? "(stored, " + String(certRootCA.length()) + " bytes - paste to replace)" : "Paste Amazon Root CA 1 PEM here";
+  // Certs: never echoed back - a blank/empty field keeps the stored value,
+  // same pattern as the WiFi password above. Each can be provided either
+  // by uploading the file from AWS as-is or by pasting the PEM text; the
+  // uploaded file wins if both are given.
+  html += "<tr><th>Root CA (PEM)</th><td>";
+  html += "<input type='file' name='caFile' accept='.pem,.crt,.txt'>";
+  html += "<br><small>or paste below:</small>";
+  html += "<br><textarea name='caCert' rows='3' style='width:95%' placeholder='";
+  html += (certRootCA.length() > 0) ? "(stored, " + String(certRootCA.length()) + " bytes - upload or paste to replace)" : "Paste Amazon Root CA 1 PEM here";
   html += "'></textarea></td></tr>";
 
-  html += "<tr><th>Device Certificate (PEM)</th><td><textarea name='devCert' rows='4' style='width:95%' placeholder='";
-  html += (certDevice.length() > 0) ? "(stored, " + String(certDevice.length()) + " bytes - paste to replace)" : "Paste device certificate PEM here";
+  html += "<tr><th>Device Certificate (PEM)</th><td>";
+  html += "<input type='file' name='devFile' accept='.pem,.crt,.txt'>";
+  html += "<br><small>or paste below:</small>";
+  html += "<br><textarea name='devCert' rows='3' style='width:95%' placeholder='";
+  html += (certDevice.length() > 0) ? "(stored, " + String(certDevice.length()) + " bytes - upload or paste to replace)" : "Paste device certificate PEM here";
   html += "'></textarea></td></tr>";
 
-  html += "<tr><th>Private Key (PEM)</th><td><textarea name='privKey' rows='4' style='width:95%' placeholder='";
-  html += (certPrivKey.length() > 0) ? "(stored, " + String(certPrivKey.length()) + " bytes - paste to replace)" : "Paste device private key PEM here";
+  html += "<tr><th>Private Key (PEM)</th><td>";
+  html += "<input type='file' name='keyFile' accept='.pem,.key,.txt'>";
+  html += "<br><small>or paste below:</small>";
+  html += "<br><textarea name='privKey' rows='3' style='width:95%' placeholder='";
+  html += (certPrivKey.length() > 0) ? "(stored, " + String(certPrivKey.length()) + " bytes - upload or paste to replace)" : "Paste device private key PEM here";
   html += "'></textarea></td></tr>";
 
   html += "<tr><td colspan='2'><button type='submit'>Save Cloud Settings</button></td></tr>";
@@ -2396,6 +2417,66 @@ void handleSaveDevice() {
 }
 
 // ===================== Save Cloud Uplink =====================
+// Minimal sanity check that content is PEM text, not an accidentally
+// selected binary (DER/.p12) or wrong file - protects the stored certs.
+bool looksLikePem(const String &content) {
+  return content.indexOf("-----BEGIN") >= 0;
+}
+
+// Upload callback for /saveCloud (multipart). Streams each cert file's
+// chunks into the matching accumulator; handleSaveCloud() consumes them
+// once the whole request is parsed.
+void handleCertUpload() {
+  HTTPUpload &upload = server.upload();
+
+  String *target = nullptr;
+  if (upload.name == "caFile") {
+    target = &uploadCaCert;
+  } else if (upload.name == "devFile") {
+    target = &uploadDevCert;
+  } else if (upload.name == "keyFile") {
+    target = &uploadPrivKey;
+  }
+
+  if (target == nullptr) {
+    return;
+  }
+
+  if (upload.status == UPLOAD_FILE_START) {
+    *target = "";
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (target->length() + upload.currentSize <= CERT_UPLOAD_MAX_LEN) {
+      target->concat((const char *)upload.buf, upload.currentSize);
+    } else {
+      // Oversized for any real PEM - discard so it can't half-apply.
+      *target = "";
+    }
+  }
+}
+
+// Applies one cert slot: uploaded file wins over pasted text, blank keeps
+// the stored value, and non-PEM content is rejected with a key-log entry.
+bool applyCertUpdate(String &stored, String &uploaded, const char *pasteArg, const char *label) {
+  String incoming;
+
+  if (uploaded.length() > 0) {
+    incoming = uploaded;
+    uploaded = "";  // free the accumulator either way
+  } else if (server.hasArg(pasteArg) && server.arg(pasteArg).length() > 0) {
+    incoming = server.arg(pasteArg);
+  } else {
+    return false;
+  }
+
+  if (!looksLikePem(incoming)) {
+    logKeyEvent("CERT REJECTED (" + String(label) + "): not PEM text - upload the .pem file, not DER/binary");
+    return false;
+  }
+
+  stored = incoming;
+  return true;
+}
+
 void handleSaveCloud() {
   if (server.hasArg("uplinkMode")) {
     cloudConfig.mode = (server.arg("uplinkMode") == "mqtt") ? UPLINK_MODE_MQTT : UPLINK_MODE_TCP;
@@ -2430,24 +2511,13 @@ void handleSaveCloud() {
 
   saveCloudConfig();
 
-  // Blank cert fields keep the stored values (same pattern as the WiFi
-  // password) so re-saving other cloud settings never wipes the certs.
+  // Per slot: uploaded file > pasted text > blank keeps stored value (same
+  // pattern as the WiFi password), so re-saving other cloud settings never
+  // wipes the certs.
   bool certsChanged = false;
-
-  if (server.hasArg("caCert") && server.arg("caCert").length() > 0) {
-    certRootCA = server.arg("caCert");
-    certsChanged = true;
-  }
-
-  if (server.hasArg("devCert") && server.arg("devCert").length() > 0) {
-    certDevice = server.arg("devCert");
-    certsChanged = true;
-  }
-
-  if (server.hasArg("privKey") && server.arg("privKey").length() > 0) {
-    certPrivKey = server.arg("privKey");
-    certsChanged = true;
-  }
+  certsChanged |= applyCertUpdate(certRootCA, uploadCaCert, "caCert", "Root CA");
+  certsChanged |= applyCertUpdate(certDevice, uploadDevCert, "devCert", "Device Certificate");
+  certsChanged |= applyCertUpdate(certPrivKey, uploadPrivKey, "privKey", "Private Key");
 
   if (certsChanged) {
     saveCerts();
@@ -2665,7 +2735,9 @@ void setup() {
   server.on("/saveCommunication", HTTP_POST, handleSaveCommunication);
   server.on("/saveUplink", HTTP_POST, handleSaveUplink);
   server.on("/saveDevice", HTTP_POST, handleSaveDevice);
-  server.on("/saveCloud", HTTP_POST, handleSaveCloud);
+  // Second callback handles the multipart cert file uploads, streamed in
+  // before handleSaveCloud runs.
+  server.on("/saveCloud", HTTP_POST, handleSaveCloud, handleCertUpload);
   server.on("/data", HTTP_GET, handleData);
   server.on("/keylog", HTTP_GET, handleKeyLog);
   server.on("/types", HTTP_GET, handleTypes);
