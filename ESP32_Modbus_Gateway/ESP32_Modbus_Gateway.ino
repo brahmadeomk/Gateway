@@ -1122,11 +1122,6 @@ void loadSettings() {
     String index = String(i);
 
     params[i].name = preferences.getString(("name" + index).c_str(), "Parameter");
-    params[i].type = preferences.getString(("type" + index).c_str(), "INT_16/100");
-
-    if (findTypeIndex(params[i].type) < 0 && typeCount > 0) {
-      params[i].type = typeList[0].name;
-    }
 
     // Default AREA_HOLDING_REGISTER (0): configs saved before the area
     // field existed keep their original behavior.
@@ -1135,9 +1130,19 @@ void loadSettings() {
       params[i].area = AREA_HOLDING_REGISTER;
     }
 
+    params[i].type = preferences.getString(("type" + index).c_str(), "INT_16/100");
+
+    if (isBitArea(params[i].area)) {
+      // Fixed pseudo-type for coil/discrete rows - deliberately not run
+      // through the type-list fallback below.
+      params[i].type = "BIT";
+    } else if (findTypeIndex(params[i].type) < 0 && typeCount > 0) {
+      params[i].type = typeList[0].name;
+    }
+
     params[i].slaveId = preferences.getUChar(("sid" + index).c_str(), 1);
     params[i].registerAddress = preferences.getUShort(("addr" + index).c_str(), 0);
-    params[i].registerLength = getDataLengthForType(params[i].type);
+    params[i].registerLength = isBitArea(params[i].area) ? 1 : getDataLengthForType(params[i].type);
     params[i].enabled = preferences.getBool(("en" + index).c_str(), true);
     params[i].value = 0;
     params[i].valid = false;
@@ -2023,7 +2028,16 @@ void handleSettings() {
     html += "<tr>";
     html += "<td><input name='name" + String(i) + "' value='" + htmlEscape(params[i].name) + "'></td>";
     html += "<td><select name='area" + String(i) + "' onchange='updateAreaSelection(this)'>" + getAreaOptions(params[i].area) + "</select></td>";
-    html += "<td><select name='type" + String(i) + "' onchange='updateDataLength(this)'>" + getTypeOptions(params[i].type) + "</select></td>";
+
+    // Bit areas auto-select a fixed BIT pseudo-type (the only thing a bit
+    // can be); register areas get the normal user-managed type list.
+    html += "<td><select name='type" + String(i) + "' onchange='updateDataLength(this)'>";
+    if (isBitArea(params[i].area)) {
+      html += "<option value='BIT' selected>BIT (0/1)</option>";
+    } else {
+      html += getTypeOptions(params[i].type);
+    }
+    html += "</select></td>";
     html += "<td><input class='dlen-display' value='" + String(dlen) + "' readonly></td>";
     html += "<td><input name='sid" + String(i) + "' value='" + String(params[i].slaveId) + "'></td>";
     html += "<td><input name='addr" + String(i) + "' value='" + String(params[i].registerAddress) + "'></td>";
@@ -2095,6 +2109,16 @@ function updateDataLength(selectEl) {
 function updateAreaSelection(selectEl) {
   let row = selectEl.closest("tr");
   let typeSel = row.querySelector("select[name^='type']");
+
+  if (isBitAreaValue(selectEl.value)) {
+    // Coil/discrete: auto-select the fixed BIT pseudo-type.
+    typeSel.innerHTML = '<option value="BIT" selected>BIT (0/1)</option>';
+  } else if (typeSel.querySelector('option[value="BIT"]')) {
+    // Switched back to a register area: restore the normal type list.
+    let defaultType = paramTypeInfo.length ? paramTypeInfo[0].name : "";
+    typeSel.innerHTML = buildTypeOptionsHTML(defaultType);
+  }
+
   updateDataLength(typeSel);
 }
 
@@ -2500,19 +2524,24 @@ void handleSave() {
     String index = String(i);
 
     params[i].name = server.arg("name" + index);
+
+    params[i].area = server.arg("area" + index).toInt();
+    if (params[i].area > AREA_DISCRETE_INPUT) {
+      params[i].area = AREA_HOLDING_REGISTER;
+    }
+
     params[i].type = server.arg("type" + index);
 
-    if (params[i].type.length() == 0 || findTypeIndex(params[i].type) < 0) {
+    if (isBitArea(params[i].area)) {
+      // Auto-selected pseudo-type for coil/discrete rows - not part of the
+      // user-managed type list, so it must skip the fallback below.
+      params[i].type = "BIT";
+    } else if (params[i].type.length() == 0 || findTypeIndex(params[i].type) < 0) {
       if (typeCount > 0) {
         params[i].type = typeList[0].name;
       } else {
         params[i].type = "INT_16/100";
       }
-    }
-
-    params[i].area = server.arg("area" + index).toInt();
-    if (params[i].area > AREA_DISCRETE_INPUT) {
-      params[i].area = AREA_HOLDING_REGISTER;
     }
 
     params[i].slaveId = server.arg("sid" + index).toInt();
