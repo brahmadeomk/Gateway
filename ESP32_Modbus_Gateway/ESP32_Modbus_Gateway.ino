@@ -446,6 +446,24 @@ void logKeyEvent(String msg) {
   enqueueLog(msg, true);
 }
 
+// ===================== NVS Write Failure Detection =====================
+// Every Preferences::put*() call returns 0 on failure (most commonly
+// NVS_ERR_NOT_ENOUGH_SPACE, once the flash partition fills up - a real
+// risk here given how many settings namespaces and how large the params
+// table have grown). A failed write leaves the OLD value on flash while
+// the in-RAM value has already changed, which looks exactly like
+// "settings revert after a reboot" - because that's exactly what it is.
+// Each save*() function resets nvsWriteFailures to 0, wraps every put*()
+// call in trackNvsWrite(), then logs once (not per-key, to avoid flooding
+// the log if an entire namespace is failing) if anything failed.
+int nvsWriteFailures = 0;
+
+void trackNvsWrite(size_t result) {
+  if (result == 0) {
+    nvsWriteFailures++;
+  }
+}
+
 // ===================== RS485 Direction Control =====================
 void preTransmission() {
   portENTER_CRITICAL(&rs485Mux);
@@ -891,15 +909,20 @@ uint16_t getDataLengthForType(String typeName) {
 
 // ===================== Communication Settings Save / Load =====================
 void saveCommunicationSettings() {
+  nvsWriteFailures = 0;
   preferences.begin("comm", false);
 
-  preferences.putUInt("baud", commBaudRate);
-  preferences.putString("parity", commParity);
-  preferences.putUChar("stop", commStopBits);
-  preferences.putUInt("pollms", pollIntervalMs);
-  preferences.putUInt("recoveryms", slaveRecoveryDelayMs);
+  trackNvsWrite(preferences.putUInt("baud", commBaudRate));
+  trackNvsWrite(preferences.putString("parity", commParity));
+  trackNvsWrite(preferences.putUChar("stop", commStopBits));
+  trackNvsWrite(preferences.putUInt("pollms", pollIntervalMs));
+  trackNvsWrite(preferences.putUInt("recoveryms", slaveRecoveryDelayMs));
 
   preferences.end();
+
+  if (nvsWriteFailures > 0) {
+    logKeyEvent("NVS SAVE INCOMPLETE (comm): " + String(nvsWriteFailures) + " write(s) failed - flash may be full, settings may not persist");
+  }
 }
 
 void loadCommunicationSettings() {
@@ -943,15 +966,20 @@ void saveUplinkConfig() {
   logMessage("Saving Server IP: " + uplinkConfig.serverIP);
   logMessage("Saving Port: " + String(uplinkConfig.port));
 
+  nvsWriteFailures = 0;
   preferences.begin("uplink", false);
 
-  preferences.putString("ssid", uplinkConfig.ssid);
-  preferences.putString("pass", uplinkConfig.password);
-  preferences.putString("ip", uplinkConfig.serverIP);
-  preferences.putInt("port", uplinkConfig.port);
-  preferences.putString("ntp", uplinkConfig.ntpServer);
+  trackNvsWrite(preferences.putString("ssid", uplinkConfig.ssid));
+  trackNvsWrite(preferences.putString("pass", uplinkConfig.password));
+  trackNvsWrite(preferences.putString("ip", uplinkConfig.serverIP));
+  trackNvsWrite(preferences.putInt("port", uplinkConfig.port));
+  trackNvsWrite(preferences.putString("ntp", uplinkConfig.ntpServer));
 
   preferences.end();
+
+  if (nvsWriteFailures > 0) {
+    logKeyEvent("NVS SAVE INCOMPLETE (uplink): " + String(nvsWriteFailures) + " write(s) failed - flash may be full, settings may not persist");
+  }
 
   logMessage("TCP CONFIG SAVED TO FLASH");
   logMessage("========== SAVE TCP CONFIG END ==========");
@@ -1010,15 +1038,20 @@ void startNtp() {
 
 // ===================== Cloud Uplink Config Save / Load =====================
 void saveCloudConfig() {
+  nvsWriteFailures = 0;
   preferences.begin("cloud", false);
 
-  preferences.putUChar("mode", cloudConfig.mode);
-  preferences.putString("ep", cloudConfig.endpoint);
-  preferences.putInt("port", cloudConfig.port);
-  preferences.putString("cid", cloudConfig.clientId);
-  preferences.putString("topic", cloudConfig.topic);
+  trackNvsWrite(preferences.putUChar("mode", cloudConfig.mode));
+  trackNvsWrite(preferences.putString("ep", cloudConfig.endpoint));
+  trackNvsWrite(preferences.putInt("port", cloudConfig.port));
+  trackNvsWrite(preferences.putString("cid", cloudConfig.clientId));
+  trackNvsWrite(preferences.putString("topic", cloudConfig.topic));
 
   preferences.end();
+
+  if (nvsWriteFailures > 0) {
+    logKeyEvent("NVS SAVE INCOMPLETE (cloud): " + String(nvsWriteFailures) + " write(s) failed - flash may be full, settings may not persist");
+  }
 }
 
 void loadCloudConfig() {
@@ -1048,13 +1081,21 @@ void loadCloudConfig() {
 // Certs are in their own namespace: PEM blocks are ~1.2-1.7KB each, well
 // within the NVS per-string limit but worth keeping apart from small keys.
 void saveCerts() {
+  // These three PEM strings are the largest single consumer of NVS space
+  // in the whole gateway (often 1-2KB each) - the most likely place an
+  // out-of-space failure first shows up.
+  nvsWriteFailures = 0;
   preferences.begin("certs", false);
 
-  preferences.putString("ca", certRootCA);
-  preferences.putString("cert", certDevice);
-  preferences.putString("key", certPrivKey);
+  trackNvsWrite(preferences.putString("ca", certRootCA));
+  trackNvsWrite(preferences.putString("cert", certDevice));
+  trackNvsWrite(preferences.putString("key", certPrivKey));
 
   preferences.end();
+
+  if (nvsWriteFailures > 0) {
+    logKeyEvent("NVS SAVE INCOMPLETE (certs): " + String(nvsWriteFailures) + " write(s) failed - flash may be full, certs may not persist");
+  }
 }
 
 void loadCerts() {
@@ -1069,13 +1110,18 @@ void loadCerts() {
 
 // ===================== Device / AP Identity Save / Load =====================
 void saveDeviceConfig() {
+  nvsWriteFailures = 0;
   preferences.begin("device", false);
 
-  preferences.putString("apssid", deviceConfig.apSsid);
-  preferences.putString("prefix", deviceConfig.deviceNamePrefix);
-  preferences.putBool("apmatch", deviceConfig.apMatchesDeviceName);
+  trackNvsWrite(preferences.putString("apssid", deviceConfig.apSsid));
+  trackNvsWrite(preferences.putString("prefix", deviceConfig.deviceNamePrefix));
+  trackNvsWrite(preferences.putBool("apmatch", deviceConfig.apMatchesDeviceName));
 
   preferences.end();
+
+  if (nvsWriteFailures > 0) {
+    logKeyEvent("NVS SAVE INCOMPLETE (device): " + String(nvsWriteFailures) + " write(s) failed - flash may be full, settings may not persist");
+  }
 }
 
 void loadDeviceConfig() {
@@ -1186,21 +1232,26 @@ void loadDefaultTypes() {
 
 // ===================== Save / Load Types =====================
 void saveTypes() {
+  nvsWriteFailures = 0;
   preferences.begin("types", false);
 
-  preferences.putUInt("schema", TYPE_SCHEMA_VERSION);
-  preferences.putInt("count", typeCount);
+  trackNvsWrite(preferences.putUInt("schema", TYPE_SCHEMA_VERSION));
+  trackNvsWrite(preferences.putInt("count", typeCount));
 
   for (int i = 0; i < typeCount; i++) {
     String index = String(i);
 
-    preferences.putString(("name" + index).c_str(), typeList[i].name);
-    preferences.putString(("base" + index).c_str(), typeList[i].baseFormat);
-    preferences.putFloat(("div" + index).c_str(), typeList[i].divisor);
-    preferences.putUShort(("dlen" + index).c_str(), typeList[i].dataLength);
+    trackNvsWrite(preferences.putString(("name" + index).c_str(), typeList[i].name));
+    trackNvsWrite(preferences.putString(("base" + index).c_str(), typeList[i].baseFormat));
+    trackNvsWrite(preferences.putFloat(("div" + index).c_str(), typeList[i].divisor));
+    trackNvsWrite(preferences.putUShort(("dlen" + index).c_str(), typeList[i].dataLength));
   }
 
   preferences.end();
+
+  if (nvsWriteFailures > 0) {
+    logKeyEvent("NVS SAVE INCOMPLETE (types): " + String(nvsWriteFailures) + " write(s) failed - flash may be full, settings may not persist");
+  }
 }
 
 void loadTypes() {
@@ -1242,21 +1293,26 @@ void loadTypes() {
 
 // ===================== Save / Load Modbus TCP Targets =====================
 void saveTcpTargets() {
+  nvsWriteFailures = 0;
   preferences.begin("tcptgt", false);
 
-  preferences.putUInt("schema", TCP_TARGET_SCHEMA_VERSION);
-  preferences.putInt("count", tcpTargetCount);
+  trackNvsWrite(preferences.putUInt("schema", TCP_TARGET_SCHEMA_VERSION));
+  trackNvsWrite(preferences.putInt("count", tcpTargetCount));
 
   for (int i = 0; i < tcpTargetCount; i++) {
     String index = String(i);
 
-    preferences.putString(("name" + index).c_str(), tcpTargets[i].name);
-    preferences.putString(("ip" + index).c_str(), tcpTargets[i].ip);
-    preferences.putUShort(("port" + index).c_str(), tcpTargets[i].port);
-    preferences.putUChar(("unit" + index).c_str(), tcpTargets[i].unitId);
+    trackNvsWrite(preferences.putString(("name" + index).c_str(), tcpTargets[i].name));
+    trackNvsWrite(preferences.putString(("ip" + index).c_str(), tcpTargets[i].ip));
+    trackNvsWrite(preferences.putUShort(("port" + index).c_str(), tcpTargets[i].port));
+    trackNvsWrite(preferences.putUChar(("unit" + index).c_str(), tcpTargets[i].unitId));
   }
 
   preferences.end();
+
+  if (nvsWriteFailures > 0) {
+    logKeyEvent("NVS SAVE INCOMPLETE (tcptgt): " + String(nvsWriteFailures) + " write(s) failed - flash may be full, TCP targets may not persist");
+  }
 }
 
 void loadTcpTargets() {
@@ -1329,25 +1385,32 @@ void loadDefaultSettings() {
 
 // ===================== Save / Load Modbus Settings =====================
 void saveSettings() {
+  // The largest NVS consumer that grows with normal use: 9 keys per row,
+  // up to MAX_PARAMS rows - the most likely place to hit a full partition.
+  nvsWriteFailures = 0;
   preferences.begin("modbus", false);
 
-  preferences.putInt("count", paramCount);
+  trackNvsWrite(preferences.putInt("count", paramCount));
 
   for (int i = 0; i < paramCount; i++) {
     String index = String(i);
 
-    preferences.putString(("name" + index).c_str(), params[i].name);
-    preferences.putString(("type" + index).c_str(), params[i].type);
-    preferences.putUChar(("area" + index).c_str(), params[i].area);
-    preferences.putUChar(("transport" + index).c_str(), params[i].transport);
-    preferences.putUChar(("sid" + index).c_str(), params[i].slaveId);
-    preferences.putUChar(("tcptgt" + index).c_str(), params[i].tcpTargetIndex);
-    preferences.putUShort(("addr" + index).c_str(), params[i].registerAddress);
-    preferences.putUShort(("len" + index).c_str(), params[i].registerLength);
-    preferences.putBool(("en" + index).c_str(), params[i].enabled);
+    trackNvsWrite(preferences.putString(("name" + index).c_str(), params[i].name));
+    trackNvsWrite(preferences.putString(("type" + index).c_str(), params[i].type));
+    trackNvsWrite(preferences.putUChar(("area" + index).c_str(), params[i].area));
+    trackNvsWrite(preferences.putUChar(("transport" + index).c_str(), params[i].transport));
+    trackNvsWrite(preferences.putUChar(("sid" + index).c_str(), params[i].slaveId));
+    trackNvsWrite(preferences.putUChar(("tcptgt" + index).c_str(), params[i].tcpTargetIndex));
+    trackNvsWrite(preferences.putUShort(("addr" + index).c_str(), params[i].registerAddress));
+    trackNvsWrite(preferences.putUShort(("len" + index).c_str(), params[i].registerLength));
+    trackNvsWrite(preferences.putBool(("en" + index).c_str(), params[i].enabled));
   }
 
   preferences.end();
+
+  if (nvsWriteFailures > 0) {
+    logKeyEvent("NVS SAVE INCOMPLETE (modbus): " + String(nvsWriteFailures) + " write(s) failed - flash may be full, param changes may not persist across reboot");
+  }
 }
 
 void loadSettings() {
