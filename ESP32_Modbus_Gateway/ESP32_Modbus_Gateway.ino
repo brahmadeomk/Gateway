@@ -39,6 +39,14 @@
      timeouts a slave's parameters are skipped for SLAVE_BACKOFF_MS and
      then re-probed, so one dead slave can't stretch every poll cycle by
      3s per parameter - see pollModbus()/slaveHealth[].
+   - Second data source: a parameter's transport field selects RS485 RTU
+     (default) or Modbus TCP client to a remote server such as a CNC
+     controller (tcpTargets[]). TCP polling runs on its own task,
+     tcpPollTask(), pinned to Core 0 - never Core 1, so a slow/blocking
+     TCP connect can never affect RTU timing. Both transports write into
+     the same params[]/dataMutex, so the cloud push, dashboard, and
+     store-and-forward paths handle either source identically. Per-target
+     backoff mirrors the per-slave scheme (tcpTargetHealth[]).
    ====================================================================== */
 
 #include <WiFi.h>
@@ -111,6 +119,25 @@ const char* AP_PASSWORD = "12345678";
 // window instead of 3s per parameter on every cycle.
 #define SLAVE_BACKOFF_FAIL_THRESHOLD 3
 #define SLAVE_BACKOFF_MS 30000
+
+// ===================== Modbus TCP Client (second data source) =====================
+// A parameter's data can come from the RS485 RTU bus (TRANSPORT_RTU, the
+// original/default behavior) or from a remote Modbus TCP server such as a
+// CNC controller (TRANSPORT_TCP), polled over WiFi by a dedicated task on
+// Core 0 - never Core 1, so this never competes with the RTU master for
+// real-time bus access. See tcpPollTask()/modbusTcpRead().
+#define TRANSPORT_RTU 0
+#define TRANSPORT_TCP 1
+#define MAX_TCP_TARGETS 4
+#define TCP_TARGET_SCHEMA_VERSION 1
+#define MODBUS_TCP_CONNECT_TIMEOUT_MS 2000
+#define MODBUS_TCP_RESPONSE_TIMEOUT_MS 3000
+// Same reasoning as SLAVE_BACKOFF_*, applied to a dead/unreachable TCP target.
+#define TCP_TARGET_BACKOFF_FAIL_THRESHOLD 3
+#define TCP_TARGET_BACKOFF_MS 30000
+#define TCP_POLL_TASK_CORE 0
+#define TCP_POLL_TASK_PRIORITY 1
+#define TCP_POLL_TASK_STACK 8192
 
 // ===================== RS485 Pins =====================
 #define RXD2 D2
@@ -189,6 +216,7 @@ SemaphoreHandle_t serialMutex;
 SemaphoreHandle_t pollCompleteSem;
 SemaphoreHandle_t tcpSendDoneSem;
 TaskHandle_t modbusTaskHandle;
+TaskHandle_t tcpPollTaskHandle;
 
 // Carries log entries from any task to logTask (Core 0), which does the
 // actual Serial/String/keyLog work off the real-time core.
@@ -329,6 +357,26 @@ struct ParamType {
 ParamType typeList[MAX_PARAM_TYPES];
 int typeCount = 0;
 
+// ===================== Modbus TCP Targets =====================
+// A small managed list of remote Modbus TCP servers (e.g. a CNC
+// controller), referenced by index from ModbusParam rows with
+// transport == TRANSPORT_TCP - same "small list + index reference"
+// pattern as typeList[] above. unitId is the MBAP Unit Identifier byte
+// (Modbus TCP's equivalent of an RTU slave address).
+struct ModbusTcpTarget {
+  String name;
+  String ip;
+  uint16_t port;
+  uint8_t unitId;
+};
+
+ModbusTcpTarget tcpTargets[MAX_TCP_TARGETS];
+int tcpTargetCount = 0;
+
+// One persistent client per target, reused across poll cycles instead of
+// reconnecting every time - only touched by tcpPollTask (Core 0).
+WiFiClient tcpTargetClients[MAX_TCP_TARGETS];
+
 // ===================== Modbus Parameter Structure =====================
 // Which of the four Modbus address spaces a parameter reads from. The
 // numeric order matters: 0 = holding register, so configs saved before
@@ -347,7 +395,9 @@ struct ModbusParam {
   String name;
   String type;
   uint8_t area;  // AREA_* address space (determines the read function code)
-  uint8_t slaveId;
+  uint8_t transport;  // TRANSPORT_RTU (default) or TRANSPORT_TCP
+  uint8_t slaveId;  // RTU slave address - only meaningful when transport == TRANSPORT_RTU
+  uint8_t tcpTargetIndex;  // index into tcpTargets[] - only meaningful when transport == TRANSPORT_TCP
   uint16_t registerAddress;
   uint16_t registerLength;
   bool enabled;
@@ -438,6 +488,14 @@ struct SlaveHealth {
 };
 
 SlaveHealth slaveHealth[256] = {};
+
+// Same backoff bookkeeping, keyed by TCP target index instead of RTU slave
+// ID. Only ever touched by tcpPollTask (Core 0), so no locking needed.
+SlaveHealth tcpTargetHealth[MAX_TCP_TARGETS] = {};
+
+// MB_ERR_* codes reused for TCP targets, plus one new one: a TCP target
+// that's simply never been configured (index unset / target list empty).
+#define MB_ERR_TCP_UNCONFIGURED 0xE5
 
 // Raw bytes for the most recent attempt, used by pollModbus()'s [POLL] debug
 // log line. Only touched while serialMutex is held, so no extra lock needed.
@@ -627,6 +685,140 @@ uint8_t modbusRead(uint8_t slaveId, uint8_t area, uint16_t startAddr, uint16_t q
   } else {
     for (uint16_t r = 0; r < qty; r++) {
       outRegs[r] = ((uint16_t)rx[3 + r * 2] << 8) | rx[3 + r * 2 + 1];
+    }
+  }
+
+  return MB_SUCCESS;
+}
+
+// ===================== Modbus TCP Client (second data source) =====================
+// Ensures tcpTargetClients[targetIndex] is connected to tcpTargets[targetIndex],
+// (re)connecting if needed. Only called from tcpPollTask (Core 0) - a TCP
+// connect can block for MODBUS_TCP_CONNECT_TIMEOUT_MS, which is fine here
+// since this task has nothing time-critical to protect, unlike Core 1.
+bool ensureTcpTargetConnected(int targetIndex) {
+  WiFiClient &client = tcpTargetClients[targetIndex];
+
+  if (client.connected()) {
+    return true;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  return client.connect(tcpTargets[targetIndex].ip.c_str(), tcpTargets[targetIndex].port, MODBUS_TCP_CONNECT_TIMEOUT_MS);
+}
+
+// Modbus TCP transaction ID, incremented per request so responses can be
+// matched to their request (required by the spec, though this gateway only
+// ever has one request in flight per target at a time).
+uint16_t tcpTransactionId = 0;
+
+// Same read semantics as modbusRead(), but framed as Modbus TCP (MBAP
+// header instead of RTU slave-ID+CRC) over tcpTargets[targetIndex]'s
+// connection. Returns MB_SUCCESS, an MB_ERR_* code, or a raw slave
+// exception code, exactly like modbusRead().
+uint8_t modbusTcpRead(int targetIndex, uint8_t area, uint16_t startAddr, uint16_t qty, uint16_t *outRegs) {
+  if (targetIndex < 0 || targetIndex >= tcpTargetCount) {
+    return MB_ERR_TCP_UNCONFIGURED;
+  }
+
+  if (!ensureTcpTargetConnected(targetIndex)) {
+    return MB_ERR_TIMEOUT;
+  }
+
+  WiFiClient &client = tcpTargetClients[targetIndex];
+  uint8_t unitId = tcpTargets[targetIndex].unitId;
+
+  uint8_t fc = modbusFunctionForArea(area);
+  uint8_t expectedDataBytes = isBitArea(area) ? ((qty + 7) / 8) : (qty * 2);
+
+  tcpTransactionId++;
+
+  uint8_t req[12];
+  req[0] = highByte(tcpTransactionId);
+  req[1] = lowByte(tcpTransactionId);
+  req[2] = 0x00;  // Protocol ID - always 0 for Modbus
+  req[3] = 0x00;
+  req[4] = 0x00;  // Length (of Unit ID + PDU that follows)
+  req[5] = 0x06;
+  req[6] = unitId;
+  req[7] = fc;
+  req[8] = highByte(startAddr);
+  req[9] = lowByte(startAddr);
+  req[10] = highByte(qty);
+  req[11] = lowByte(qty);
+
+  // Drain any stale bytes left over from a previous transaction before
+  // sending a new request, same defensive purpose as the RTU path's
+  // Serial1.available() drain.
+  while (client.available()) {
+    client.read();
+  }
+
+  client.write(req, sizeof(req));
+  client.flush();
+
+  uint8_t rx[7 + MODBUS_RAW_BUF_SIZE];
+  uint8_t rxLen = 0;
+  uint16_t expectedTotalLen = 0;  // full MBAP+PDU length, once the header tells us
+
+  unsigned long deadline = millis() + MODBUS_TCP_RESPONSE_TIMEOUT_MS;
+
+  while ((long)(millis() - deadline) < 0) {
+    if (client.available()) {
+      if (rxLen < sizeof(rx)) {
+        rx[rxLen++] = (uint8_t)client.read();
+      } else {
+        client.read();  // discard - response longer than our buffer, will fail length check below
+      }
+
+      if (rxLen == 8) {
+        // MBAP header's own Length field covers Unit ID + PDU (from byte 6
+        // onward); the header itself is 6 bytes (bytes 0-5), so total frame
+        // length is 6 + that value.
+        uint16_t mbapLen = ((uint16_t)rx[4] << 8) | rx[5];
+        expectedTotalLen = 6 + mbapLen;
+      }
+
+      if (expectedTotalLen != 0 && rxLen >= expectedTotalLen) {
+        break;
+      }
+    } else {
+      vTaskDelay(1);
+    }
+  }
+
+  if (rxLen == 0 || expectedTotalLen == 0 || rxLen < expectedTotalLen) {
+    client.stop();  // stale/partial TCP session - start clean next attempt
+    return MB_ERR_TIMEOUT;
+  }
+
+  uint16_t respTxId = ((uint16_t)rx[0] << 8) | rx[1];
+  if (respTxId != tcpTransactionId) {
+    return MB_ERR_CRC;  // mismatched transaction - treat as a corrupt/unexpected reply
+  }
+
+  if (rx[6] != unitId) {
+    return MB_ERR_WRONG_SLAVE;
+  }
+
+  if (rx[7] & 0x80) {
+    return rx[8];  // raw Modbus exception code from the target
+  }
+
+  if (rx[7] != fc || rx[8] != expectedDataBytes) {
+    return MB_ERR_CRC;
+  }
+
+  if (isBitArea(area)) {
+    for (uint16_t r = 0; r < qty; r++) {
+      outRegs[r] = (rx[9 + r / 8] >> (r % 8)) & 0x01;
+    }
+  } else {
+    for (uint16_t r = 0; r < qty; r++) {
+      outRegs[r] = ((uint16_t)rx[9 + r * 2] << 8) | rx[9 + r * 2 + 1];
     }
   }
 
@@ -1048,6 +1240,60 @@ void loadTypes() {
   preferences.end();
 }
 
+// ===================== Save / Load Modbus TCP Targets =====================
+void saveTcpTargets() {
+  preferences.begin("tcptgt", false);
+
+  preferences.putUInt("schema", TCP_TARGET_SCHEMA_VERSION);
+  preferences.putInt("count", tcpTargetCount);
+
+  for (int i = 0; i < tcpTargetCount; i++) {
+    String index = String(i);
+
+    preferences.putString(("name" + index).c_str(), tcpTargets[i].name);
+    preferences.putString(("ip" + index).c_str(), tcpTargets[i].ip);
+    preferences.putUShort(("port" + index).c_str(), tcpTargets[i].port);
+    preferences.putUChar(("unit" + index).c_str(), tcpTargets[i].unitId);
+  }
+
+  preferences.end();
+}
+
+void loadTcpTargets() {
+  preferences.begin("tcptgt", true);
+
+  uint32_t savedSchema = preferences.getUInt("schema", 0);
+  tcpTargetCount = preferences.getInt("count", 0);
+
+  preferences.end();
+
+  if (savedSchema != TCP_TARGET_SCHEMA_VERSION || tcpTargetCount < 0 || tcpTargetCount > MAX_TCP_TARGETS) {
+    // No prior config (e.g. upgrading from a firmware version before this
+    // feature existed) - default to zero targets, not sample data, since
+    // there's no sensible generic default IP/unit ID to guess at.
+    tcpTargetCount = 0;
+    saveTcpTargets();
+    return;
+  }
+
+  preferences.begin("tcptgt", true);
+
+  for (int i = 0; i < tcpTargetCount; i++) {
+    String index = String(i);
+
+    tcpTargets[i].name = preferences.getString(("name" + index).c_str(), "TCP Target " + String(i + 1));
+    tcpTargets[i].ip = preferences.getString(("ip" + index).c_str(), "");
+    tcpTargets[i].port = preferences.getUShort(("port" + index).c_str(), 502);
+    tcpTargets[i].unitId = preferences.getUChar(("unit" + index).c_str(), 1);
+
+    if (tcpTargets[i].port == 0) {
+      tcpTargets[i].port = 502;
+    }
+  }
+
+  preferences.end();
+}
+
 // ===================== Debug State =====================
 void resetDebugState(int index) {
   params[index].lastLoggedValid = false;
@@ -1065,7 +1311,9 @@ void loadDefaultSettings() {
     params[i].name = "";
     params[i].type = "";
     params[i].area = AREA_HOLDING_REGISTER;
+    params[i].transport = TRANSPORT_RTU;
     params[i].slaveId = 1;
+    params[i].tcpTargetIndex = 0;
     params[i].registerAddress = 0;
     params[i].registerLength = 1;
     params[i].enabled = false;
@@ -1091,7 +1339,9 @@ void saveSettings() {
     preferences.putString(("name" + index).c_str(), params[i].name);
     preferences.putString(("type" + index).c_str(), params[i].type);
     preferences.putUChar(("area" + index).c_str(), params[i].area);
+    preferences.putUChar(("transport" + index).c_str(), params[i].transport);
     preferences.putUChar(("sid" + index).c_str(), params[i].slaveId);
+    preferences.putUChar(("tcptgt" + index).c_str(), params[i].tcpTargetIndex);
     preferences.putUShort(("addr" + index).c_str(), params[i].registerAddress);
     preferences.putUShort(("len" + index).c_str(), params[i].registerLength);
     preferences.putBool(("en" + index).c_str(), params[i].enabled);
@@ -1140,7 +1390,20 @@ void loadSettings() {
       params[i].type = typeList[0].name;
     }
 
+    // Default TRANSPORT_RTU (0): configs saved before this field existed
+    // keep their original behavior.
+    params[i].transport = preferences.getUChar(("transport" + index).c_str(), TRANSPORT_RTU);
+    if (params[i].transport > TRANSPORT_TCP) {
+      params[i].transport = TRANSPORT_RTU;
+    }
+
     params[i].slaveId = preferences.getUChar(("sid" + index).c_str(), 1);
+
+    params[i].tcpTargetIndex = preferences.getUChar(("tcptgt" + index).c_str(), 0);
+    if (params[i].tcpTargetIndex >= MAX_TCP_TARGETS) {
+      params[i].tcpTargetIndex = 0;
+    }
+
     params[i].registerAddress = preferences.getUShort(("addr" + index).c_str(), 0);
     params[i].registerLength = isBitArea(params[i].area) ? 1 : getDataLengthForType(params[i].type);
     params[i].enabled = preferences.getBool(("en" + index).c_str(), true);
@@ -1185,6 +1448,25 @@ String getAreaOptions(uint8_t selected) {
     }
 
     html += ">" + String(AREA_NAMES[a]) + "</option>";
+  }
+
+  return html;
+}
+
+// Options for the "TCP Target" dropdown, from the configured tcpTargets[]
+// list. Empty when no targets are configured yet - the row's transport
+// select should default back to RTU in that case (enforced client-side).
+String getTcpTargetOptions(uint8_t selected) {
+  String html = "";
+
+  for (int t = 0; t < tcpTargetCount; t++) {
+    html += "<option value='" + String(t) + "'";
+
+    if (t == selected) {
+      html += " selected";
+    }
+
+    html += ">" + htmlEscape(tcpTargets[t].name) + "</option>";
   }
 
   return html;
@@ -1681,6 +1963,7 @@ void pollModbus() {
     uint16_t regLen;
 
     xSemaphoreTake(dataMutex, portMAX_DELAY);
+    bool isRtu = (params[i].transport == TRANSPORT_RTU);
     enabled = params[i].enabled;
     type = params[i].type;
     area = params[i].area;
@@ -1688,6 +1971,11 @@ void pollModbus() {
     regAddr = params[i].registerAddress;
     regLen = getDataLengthForType(type);
     xSemaphoreGive(dataMutex);
+
+    // TCP-transport rows are owned by tcpPollTask - never touch RS485 for them.
+    if (!isRtu) {
+      continue;
+    }
 
     if (!enabled) {
       xSemaphoreTake(dataMutex, portMAX_DELAY);
@@ -1807,6 +2095,136 @@ void pollModbus() {
   xSemaphoreGive(pollCompleteSem);
 }
 
+// ===================== Poll Modbus TCP Targets (Core 0) =====================
+// Mirrors pollModbus()'s per-parameter logic, but for TRANSPORT_TCP rows:
+// reads via modbusTcpRead() over WiFi instead of the RS485 bus, and tracks
+// per-target backoff (tcpTargetHealth[]) instead of per-slave. Deliberately
+// independent of modbusTask's cycle - it just writes into the same
+// params[]/dataMutex, and whichever cloud push fires next (still triggered
+// by modbusTask's pollCompleteSem) picks up whatever the latest values are.
+// No serialMutex here: this never touches Serial1/RS485.
+void pollTcpTargets() {
+  int count;
+
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  count = paramCount;
+  xSemaphoreGive(dataMutex);
+
+  for (int i = 0; i < count; i++) {
+    bool enabled;
+    String type;
+    uint8_t area;
+    uint8_t targetIndex;
+    uint16_t regAddr;
+    uint16_t regLen;
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    bool isTcp = (params[i].transport == TRANSPORT_TCP);
+    enabled = params[i].enabled;
+    type = params[i].type;
+    area = params[i].area;
+    targetIndex = params[i].tcpTargetIndex;
+    regAddr = params[i].registerAddress;
+    regLen = getDataLengthForType(type);
+    xSemaphoreGive(dataMutex);
+
+    if (!isTcp) {
+      continue;
+    }
+
+    if (!enabled) {
+      xSemaphoreTake(dataMutex, portMAX_DELAY);
+      params[i].valid = false;
+      params[i].errorCode = 0;
+      xSemaphoreGive(dataMutex);
+      continue;
+    }
+
+    if (isBitArea(area)) {
+      regLen = 1;
+    }
+
+    if (regLen < 1) {
+      regLen = 1;
+    }
+
+    if (regLen > 2) {
+      regLen = 2;
+    }
+
+    if (targetIndex >= tcpTargetCount) {
+      xSemaphoreTake(dataMutex, portMAX_DELAY);
+      params[i].valid = false;
+      params[i].errorCode = MB_ERR_TCP_UNCONFIGURED;
+      logModbusStatusChange(i);
+      xSemaphoreGive(dataMutex);
+      continue;
+    }
+
+    // Target still inside its offline backoff window: skip the transaction
+    // entirely, mark the parameter accordingly - same idea as RTU's backoff.
+    SlaveHealth &health = tcpTargetHealth[targetIndex];
+
+    if (health.backoffUntil != 0 && (long)(millis() - health.backoffUntil) < 0) {
+      xSemaphoreTake(dataMutex, portMAX_DELAY);
+      params[i].valid = false;
+      params[i].errorCode = MB_ERR_BACKOFF;
+      logModbusStatusChange(i);
+      xSemaphoreGive(dataMutex);
+      continue;
+    }
+
+    uint16_t regs[2] = { 0, 0 };
+    uint8_t result = modbusTcpRead(targetIndex, area, regAddr, regLen, regs);
+
+    // Per-target backoff accounting - only a full timeout counts.
+    if (result == MB_ERR_TIMEOUT) {
+      if (health.consecTimeouts < 255) {
+        health.consecTimeouts++;
+      }
+      if (health.consecTimeouts >= TCP_TARGET_BACKOFF_FAIL_THRESHOLD) {
+        bool enteringBackoff = (health.backoffUntil == 0);
+        health.backoffUntil = millis() + TCP_TARGET_BACKOFF_MS;
+        if (enteringBackoff) {
+          logKeyEvent("TCP TARGET " + tcpTargets[targetIndex].name + " NOT RESPONDING - pausing its polls for " + String(TCP_TARGET_BACKOFF_MS / 1000) + "s");
+        }
+      }
+    } else {
+      if (health.backoffUntil != 0) {
+        logKeyEvent("TCP TARGET " + tcpTargets[targetIndex].name + " BACK ONLINE");
+      }
+      health.consecTimeouts = 0;
+      health.backoffUntil = 0;
+    }
+
+#if DEBUG_ENABLED
+    logMessage("[TCP-POLL] Target=" + tcpTargets[targetIndex].name + " Addr=" + String(regAddr) + " Len=" + String(regLen) + " Result=" + String(result));
+#endif
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+
+    params[i].registerLength = regLen;
+
+    if (result == MB_SUCCESS) {
+      if (isBitArea(area)) {
+        params[i].value = regs[0] ? 1 : 0;
+      } else {
+        params[i].value = convertValue(type, regs[0], regs[1]);
+      }
+      params[i].valid = true;
+      params[i].errorCode = 0;
+      params[i].lastUpdateTime = millis();
+    } else {
+      params[i].valid = false;
+      params[i].errorCode = result;
+    }
+
+    logModbusStatusChange(i);
+
+    xSemaphoreGive(dataMutex);
+  }
+}
+
 // ===================== Root Web Page =====================
 
 // ===================== Landing Page: Dashboard =====================
@@ -1872,6 +2290,7 @@ void handleRoot() {
 <thead>
 <tr>
 <th>Name</th>
+<th>Source</th>
 <th>Enabled</th>
 <th>Value</th>
 <th>Status</th>
@@ -1907,6 +2326,7 @@ function renderTable(){
    let staleClass = (ageSec === null || ageSec > 10) ? "stale" : "";
    body += `<tr>
    <td>${p.name}</td>
+   <td>${p.source ?? '-'}</td>
    <td>${p.enabled ? 'Yes':'No'}</td>
    <td>${p.value ?? '-'}</td>
    <td>${p.valid ? 'OK':'ERR'}</td>
@@ -2010,10 +2430,11 @@ void handleSettings() {
 <thead>
 <tr>
 <th>Name</th>
+<th>Transport</th>
 <th>Register Area</th>
 <th>Data Type</th>
 <th>Data Length</th>
-<th>Device ID</th>
+<th>Device ID / TCP Target</th>
 <th>Register Address</th>
 <th>Enable</th>
 <th>Action</th>
@@ -2024,9 +2445,16 @@ void handleSettings() {
 
   for (int i = 0; i < paramCount; i++) {
     uint16_t dlen = isBitArea(params[i].area) ? 1 : getDataLengthForType(params[i].type);
+    bool rowIsTcp = (params[i].transport == TRANSPORT_TCP);
 
     html += "<tr>";
     html += "<td><input name='name" + String(i) + "' value='" + htmlEscape(params[i].name) + "'></td>";
+
+    html += "<td><select name='transport" + String(i) + "' onchange='updateTransportSelection(this)'>";
+    html += "<option value='0'" + String(rowIsTcp ? "" : " selected") + ">RTU (RS485)</option>";
+    html += "<option value='1'" + String(rowIsTcp ? " selected" : "") + ">TCP (Network)</option>";
+    html += "</select></td>";
+
     html += "<td><select name='area" + String(i) + "' onchange='updateAreaSelection(this)'>" + getAreaOptions(params[i].area) + "</select></td>";
 
     // Bit areas auto-select a fixed BIT pseudo-type (the only thing a bit
@@ -2039,7 +2467,18 @@ void handleSettings() {
     }
     html += "</select></td>";
     html += "<td><input class='dlen-display' value='" + String(dlen) + "' readonly></td>";
-    html += "<td><input name='sid" + String(i) + "' value='" + String(params[i].slaveId) + "'></td>";
+
+    // Both fields always render (and submit) - server reads whichever the
+    // submitted transport value selects; JS only toggles which is visible.
+    html += "<td>";
+    html += "<div class='rtu-field' style='display:" + String(rowIsTcp ? "none" : "block") + "'>";
+    html += "<input name='sid" + String(i) + "' placeholder='RTU Slave ID' value='" + String(params[i].slaveId) + "'>";
+    html += "</div>";
+    html += "<div class='tcp-field' style='display:" + String(rowIsTcp ? "block" : "none") + "'>";
+    html += "<select name='tcptgt" + String(i) + "'>" + getTcpTargetOptions(params[i].tcpTargetIndex) + "</select>";
+    html += "</div>";
+    html += "</td>";
+
     html += "<td><input name='addr" + String(i) + "' value='" + String(params[i].registerAddress) + "'></td>";
     html += "<td><input type='checkbox' name='en" + String(i) + "'";
     if (params[i].enabled) html += " checked";
@@ -2069,6 +2508,30 @@ const paramTypeInfo = [)rawliteral";
   }
 
   html += R"rawliteral(];
+
+const tcpTargetInfo = [)rawliteral";
+
+  for (int i = 0; i < tcpTargetCount; i++) {
+    if (i > 0) html += ",";
+    html += "{\"name\":\"" + jsonEscape(tcpTargets[i].name) + "\"}";
+  }
+
+  html += R"rawliteral(];
+
+function buildTcpTargetOptionsHTML(selected) {
+  let opts = "";
+  tcpTargetInfo.forEach((t, i) => {
+    opts += `<option value="${i}"${i === selected ? " selected" : ""}>${t.name}</option>`;
+  });
+  return opts;
+}
+
+function updateTransportSelection(selectEl) {
+  let row = selectEl.closest("tr");
+  let isTcp = (selectEl.value == "1");
+  row.querySelector(".rtu-field").style.display = isTcp ? "none" : "block";
+  row.querySelector(".tcp-field").style.display = isTcp ? "block" : "none";
+}
 
 function buildTypeOptionsHTML(selected) {
   let opts = "";
@@ -2129,10 +2592,17 @@ function buildParamRow() {
 
   row.innerHTML = `
     <td><input name="nameX" value=""></td>
+    <td><select name="transportX" onchange="updateTransportSelection(this)">
+      <option value="0" selected>RTU (RS485)</option>
+      <option value="1">TCP (Network)</option>
+    </select></td>
     <td><select name="areaX" onchange="updateAreaSelection(this)">${buildAreaOptionsHTML(0)}</select></td>
     <td><select name="typeX" onchange="updateDataLength(this)">${buildTypeOptionsHTML(defaultType)}</select></td>
     <td><input class="dlen-display" value="${defaultLen}" readonly></td>
-    <td><input name="sidX" value="1"></td>
+    <td>
+      <div class="rtu-field" style="display:block"><input name="sidX" placeholder="RTU Slave ID" value="1"></div>
+      <div class="tcp-field" style="display:none"><select name="tcptgtX">${buildTcpTargetOptionsHTML(0)}</select></div>
+    </td>
     <td><input name="addrX" value="0"></td>
     <td><input type="checkbox" name="enX" checked></td>
     <td>
@@ -2167,9 +2637,11 @@ function renumberParamRows() {
 
   rows.forEach((row, index) => {
     row.querySelector("input[name^='name']").name = "name" + index;
+    row.querySelector("select[name^='transport']").name = "transport" + index;
     row.querySelector("select[name^='area']").name = "area" + index;
     row.querySelector("select[name^='type']").name = "type" + index;
     row.querySelector("input[name^='sid']").name = "sid" + index;
+    row.querySelector("select[name^='tcptgt']").name = "tcptgt" + index;
     row.querySelector("input[name^='addr']").name = "addr" + index;
     row.querySelector("input[name^='en']").name = "en" + index;
   });
@@ -2329,6 +2801,41 @@ function toggleApSsidField() {
   html += "'></textarea></td></tr>";
 
   html += "<tr><td colspan='2'><button type='submit'>Save Cloud Settings</button></td></tr>";
+  html += "</table>";
+  html += "</form>";
+  html += "</div>";
+
+
+  // MODBUS TCP TARGETS FORM (second data source, e.g. a CNC controller)
+  html += "<div class='box'>";
+  html += "<h2>Modbus TCP Targets</h2>";
+  html += "<p><small>Remote Modbus TCP servers (e.g. a CNC controller) this gateway polls over WiFi, as a second data source alongside the RS485 RTU bus below. Reference a target from the \"TCP Target\" column in the Modbus Settings table. Leave Name/IP blank to leave a slot unused.</small></p>";
+
+  if (server.hasArg("tcpTargetsSaved")) {
+    html += "<div class='success'>Modbus TCP Targets Saved Successfully</div>";
+  }
+
+  html += "<form action='/saveTcpTargets' method='POST'>";
+  html += "<table>";
+  html += "<tr><th>#</th><th>Name</th><th>IP Address</th><th>Port</th><th>Unit ID</th></tr>";
+
+  for (int i = 0; i < MAX_TCP_TARGETS; i++) {
+    bool used = (i < tcpTargetCount);
+    String tname = used ? tcpTargets[i].name : "";
+    String tip = used ? tcpTargets[i].ip : "";
+    uint16_t tport = used ? tcpTargets[i].port : 502;
+    uint8_t tunit = used ? tcpTargets[i].unitId : 1;
+
+    html += "<tr>";
+    html += "<td>" + String(i) + "</td>";
+    html += "<td><input type='text' name='tgtName" + String(i) + "' placeholder='e.g. CNC' value='" + htmlEscape(tname) + "'></td>";
+    html += "<td><input type='text' name='tgtIp" + String(i) + "' placeholder='192.168.1.50' value='" + htmlEscape(tip) + "'></td>";
+    html += "<td><input type='number' name='tgtPort" + String(i) + "' value='" + String(tport) + "'></td>";
+    html += "<td><input type='number' name='tgtUnit" + String(i) + "' min='0' max='255' value='" + String(tunit) + "'></td>";
+    html += "</tr>";
+  }
+
+  html += "<tr><td colspan='5'><button type='submit'>Save TCP Targets</button></td></tr>";
   html += "</table>";
   html += "</form>";
   html += "</div>";
@@ -2525,6 +3032,11 @@ void handleSave() {
 
     params[i].name = server.arg("name" + index);
 
+    params[i].transport = server.arg("transport" + index).toInt();
+    if (params[i].transport > TRANSPORT_TCP) {
+      params[i].transport = TRANSPORT_RTU;
+    }
+
     params[i].area = server.arg("area" + index).toInt();
     if (params[i].area > AREA_DISCRETE_INPUT) {
       params[i].area = AREA_HOLDING_REGISTER;
@@ -2545,6 +3057,12 @@ void handleSave() {
     }
 
     params[i].slaveId = server.arg("sid" + index).toInt();
+
+    params[i].tcpTargetIndex = server.arg("tcptgt" + index).toInt();
+    if (params[i].tcpTargetIndex >= MAX_TCP_TARGETS) {
+      params[i].tcpTargetIndex = 0;
+    }
+
     params[i].registerAddress = server.arg("addr" + index).toInt();
     params[i].registerLength = isBitArea(params[i].area) ? 1 : getDataLengthForType(params[i].type);
     params[i].enabled = server.hasArg("en" + index);
@@ -2726,6 +3244,62 @@ void handleSaveDevice() {
   logKeyEvent("DEVICE SETTINGS SAVED: AP=" + apSsidToUse + " deviceName=" + getDeviceName());
 
   server.sendHeader("Location", "/settings?deviceSaved=1");
+  server.send(303);
+}
+
+// ===================== Save Modbus TCP Targets =====================
+void handleSaveTcpTargets() {
+  int newCount = 0;
+
+  for (int i = 0; i < MAX_TCP_TARGETS; i++) {
+    String index = String(i);
+    String name = server.hasArg("tgtName" + index) ? server.arg("tgtName" + index) : "";
+    String ip = server.hasArg("tgtIp" + index) ? server.arg("tgtIp" + index) : "";
+
+    name.trim();
+    ip.trim();
+
+    // A slot with no name/IP is simply unused - only compacted slots
+    // (0..newCount-1) are kept, so gaps in the form don't create holes.
+    if (name.length() == 0 || ip.length() == 0) {
+      continue;
+    }
+
+    int port = server.hasArg("tgtPort" + index) ? server.arg("tgtPort" + index).toInt() : 502;
+    int unitId = server.hasArg("tgtUnit" + index) ? server.arg("tgtUnit" + index).toInt() : 1;
+
+    if (port <= 0 || port > 65535) {
+      port = 502;
+    }
+
+    if (unitId < 0 || unitId > 255) {
+      unitId = 1;
+    }
+
+    tcpTargets[newCount].name = name;
+    tcpTargets[newCount].ip = ip;
+    tcpTargets[newCount].port = (uint16_t)port;
+    tcpTargets[newCount].unitId = (uint8_t)unitId;
+    newCount++;
+  }
+
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  tcpTargetCount = newCount;
+  xSemaphoreGive(dataMutex);
+
+  saveTcpTargets();
+
+  // Force reconnects so any changed IP/port/unit ID for an existing slot
+  // index takes effect immediately rather than on next reboot.
+  for (int i = 0; i < MAX_TCP_TARGETS; i++) {
+    tcpTargetClients[i].stop();
+    tcpTargetHealth[i].consecTimeouts = 0;
+    tcpTargetHealth[i].backoffUntil = 0;
+  }
+
+  logKeyEvent("MODBUS TCP TARGETS SAVED: " + String(tcpTargetCount) + " configured");
+
+  server.sendHeader("Location", "/settings?tcpTargetsSaved=1");
   server.send(303);
 }
 
@@ -2913,6 +3487,11 @@ void handleData() {
     json += "\"name\":\"" + jsonEscape(params[i].name) + "\",";
     json += "\"type\":\"" + jsonEscape(params[i].type) + "\",";
     json += "\"area\":\"" + String(AREA_NAMES[params[i].area <= AREA_DISCRETE_INPUT ? params[i].area : 0]) + "\",";
+
+    bool rowIsTcp = (params[i].transport == TRANSPORT_TCP);
+    json += "\"transport\":\"" + String(rowIsTcp ? "TCP" : "RTU") + "\",";
+    json += "\"source\":\"" + (rowIsTcp && params[i].tcpTargetIndex < tcpTargetCount ? jsonEscape(tcpTargets[params[i].tcpTargetIndex].name) : String("RS485")) + "\",";
+
     json += "\"slaveId\":" + String(params[i].slaveId) + ",";
     json += "\"registerAddress\":" + String(params[i].registerAddress) + ",";
     json += "\"registerLength\":" + String(params[i].registerLength) + ",";
@@ -3026,6 +3605,7 @@ void setup() {
 
   loadTypes();
   loadSettings();
+  loadTcpTargets();
 
   WiFi.mode(WIFI_AP_STA);
 
@@ -3056,6 +3636,7 @@ void setup() {
   server.on("/keylog", HTTP_GET, handleKeyLog);
   server.on("/types", HTTP_GET, handleTypes);
   server.on("/saveTypes", HTTP_POST, handleSaveTypes);
+  server.on("/saveTcpTargets", HTTP_POST, handleSaveTcpTargets);
   server.on("/reset", HTTP_GET, handleReset);
   server.on("/resetTypes", HTTP_GET, handleResetTypes);
 
@@ -3085,6 +3666,19 @@ void setup() {
     WEB_TASK_CORE);
 
   logKeyEvent("WEB/TCP TASK STARTED (core " + String(WEB_TASK_CORE) + ")");
+
+  // Modbus TCP client poller (e.g. a CNC controller) - Core 0, independent
+  // of modbusTask/Core 1's real-time RS485 timing.
+  xTaskCreatePinnedToCore(
+    tcpPollTask,
+    "TcpPollTask",
+    TCP_POLL_TASK_STACK,
+    NULL,
+    TCP_POLL_TASK_PRIORITY,
+    &tcpPollTaskHandle,
+    TCP_POLL_TASK_CORE);
+
+  logKeyEvent("MODBUS TCP POLLING STARTED (core " + String(TCP_POLL_TASK_CORE) + ")");
 }
 
 // ===================== Summary Debug =====================
@@ -3157,6 +3751,34 @@ void modbusTask(void *parameter) {
     }
 
     printModbusSummary();
+
+    uint32_t interval;
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    interval = pollIntervalMs;
+    xSemaphoreGive(dataMutex);
+
+    unsigned long elapsed = millis() - cycleStart;
+
+    if (elapsed < interval) {
+      vTaskDelay(pdMS_TO_TICKS(interval - elapsed));
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+  }
+}
+
+// ===================== Modbus TCP Poll Task (Core 0) =====================
+// Polls TRANSPORT_TCP parameters (e.g. a CNC controller) over WiFi,
+// completely independent of modbusTask/Core 1 - a TCP connect/read here
+// can block for seconds without ever affecting RS485 timing. Paced to the
+// same pollIntervalMs as the RTU poller for predictable behavior, but runs
+// as its own cycle; results land in the same params[]/dataMutex the RTU
+// poller and cloud push already share.
+void tcpPollTask(void *parameter) {
+  for (;;) {
+    unsigned long cycleStart = millis();
+
+    pollTcpTargets();
 
     uint32_t interval;
     xSemaphoreTake(dataMutex, portMAX_DELAY);
