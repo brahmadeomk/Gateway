@@ -47,6 +47,16 @@
      the same params[]/dataMutex, so the cloud push, dashboard, and
      store-and-forward paths handle either source identically. Per-target
      backoff mirrors the per-slave scheme (tcpTargetHealth[]).
+   - Settings storage: the params/types/TCP-target tables persist as one
+     compact binary blob per table (StoredParamRow etc., putBytes/
+     getBytes) instead of one NVS key per field per row - NVS is a small
+     fixed-size partition shared by every namespace including the AWS
+     certs, and the old one-key-per-field layout was exhausting it in the
+     field (confirmed: NVS_SAVE_INCOMPLETE with only 4 rows configured).
+     Every save*() checks each write's result (trackNvsWrite()) and logs
+     a key event if any failed, and every load*() transparently migrates
+     a config saved by an older per-key firmware version to the compact
+     format on next boot, reclaiming the old keys via preferences.clear().
    ====================================================================== */
 
 #include <WiFi.h>
@@ -413,6 +423,47 @@ struct ModbusParam {
 
 ModbusParam params[MAX_PARAMS];
 int paramCount = 0;
+
+// ===================== Compact Blob Storage =====================
+// params[]/typeList[]/tcpTargets[] used to persist as one NVS key per
+// FIELD per ROW - a full params table alone could be up to 900 individual
+// entries. NVS is a small, fixed-size partition shared by every namespace
+// in this sketch (including the AWS certs, which alone are 1-2KB of PEM
+// text), and that many-small-keys layout was exhausting it in practice
+// (confirmed in the field: NVS_SAVE_INCOMPLETE errors on the "modbus"
+// namespace with only 4 rows configured). Each table is now packed into
+// a fixed-size POD struct array and stored as a single blob
+// (putBytes/getBytes) - a couple of NVS entries total regardless of row
+// count. String fields are truncated into fixed-size char buffers only
+// for this on-flash format; params[]/typeList[]/tcpTargets[] themselves
+// are untouched. registerLength/baseFormat/dataLength are recomputed
+// after load exactly as before, so they aren't stored at all.
+#define STORED_NAME_LEN 32
+#define STORED_TYPE_LEN 20
+#define STORED_IP_LEN 40
+
+struct StoredParamRow {
+  char name[STORED_NAME_LEN];
+  char type[STORED_TYPE_LEN];
+  uint8_t area;
+  uint8_t transport;
+  uint8_t slaveId;
+  uint8_t tcpTargetIndex;
+  uint16_t registerAddress;
+  uint8_t enabled;
+};
+
+struct StoredParamTypeRow {
+  char name[STORED_TYPE_LEN];
+  float divisor;
+};
+
+struct StoredTcpTargetRow {
+  char name[STORED_NAME_LEN];
+  char ip[STORED_IP_LEN];
+  uint16_t port;
+  uint8_t unitId;
+};
 
 // ===================== Forward Declarations =====================
 void resetDebugState(int index);
@@ -1231,20 +1282,48 @@ void loadDefaultTypes() {
 }
 
 // ===================== Save / Load Types =====================
+// Normalizes/derives fields after typeList[i].name/divisor have been
+// populated from either storage format.
+void finalizeLoadedTypeRow(int i) {
+  if (typeList[i].name.length() == 0) {
+    typeList[i].name = "INT_16/100";
+  }
+
+  if (typeList[i].divisor <= 0) {
+    typeList[i].divisor = 1;
+  }
+
+  typeList[i].baseFormat = getBaseFormatFromType(typeList[i].name);
+  typeList[i].dataLength = inferDataLengthFromType(typeList[i].name);
+}
+
 void saveTypes() {
   nvsWriteFailures = 0;
   preferences.begin("types", false);
 
+  // Wipes any leftover keys from the old one-key-per-field format so a
+  // migrated config actually reclaims that space.
+  preferences.clear();
+
   trackNvsWrite(preferences.putUInt("schema", TYPE_SCHEMA_VERSION));
   trackNvsWrite(preferences.putInt("count", typeCount));
 
-  for (int i = 0; i < typeCount; i++) {
-    String index = String(i);
+  if (typeCount > 0) {
+    StoredParamTypeRow *rows = new StoredParamTypeRow[typeCount];
 
-    trackNvsWrite(preferences.putString(("name" + index).c_str(), typeList[i].name));
-    trackNvsWrite(preferences.putString(("base" + index).c_str(), typeList[i].baseFormat));
-    trackNvsWrite(preferences.putFloat(("div" + index).c_str(), typeList[i].divisor));
-    trackNvsWrite(preferences.putUShort(("dlen" + index).c_str(), typeList[i].dataLength));
+    for (int i = 0; i < typeCount; i++) {
+      memset(&rows[i], 0, sizeof(StoredParamTypeRow));
+      typeList[i].name.toCharArray(rows[i].name, STORED_TYPE_LEN);
+      rows[i].divisor = typeList[i].divisor;
+    }
+
+    size_t expectedLen = (size_t)typeCount * sizeof(StoredParamTypeRow);
+    size_t written = preferences.putBytes("rows", rows, expectedLen);
+    if (written != expectedLen) {
+      nvsWriteFailures++;
+    }
+
+    delete[] rows;
   }
 
   preferences.end();
@@ -1260,35 +1339,46 @@ void loadTypes() {
   uint32_t savedSchema = preferences.getUInt("schema", 0);
   typeCount = preferences.getInt("count", 0);
 
-  preferences.end();
-
   if (savedSchema != TYPE_SCHEMA_VERSION || typeCount <= 0 || typeCount > MAX_PARAM_TYPES) {
+    preferences.end();
     loadDefaultTypes();
     saveTypes();
     return;
   }
 
-  preferences.begin("types", true);
+  size_t expectedLen = (size_t)typeCount * sizeof(StoredParamTypeRow);
+  size_t blobLen = preferences.getBytesLength("rows");
 
+  if (blobLen == expectedLen) {
+    StoredParamTypeRow *rows = new StoredParamTypeRow[typeCount];
+    preferences.getBytes("rows", rows, expectedLen);
+    preferences.end();
+
+    for (int i = 0; i < typeCount; i++) {
+      rows[i].name[STORED_TYPE_LEN - 1] = '\0';
+      typeList[i].name = String(rows[i].name);
+      typeList[i].divisor = rows[i].divisor;
+      finalizeLoadedTypeRow(i);
+    }
+
+    delete[] rows;
+    return;
+  }
+
+  // No compact blob yet - a config saved by an earlier firmware version.
+  // Read the old per-key layout, then re-save in the compact format.
   for (int i = 0; i < typeCount; i++) {
     String index = String(i);
 
     typeList[i].name = preferences.getString(("name" + index).c_str(), "INT_16/100");
     typeList[i].divisor = preferences.getFloat(("div" + index).c_str(), 100);
-
-    if (typeList[i].name.length() == 0) {
-      typeList[i].name = "INT_16/100";
-    }
-
-    if (typeList[i].divisor <= 0) {
-      typeList[i].divisor = 1;
-    }
-
-    typeList[i].baseFormat = getBaseFormatFromType(typeList[i].name);
-    typeList[i].dataLength = inferDataLengthFromType(typeList[i].name);
+    finalizeLoadedTypeRow(i);
   }
 
   preferences.end();
+
+  saveTypes();
+  logKeyEvent("DATA TYPES MIGRATED to compact storage - freed flash space");
 }
 
 // ===================== Save / Load Modbus TCP Targets =====================
@@ -1296,16 +1386,31 @@ void saveTcpTargets() {
   nvsWriteFailures = 0;
   preferences.begin("tcptgt", false);
 
+  // Wipes any leftover keys from the old one-key-per-field format so a
+  // migrated config actually reclaims that space.
+  preferences.clear();
+
   trackNvsWrite(preferences.putUInt("schema", TCP_TARGET_SCHEMA_VERSION));
   trackNvsWrite(preferences.putInt("count", tcpTargetCount));
 
-  for (int i = 0; i < tcpTargetCount; i++) {
-    String index = String(i);
+  if (tcpTargetCount > 0) {
+    StoredTcpTargetRow *rows = new StoredTcpTargetRow[tcpTargetCount];
 
-    trackNvsWrite(preferences.putString(("name" + index).c_str(), tcpTargets[i].name));
-    trackNvsWrite(preferences.putString(("ip" + index).c_str(), tcpTargets[i].ip));
-    trackNvsWrite(preferences.putUShort(("port" + index).c_str(), tcpTargets[i].port));
-    trackNvsWrite(preferences.putUChar(("unit" + index).c_str(), tcpTargets[i].unitId));
+    for (int i = 0; i < tcpTargetCount; i++) {
+      memset(&rows[i], 0, sizeof(StoredTcpTargetRow));
+      tcpTargets[i].name.toCharArray(rows[i].name, STORED_NAME_LEN);
+      tcpTargets[i].ip.toCharArray(rows[i].ip, STORED_IP_LEN);
+      rows[i].port = tcpTargets[i].port;
+      rows[i].unitId = tcpTargets[i].unitId;
+    }
+
+    size_t expectedLen = (size_t)tcpTargetCount * sizeof(StoredTcpTargetRow);
+    size_t written = preferences.putBytes("rows", rows, expectedLen);
+    if (written != expectedLen) {
+      nvsWriteFailures++;
+    }
+
+    delete[] rows;
   }
 
   preferences.end();
@@ -1321,19 +1426,40 @@ void loadTcpTargets() {
   uint32_t savedSchema = preferences.getUInt("schema", 0);
   tcpTargetCount = preferences.getInt("count", 0);
 
-  preferences.end();
-
   if (savedSchema != TCP_TARGET_SCHEMA_VERSION || tcpTargetCount < 0 || tcpTargetCount > MAX_TCP_TARGETS) {
-    // No prior config (e.g. upgrading from a firmware version before this
-    // feature existed) - default to zero targets, not sample data, since
-    // there's no sensible generic default IP/unit ID to guess at.
+    // No prior config at all (e.g. upgrading from a firmware version
+    // before this feature existed) - default to zero targets, not sample
+    // data, since there's no sensible generic default IP/unit ID to guess at.
+    preferences.end();
     tcpTargetCount = 0;
     saveTcpTargets();
     return;
   }
 
-  preferences.begin("tcptgt", true);
+  size_t expectedLen = (size_t)tcpTargetCount * sizeof(StoredTcpTargetRow);
+  size_t blobLen = preferences.getBytesLength("rows");
 
+  if (blobLen == expectedLen) {
+    StoredTcpTargetRow *rows = new StoredTcpTargetRow[tcpTargetCount];
+    preferences.getBytes("rows", rows, expectedLen);
+    preferences.end();
+
+    for (int i = 0; i < tcpTargetCount; i++) {
+      rows[i].name[STORED_NAME_LEN - 1] = '\0';
+      rows[i].ip[STORED_IP_LEN - 1] = '\0';
+
+      tcpTargets[i].name = String(rows[i].name);
+      tcpTargets[i].ip = String(rows[i].ip);
+      tcpTargets[i].port = (rows[i].port == 0) ? 502 : rows[i].port;
+      tcpTargets[i].unitId = rows[i].unitId;
+    }
+
+    delete[] rows;
+    return;
+  }
+
+  // No compact blob yet - a config saved by the earlier per-key format
+  // (this table's very first version). Read it, then re-save compactly.
   for (int i = 0; i < tcpTargetCount; i++) {
     String index = String(i);
 
@@ -1348,6 +1474,9 @@ void loadTcpTargets() {
   }
 
   preferences.end();
+
+  saveTcpTargets();
+  logKeyEvent("MODBUS TCP TARGETS MIGRATED to compact storage - freed flash space");
 }
 
 // ===================== Debug State =====================
@@ -1384,32 +1513,99 @@ void loadDefaultSettings() {
 }
 
 // ===================== Save / Load Modbus Settings =====================
+// Normalizes/derives fields after params[i].name/type/area/transport/
+// slaveId/tcpTargetIndex/registerAddress/enabled have been populated from
+// either storage format - shared by both load paths below so the
+// validation logic (area/type/transport/target clamping, derived
+// registerLength) only exists once.
+void finalizeLoadedParamRow(int i) {
+  if (params[i].area > AREA_DISCRETE_INPUT) {
+    params[i].area = AREA_HOLDING_REGISTER;
+  }
+
+  if (isBitArea(params[i].area)) {
+    // Fixed pseudo-type for coil/discrete rows - deliberately not run
+    // through the type-list fallback below.
+    params[i].type = "BIT";
+  } else if (findTypeIndex(params[i].type) < 0 && typeCount > 0) {
+    params[i].type = typeList[0].name;
+  }
+
+  if (params[i].transport > TRANSPORT_TCP) {
+    params[i].transport = TRANSPORT_RTU;
+  }
+
+  if (params[i].tcpTargetIndex >= MAX_TCP_TARGETS) {
+    params[i].tcpTargetIndex = 0;
+  }
+
+  params[i].registerLength = isBitArea(params[i].area) ? 1 : getDataLengthForType(params[i].type);
+  params[i].value = 0;
+  params[i].valid = false;
+  params[i].errorCode = 0;
+  params[i].lastUpdateTime = 0;
+  resetDebugState(i);
+}
+
 void saveSettings() {
-  // The largest NVS consumer that grows with normal use: 9 keys per row,
-  // up to MAX_PARAMS rows - the most likely place to hit a full partition.
   nvsWriteFailures = 0;
   preferences.begin("modbus", false);
 
+  // Wipes any leftover keys from the old one-key-per-field format (see
+  // loadSettingsLegacyPerKey()) so a migrated config actually reclaims
+  // that space instead of leaving hundreds of orphaned entries behind.
+  preferences.clear();
+
   trackNvsWrite(preferences.putInt("count", paramCount));
 
-  for (int i = 0; i < paramCount; i++) {
-    String index = String(i);
+  if (paramCount > 0) {
+    StoredParamRow *rows = new StoredParamRow[paramCount];
 
-    trackNvsWrite(preferences.putString(("name" + index).c_str(), params[i].name));
-    trackNvsWrite(preferences.putString(("type" + index).c_str(), params[i].type));
-    trackNvsWrite(preferences.putUChar(("area" + index).c_str(), params[i].area));
-    trackNvsWrite(preferences.putUChar(("transport" + index).c_str(), params[i].transport));
-    trackNvsWrite(preferences.putUChar(("sid" + index).c_str(), params[i].slaveId));
-    trackNvsWrite(preferences.putUChar(("tcptgt" + index).c_str(), params[i].tcpTargetIndex));
-    trackNvsWrite(preferences.putUShort(("addr" + index).c_str(), params[i].registerAddress));
-    trackNvsWrite(preferences.putUShort(("len" + index).c_str(), params[i].registerLength));
-    trackNvsWrite(preferences.putBool(("en" + index).c_str(), params[i].enabled));
+    for (int i = 0; i < paramCount; i++) {
+      memset(&rows[i], 0, sizeof(StoredParamRow));
+      params[i].name.toCharArray(rows[i].name, STORED_NAME_LEN);
+      params[i].type.toCharArray(rows[i].type, STORED_TYPE_LEN);
+      rows[i].area = params[i].area;
+      rows[i].transport = params[i].transport;
+      rows[i].slaveId = params[i].slaveId;
+      rows[i].tcpTargetIndex = params[i].tcpTargetIndex;
+      rows[i].registerAddress = params[i].registerAddress;
+      rows[i].enabled = params[i].enabled ? 1 : 0;
+    }
+
+    size_t expectedLen = (size_t)paramCount * sizeof(StoredParamRow);
+    size_t written = preferences.putBytes("rows", rows, expectedLen);
+    if (written != expectedLen) {
+      nvsWriteFailures++;
+    }
+
+    delete[] rows;
   }
 
   preferences.end();
 
   if (nvsWriteFailures > 0) {
     logKeyEvent("NVS SAVE INCOMPLETE (modbus): " + String(nvsWriteFailures) + " write(s) failed - flash may be full, param changes may not persist across reboot");
+  }
+}
+
+// Reads the pre-blob one-key-per-field format, for configs saved by a
+// firmware version before this compact format existed. Preferences must
+// already be open (read-only) when called; does not call end().
+void loadSettingsLegacyPerKey() {
+  for (int i = 0; i < paramCount; i++) {
+    String index = String(i);
+
+    params[i].name = preferences.getString(("name" + index).c_str(), "Parameter");
+    params[i].area = preferences.getUChar(("area" + index).c_str(), AREA_HOLDING_REGISTER);
+    params[i].type = preferences.getString(("type" + index).c_str(), "INT_16/100");
+    params[i].transport = preferences.getUChar(("transport" + index).c_str(), TRANSPORT_RTU);
+    params[i].slaveId = preferences.getUChar(("sid" + index).c_str(), 1);
+    params[i].tcpTargetIndex = preferences.getUChar(("tcptgt" + index).c_str(), 0);
+    params[i].registerAddress = preferences.getUShort(("addr" + index).c_str(), 0);
+    params[i].enabled = preferences.getBool(("en" + index).c_str(), true);
+
+    finalizeLoadedParamRow(i);
   }
 }
 
@@ -1431,53 +1627,45 @@ void loadSettings() {
     return;
   }
 
-  for (int i = 0; i < paramCount; i++) {
-    String index = String(i);
+  size_t expectedLen = (size_t)paramCount * sizeof(StoredParamRow);
+  size_t blobLen = preferences.getBytesLength("rows");
 
-    params[i].name = preferences.getString(("name" + index).c_str(), "Parameter");
+  if (blobLen == expectedLen) {
+    StoredParamRow *rows = new StoredParamRow[paramCount];
+    preferences.getBytes("rows", rows, expectedLen);
+    preferences.end();
 
-    // Default AREA_HOLDING_REGISTER (0): configs saved before the area
-    // field existed keep their original behavior.
-    params[i].area = preferences.getUChar(("area" + index).c_str(), AREA_HOLDING_REGISTER);
-    if (params[i].area > AREA_DISCRETE_INPUT) {
-      params[i].area = AREA_HOLDING_REGISTER;
+    for (int i = 0; i < paramCount; i++) {
+      // Defensive null-termination in case a name/type was ever truncated
+      // to exactly fill its buffer with no room for the terminator.
+      rows[i].name[STORED_NAME_LEN - 1] = '\0';
+      rows[i].type[STORED_TYPE_LEN - 1] = '\0';
+
+      params[i].name = String(rows[i].name);
+      params[i].type = String(rows[i].type);
+      params[i].area = rows[i].area;
+      params[i].transport = rows[i].transport;
+      params[i].slaveId = rows[i].slaveId;
+      params[i].tcpTargetIndex = rows[i].tcpTargetIndex;
+      params[i].registerAddress = rows[i].registerAddress;
+      params[i].enabled = rows[i].enabled != 0;
+
+      finalizeLoadedParamRow(i);
     }
 
-    params[i].type = preferences.getString(("type" + index).c_str(), "INT_16/100");
-
-    if (isBitArea(params[i].area)) {
-      // Fixed pseudo-type for coil/discrete rows - deliberately not run
-      // through the type-list fallback below.
-      params[i].type = "BIT";
-    } else if (findTypeIndex(params[i].type) < 0 && typeCount > 0) {
-      params[i].type = typeList[0].name;
-    }
-
-    // Default TRANSPORT_RTU (0): configs saved before this field existed
-    // keep their original behavior.
-    params[i].transport = preferences.getUChar(("transport" + index).c_str(), TRANSPORT_RTU);
-    if (params[i].transport > TRANSPORT_TCP) {
-      params[i].transport = TRANSPORT_RTU;
-    }
-
-    params[i].slaveId = preferences.getUChar(("sid" + index).c_str(), 1);
-
-    params[i].tcpTargetIndex = preferences.getUChar(("tcptgt" + index).c_str(), 0);
-    if (params[i].tcpTargetIndex >= MAX_TCP_TARGETS) {
-      params[i].tcpTargetIndex = 0;
-    }
-
-    params[i].registerAddress = preferences.getUShort(("addr" + index).c_str(), 0);
-    params[i].registerLength = isBitArea(params[i].area) ? 1 : getDataLengthForType(params[i].type);
-    params[i].enabled = preferences.getBool(("en" + index).c_str(), true);
-    params[i].value = 0;
-    params[i].valid = false;
-    params[i].errorCode = 0;
-    params[i].lastUpdateTime = 0;
-    resetDebugState(i);
+    delete[] rows;
+    return;
   }
 
+  // No compact blob yet (or a size mismatch) - a config saved by an
+  // earlier firmware version before this format existed. Read it via the
+  // old layout, then immediately re-save in the compact format, which
+  // also reclaims the many old per-row keys via preferences.clear().
+  loadSettingsLegacyPerKey();
   preferences.end();
+
+  saveSettings();
+  logKeyEvent("MODBUS SETTINGS MIGRATED to compact storage - freed flash space");
 }
 
 // ===================== Dropdown =====================
