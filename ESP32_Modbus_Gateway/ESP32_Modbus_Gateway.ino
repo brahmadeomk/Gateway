@@ -240,6 +240,24 @@ struct LogQueueItem {
   bool isKeyEvent;
 };
 
+// ===================== Write Command Queues =====================
+// A write request (from the manual dashboard control now, and MQTT/raw-TCP
+// command channels in a follow-up) is validated and enqueued by
+// submitWriteCommand(), then routed to one of two queues by the target
+// parameter's transport - RTU writes are drained by modbusTask (Core 1,
+// under serialMutex, interleaved with polling); TCP writes are drained by
+// tcpPollTask (Core 0). Keeping them as two separate queues means each
+// task only ever touches its own transport, with no cross-task filtering.
+#define WRITE_QUEUE_LEN 16
+
+struct WriteCommand {
+  int paramIndex;
+  float value;  // engineering-unit value to write
+};
+
+QueueHandle_t rtuWriteQueue;
+QueueHandle_t tcpWriteQueue;
+
 // Guards only the RS485_DE_RE pin toggle inside preTransmission()/
 // postTransmission(). This is the single most timing-critical line in the
 // program: postTransmission() must flip the transceiver back to receive
@@ -401,6 +419,12 @@ bool isBitArea(uint8_t area) {
   return area == AREA_COIL || area == AREA_DISCRETE_INPUT;
 }
 
+// Only holding registers and coils are writable per the Modbus spec -
+// input registers and discrete inputs are read-only address spaces.
+bool isWritableArea(uint8_t area) {
+  return area == AREA_HOLDING_REGISTER || area == AREA_COIL;
+}
+
 struct ModbusParam {
   String name;
   String type;
@@ -419,6 +443,16 @@ struct ModbusParam {
   bool lastLoggedValid;
   uint8_t lastLoggedErrorCode;
   unsigned long lastErrorLogTime;
+
+  // Write path: writable is a user opt-in (only meaningful/settable when
+  // isWritableArea(area) is true); min/maxWriteValue are an optional
+  // engineering-unit safety clamp enforced before any write is dispatched
+  // (min==max==0 means "no limit configured" - see submitWriteCommand()).
+  bool writable;
+  float minWriteValue;
+  float maxWriteValue;
+  uint8_t lastWriteResult;  // 0xFF = never written; else MB_SUCCESS or an MB_ERR_*/exception code
+  unsigned long lastWriteTime;
 };
 
 ModbusParam params[MAX_PARAMS];
@@ -442,6 +476,21 @@ int paramCount = 0;
 #define STORED_TYPE_LEN 20
 #define STORED_IP_LEN 40
 
+// v1: the original compact blob layout, before the write path (writable/
+// min/maxWriteValue) existed. Kept only so a device that already migrated
+// to v1 (an earlier firmware version) can be read once more and
+// transparently re-saved in the current (v2) layout - see loadSettings().
+struct StoredParamRowV1 {
+  char name[STORED_NAME_LEN];
+  char type[STORED_TYPE_LEN];
+  uint8_t area;
+  uint8_t transport;
+  uint8_t slaveId;
+  uint8_t tcpTargetIndex;
+  uint16_t registerAddress;
+  uint8_t enabled;
+};
+
 struct StoredParamRow {
   char name[STORED_NAME_LEN];
   char type[STORED_TYPE_LEN];
@@ -451,6 +500,9 @@ struct StoredParamRow {
   uint8_t tcpTargetIndex;
   uint16_t registerAddress;
   uint8_t enabled;
+  uint8_t writable;
+  float minWriteValue;
+  float maxWriteValue;
 };
 
 struct StoredParamTypeRow {
@@ -760,6 +812,149 @@ uint8_t modbusRead(uint8_t slaveId, uint8_t area, uint16_t startAddr, uint16_t q
   return MB_SUCCESS;
 }
 
+// Writes `qty` values to `slaveId` at `startAddr`: FC 0x05 (write single
+// coil) for a 1-bit area, FC 0x06 (write single register, qty==1) or
+// FC 0x10 (write multiple registers, qty==2 - e.g. FLOAT32) for register
+// areas. Must be called with serialMutex held. Same T3.5/T1.5 timing and
+// response validation as modbusRead(); write responses are a fixed-length
+// echo of the request (no data to unpack). Returns MB_SUCCESS or an
+// MB_ERR_* code / raw slave exception code, same conventions as modbusRead().
+uint8_t modbusWrite(uint8_t slaveId, uint8_t area, uint16_t startAddr, uint16_t qty, const uint16_t *regs) {
+  uint8_t req[13];
+  uint8_t reqLen;
+  uint8_t fc;
+
+  if (isBitArea(area)) {
+    fc = 0x05;
+    req[0] = slaveId;
+    req[1] = fc;
+    req[2] = highByte(startAddr);
+    req[3] = lowByte(startAddr);
+    req[4] = regs[0] ? 0xFF : 0x00;
+    req[5] = 0x00;
+    reqLen = 6;
+  } else if (qty <= 1) {
+    fc = 0x06;
+    req[0] = slaveId;
+    req[1] = fc;
+    req[2] = highByte(startAddr);
+    req[3] = lowByte(startAddr);
+    req[4] = highByte(regs[0]);
+    req[5] = lowByte(regs[0]);
+    reqLen = 6;
+  } else {
+    fc = 0x10;
+    req[0] = slaveId;
+    req[1] = fc;
+    req[2] = highByte(startAddr);
+    req[3] = lowByte(startAddr);
+    req[4] = highByte(qty);
+    req[5] = lowByte(qty);
+    req[6] = (uint8_t)(qty * 2);
+    for (uint16_t r = 0; r < qty; r++) {
+      req[7 + r * 2] = highByte(regs[r]);
+      req[8 + r * 2] = lowByte(regs[r]);
+    }
+    reqLen = 7 + qty * 2;
+  }
+
+  // All three write responses are fixed-length: slave ID + FC + 4 data
+  // bytes (echoed address+value, or address+quantity) + 2 CRC bytes.
+  uint8_t expectedRespLen = 8;
+
+  uint16_t reqCrc = modbusCRC16(req, reqLen);
+  req[reqLen] = reqCrc & 0xFF;
+  req[reqLen + 1] = (reqCrc >> 8) & 0xFF;
+  reqLen += 2;
+
+  memcpy(lastModbusTx, req, reqLen);
+  lastModbusTxLen = reqLen;
+
+  uint32_t t35 = modbusT35Us();
+  uint32_t sinceActivity = micros() - lastBusActivityUs;
+  if (sinceActivity < t35) {
+    delayMicroseconds(t35 - sinceActivity);
+  }
+
+  while (Serial1.available()) {
+    Serial1.read();
+  }
+
+  preTransmission();
+  Serial1.write(req, reqLen);
+  Serial1.flush();
+  postTransmission();
+
+  lastBusActivityUs = micros();
+
+  uint8_t rx[MODBUS_RAW_BUF_SIZE];
+  uint8_t rxLen = 0;
+  uint8_t expectedLen = 0;
+  uint32_t lastByteUs = lastBusActivityUs;
+  uint32_t t15 = modbusT15Us();
+
+  unsigned long deadline = millis() + MODBUS_RESPONSE_TIMEOUT_MS;
+
+  while ((long)(millis() - deadline) < 0) {
+    if (Serial1.available()) {
+      uint8_t b = Serial1.read();
+      uint32_t now = micros();
+
+      if (rxLen > 0 && (now - lastByteUs) > t15) {
+        rxLen = 0;
+        expectedLen = 0;
+      }
+
+      lastByteUs = now;
+
+      if (rxLen < MODBUS_RAW_BUF_SIZE) {
+        rx[rxLen++] = b;
+      }
+
+      if (rxLen == 2) {
+        expectedLen = (rx[1] & 0x80) ? 5 : expectedRespLen;
+      }
+
+      if (expectedLen != 0 && rxLen >= expectedLen) {
+        break;
+      }
+    } else if (rxLen == 0) {
+      vTaskDelay(1);
+    }
+  }
+
+  lastBusActivityUs = (rxLen > 0) ? lastByteUs : micros();
+
+  memcpy(lastModbusRx, rx, rxLen);
+  lastModbusRxLen = rxLen;
+  lastModbusRxOverflow = false;
+
+  if (rxLen == 0 || expectedLen == 0 || rxLen < expectedLen) {
+    return MB_ERR_TIMEOUT;
+  }
+
+  uint16_t receivedCrc = rx[expectedLen - 2] | ((uint16_t)rx[expectedLen - 1] << 8);
+  uint16_t calcCrc = modbusCRC16(rx, expectedLen - 2);
+
+  if (receivedCrc != calcCrc) {
+    return MB_ERR_CRC;
+  }
+
+  if (rx[0] != slaveId) {
+    return MB_ERR_WRONG_SLAVE;
+  }
+
+  if (rx[1] & 0x80) {
+    return rx[2];  // raw Modbus exception code from the slave
+  }
+
+  if (rx[1] != fc) {
+    return MB_ERR_CRC;
+  }
+
+  return MB_SUCCESS;
+}
+
 // ===================== Modbus TCP Client (second data source) =====================
 // Ensures tcpTargetClients[targetIndex] is connected to tcpTargets[targetIndex],
 // (re)connecting if needed. Only called from tcpPollTask (Core 0) - a TCP
@@ -889,6 +1084,129 @@ uint8_t modbusTcpRead(int targetIndex, uint8_t area, uint16_t startAddr, uint16_
     for (uint16_t r = 0; r < qty; r++) {
       outRegs[r] = ((uint16_t)rx[9 + r * 2] << 8) | rx[9 + r * 2 + 1];
     }
+  }
+
+  return MB_SUCCESS;
+}
+
+// Same write semantics as modbusWrite() (FC 0x05/0x06/0x10), framed as
+// Modbus TCP (MBAP header) over tcpTargets[targetIndex]'s connection.
+// Returns MB_SUCCESS, an MB_ERR_* code, or a raw slave exception code.
+uint8_t modbusTcpWrite(int targetIndex, uint8_t area, uint16_t startAddr, uint16_t qty, const uint16_t *regs) {
+  if (targetIndex < 0 || targetIndex >= tcpTargetCount) {
+    return MB_ERR_TCP_UNCONFIGURED;
+  }
+
+  if (!ensureTcpTargetConnected(targetIndex)) {
+    return MB_ERR_TIMEOUT;
+  }
+
+  WiFiClient &client = tcpTargetClients[targetIndex];
+  uint8_t unitId = tcpTargets[targetIndex].unitId;
+
+  uint8_t pdu[11];
+  uint8_t pduLen;
+  uint8_t fc;
+
+  if (isBitArea(area)) {
+    fc = 0x05;
+    pdu[0] = fc;
+    pdu[1] = highByte(startAddr);
+    pdu[2] = lowByte(startAddr);
+    pdu[3] = regs[0] ? 0xFF : 0x00;
+    pdu[4] = 0x00;
+    pduLen = 5;
+  } else if (qty <= 1) {
+    fc = 0x06;
+    pdu[0] = fc;
+    pdu[1] = highByte(startAddr);
+    pdu[2] = lowByte(startAddr);
+    pdu[3] = highByte(regs[0]);
+    pdu[4] = lowByte(regs[0]);
+    pduLen = 5;
+  } else {
+    fc = 0x10;
+    pdu[0] = fc;
+    pdu[1] = highByte(startAddr);
+    pdu[2] = lowByte(startAddr);
+    pdu[3] = highByte(qty);
+    pdu[4] = lowByte(qty);
+    pdu[5] = (uint8_t)(qty * 2);
+    for (uint16_t r = 0; r < qty; r++) {
+      pdu[6 + r * 2] = highByte(regs[r]);
+      pdu[7 + r * 2] = lowByte(regs[r]);
+    }
+    pduLen = 6 + qty * 2;
+  }
+
+  tcpTransactionId++;
+
+  uint8_t req[7 + 11];
+  req[0] = highByte(tcpTransactionId);
+  req[1] = lowByte(tcpTransactionId);
+  req[2] = 0x00;
+  req[3] = 0x00;
+  req[4] = highByte((uint16_t)(1 + pduLen));
+  req[5] = lowByte((uint16_t)(1 + pduLen));
+  req[6] = unitId;
+  memcpy(&req[7], pdu, pduLen);
+
+  uint16_t totalReqLen = 7 + pduLen;
+
+  while (client.available()) {
+    client.read();
+  }
+
+  client.write(req, totalReqLen);
+  client.flush();
+
+  uint8_t rx[7 + MODBUS_RAW_BUF_SIZE];
+  uint8_t rxLen = 0;
+  uint16_t expectedTotalLen = 0;
+
+  unsigned long deadline = millis() + MODBUS_TCP_RESPONSE_TIMEOUT_MS;
+
+  while ((long)(millis() - deadline) < 0) {
+    if (client.available()) {
+      if (rxLen < sizeof(rx)) {
+        rx[rxLen++] = (uint8_t)client.read();
+      } else {
+        client.read();
+      }
+
+      if (rxLen == 8) {
+        uint16_t mbapLen = ((uint16_t)rx[4] << 8) | rx[5];
+        expectedTotalLen = 6 + mbapLen;
+      }
+
+      if (expectedTotalLen != 0 && rxLen >= expectedTotalLen) {
+        break;
+      }
+    } else {
+      vTaskDelay(1);
+    }
+  }
+
+  if (rxLen == 0 || expectedTotalLen == 0 || rxLen < expectedTotalLen) {
+    client.stop();
+    return MB_ERR_TIMEOUT;
+  }
+
+  uint16_t respTxId = ((uint16_t)rx[0] << 8) | rx[1];
+  if (respTxId != tcpTransactionId) {
+    return MB_ERR_CRC;
+  }
+
+  if (rx[6] != unitId) {
+    return MB_ERR_WRONG_SLAVE;
+  }
+
+  if (rx[7] & 0x80) {
+    return rx[8];
+  }
+
+  if (rx[7] != fc) {
+    return MB_ERR_CRC;
   }
 
   return MB_SUCCESS;
@@ -1506,6 +1824,11 @@ void loadDefaultSettings() {
     params[i].valid = false;
     params[i].errorCode = 0;
     params[i].lastUpdateTime = 0;
+    params[i].writable = false;
+    params[i].minWriteValue = 0;
+    params[i].maxWriteValue = 0;
+    params[i].lastWriteResult = 0xFF;
+    params[i].lastWriteTime = 0;
     resetDebugState(i);
   }
 
@@ -1539,11 +1862,19 @@ void finalizeLoadedParamRow(int i) {
     params[i].tcpTargetIndex = 0;
   }
 
+  // Defensive: a stored writable flag can't apply to a read-only area -
+  // if the area itself was invalid/clamped above, don't carry it forward.
+  if (!isWritableArea(params[i].area)) {
+    params[i].writable = false;
+  }
+
   params[i].registerLength = isBitArea(params[i].area) ? 1 : getDataLengthForType(params[i].type);
   params[i].value = 0;
   params[i].valid = false;
   params[i].errorCode = 0;
   params[i].lastUpdateTime = 0;
+  params[i].lastWriteResult = 0xFF;
+  params[i].lastWriteTime = 0;
   resetDebugState(i);
 }
 
@@ -1571,6 +1902,9 @@ void saveSettings() {
       rows[i].tcpTargetIndex = params[i].tcpTargetIndex;
       rows[i].registerAddress = params[i].registerAddress;
       rows[i].enabled = params[i].enabled ? 1 : 0;
+      rows[i].writable = params[i].writable ? 1 : 0;
+      rows[i].minWriteValue = params[i].minWriteValue;
+      rows[i].maxWriteValue = params[i].maxWriteValue;
     }
 
     size_t expectedLen = (size_t)paramCount * sizeof(StoredParamRow);
@@ -1605,6 +1939,12 @@ void loadSettingsLegacyPerKey() {
     params[i].registerAddress = preferences.getUShort(("addr" + index).c_str(), 0);
     params[i].enabled = preferences.getBool(("en" + index).c_str(), true);
 
+    // The write path didn't exist when this per-key format was in use -
+    // no keys to read, so every row starts non-writable/no limits set.
+    params[i].writable = false;
+    params[i].minWriteValue = 0;
+    params[i].maxWriteValue = 0;
+
     finalizeLoadedParamRow(i);
   }
 }
@@ -1627,12 +1967,13 @@ void loadSettings() {
     return;
   }
 
-  size_t expectedLen = (size_t)paramCount * sizeof(StoredParamRow);
+  size_t expectedLenV2 = (size_t)paramCount * sizeof(StoredParamRow);
+  size_t expectedLenV1 = (size_t)paramCount * sizeof(StoredParamRowV1);
   size_t blobLen = preferences.getBytesLength("rows");
 
-  if (blobLen == expectedLen) {
+  if (blobLen == expectedLenV2) {
     StoredParamRow *rows = new StoredParamRow[paramCount];
-    preferences.getBytes("rows", rows, expectedLen);
+    preferences.getBytes("rows", rows, expectedLenV2);
     preferences.end();
 
     for (int i = 0; i < paramCount; i++) {
@@ -1649,6 +1990,9 @@ void loadSettings() {
       params[i].tcpTargetIndex = rows[i].tcpTargetIndex;
       params[i].registerAddress = rows[i].registerAddress;
       params[i].enabled = rows[i].enabled != 0;
+      params[i].writable = rows[i].writable != 0;
+      params[i].minWriteValue = rows[i].minWriteValue;
+      params[i].maxWriteValue = rows[i].maxWriteValue;
 
       finalizeLoadedParamRow(i);
     }
@@ -1657,10 +2001,44 @@ void loadSettings() {
     return;
   }
 
-  // No compact blob yet (or a size mismatch) - a config saved by an
-  // earlier firmware version before this format existed. Read it via the
-  // old layout, then immediately re-save in the compact format, which
-  // also reclaims the many old per-row keys via preferences.clear().
+  if (blobLen == expectedLenV1) {
+    // A device that already migrated to the v1 compact blob (before the
+    // write path existed) - read it once via the old layout, then
+    // re-save in v2, which adds the write fields at their safe defaults.
+    StoredParamRowV1 *rows = new StoredParamRowV1[paramCount];
+    preferences.getBytes("rows", rows, expectedLenV1);
+    preferences.end();
+
+    for (int i = 0; i < paramCount; i++) {
+      rows[i].name[STORED_NAME_LEN - 1] = '\0';
+      rows[i].type[STORED_TYPE_LEN - 1] = '\0';
+
+      params[i].name = String(rows[i].name);
+      params[i].type = String(rows[i].type);
+      params[i].area = rows[i].area;
+      params[i].transport = rows[i].transport;
+      params[i].slaveId = rows[i].slaveId;
+      params[i].tcpTargetIndex = rows[i].tcpTargetIndex;
+      params[i].registerAddress = rows[i].registerAddress;
+      params[i].enabled = rows[i].enabled != 0;
+      params[i].writable = false;
+      params[i].minWriteValue = 0;
+      params[i].maxWriteValue = 0;
+
+      finalizeLoadedParamRow(i);
+    }
+
+    delete[] rows;
+
+    saveSettings();
+    logKeyEvent("MODBUS SETTINGS MIGRATED to v2 storage (write path fields added)");
+    return;
+  }
+
+  // No compact blob at all - a config saved by the original per-key
+  // format (before either blob version existed). Read it via that old
+  // layout, then re-save in the current compact format, which also
+  // reclaims the many old per-row keys via preferences.clear().
   loadSettingsLegacyPerKey();
   preferences.end();
 
@@ -1780,6 +2158,75 @@ float convertValue(String selectedType, uint16_t reg1, uint16_t reg2) {
   }
 
   return reg1;
+}
+
+// Reverse of halfToFloat(): packs a float into IEEE754 binary16.
+uint16_t floatToHalf(float f) {
+  uint32_t bits;
+  memcpy(&bits, &f, sizeof(bits));
+
+  uint32_t sign = (bits >> 31) & 0x1;
+  int32_t exp = (int32_t)((bits >> 23) & 0xFF) - 127 + 15;
+  uint32_t mantissa = bits & 0x7FFFFF;
+
+  if (exp <= 0) {
+    return (uint16_t)(sign << 15);  // underflow to (signed) zero
+  }
+
+  if (exp >= 31) {
+    return (uint16_t)((sign << 15) | (0x1Ful << 10));  // overflow to +/-Inf
+  }
+
+  return (uint16_t)((sign << 15) | ((uint32_t)exp << 10) | (mantissa >> 13));
+}
+
+// Reverse of convertValue(): converts an engineering-unit value into the
+// raw register(s) to write, using the same type/divisor rules. outRegs
+// must have room for 2 entries (the second is only used for FLOAT32).
+void floatToRegs(String selectedType, float value, uint16_t *outRegs) {
+  int index = findTypeIndex(selectedType);
+
+  String base = getBaseFormatFromType(selectedType);
+  float divisor = 1;
+
+  if (index >= 0) {
+    divisor = typeList[index].divisor;
+  }
+
+  if (divisor <= 0) {
+    divisor = 1;
+  }
+
+  if (base == "INT16") {
+    float scaled = value * divisor;
+    if (scaled < -32768) scaled = -32768;
+    if (scaled > 32767) scaled = 32767;
+    outRegs[0] = (uint16_t)(int16_t)lroundf(scaled);
+    return;
+  }
+
+  if (base == "UINT16") {
+    float scaled = value * divisor;
+    if (scaled < 0) scaled = 0;
+    if (scaled > 65535) scaled = 65535;
+    outRegs[0] = (uint16_t)lroundf(scaled);
+    return;
+  }
+
+  if (base == "FLOAT16") {
+    outRegs[0] = floatToHalf(value);
+    return;
+  }
+
+  if (base == "FLOAT32") {
+    uint32_t raw;
+    memcpy(&raw, &value, sizeof(raw));
+    outRegs[0] = (uint16_t)(raw >> 16);
+    outRegs[1] = (uint16_t)(raw & 0xFFFF);
+    return;
+  }
+
+  outRegs[0] = (uint16_t)lroundf(value);
 }
 
 // ===================== TCP JSON =====================
@@ -2192,6 +2639,153 @@ void logModbusStatusChange(int index) {
 #endif
 }
 
+// ===================== Write Command Submission =====================
+// Validates a write request against the target parameter's writable flag
+// and optional min/max safety limits, then queues it for whichever task
+// owns that parameter's transport. `source` is just for the key-log line
+// (e.g. "dashboard", later "shadow"/"tcp-cmd"). Returns true if queued.
+bool submitWriteCommand(int paramIndex, float value, const String &source) {
+  if (paramIndex < 0 || paramIndex >= paramCount) {
+    logKeyEvent("WRITE REJECTED (" + source + "): invalid parameter index " + String(paramIndex));
+    return false;
+  }
+
+  bool writable;
+  uint8_t transport;
+  float minV, maxV;
+  String pname;
+
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  writable = params[paramIndex].writable;
+  transport = params[paramIndex].transport;
+  minV = params[paramIndex].minWriteValue;
+  maxV = params[paramIndex].maxWriteValue;
+  pname = params[paramIndex].name;
+  xSemaphoreGive(dataMutex);
+
+  if (!writable) {
+    logKeyEvent("WRITE REJECTED (" + source + "): " + pname + " is not writable");
+    return false;
+  }
+
+  // maxV > minV is the signal that a limit is actually configured (the
+  // default 0/0 means "no limit set" - see the ModbusParam field comment).
+  if (maxV > minV && (value < minV || value > maxV)) {
+    logKeyEvent("WRITE REJECTED (" + source + "): " + pname + " value " + String(value, 3) + " outside allowed range [" + String(minV, 3) + ", " + String(maxV, 3) + "]");
+    return false;
+  }
+
+  WriteCommand cmd;
+  cmd.paramIndex = paramIndex;
+  cmd.value = value;
+
+  QueueHandle_t q = (transport == TRANSPORT_TCP) ? tcpWriteQueue : rtuWriteQueue;
+
+  if (xQueueSend(q, &cmd, 0) != pdTRUE) {
+    logKeyEvent("WRITE QUEUE FULL (" + source + ") - dropped command for " + pname);
+    return false;
+  }
+
+  logKeyEvent("WRITE QUEUED (" + source + "): " + pname + " = " + String(value, 3));
+  return true;
+}
+
+// Converts an engineering-unit write value into the raw register(s)/bit
+// for the wire, per the target parameter's area/type - shared by both
+// drain functions below so the conversion rule lives in one place.
+void buildWriteRegs(uint8_t area, String type, float value, uint16_t *outRegs) {
+  if (isBitArea(area)) {
+    outRegs[0] = (value != 0) ? 1 : 0;
+  } else {
+    floatToRegs(type, value, outRegs);
+  }
+}
+
+// Drains any pending RTU write commands, dispatching each via
+// modbusWrite() under serialMutex exactly like a read transaction. Called
+// once per modbusTask cycle, interleaved with the poll loop.
+void processRtuWriteQueue() {
+  WriteCommand cmd;
+
+  while (xQueueReceive(rtuWriteQueue, &cmd, 0) == pdTRUE) {
+    if (cmd.paramIndex < 0 || cmd.paramIndex >= paramCount) {
+      continue;
+    }
+
+    uint8_t area, slaveId;
+    uint16_t regAddr, regLen;
+    String type, pname;
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    area = params[cmd.paramIndex].area;
+    slaveId = params[cmd.paramIndex].slaveId;
+    regAddr = params[cmd.paramIndex].registerAddress;
+    type = params[cmd.paramIndex].type;
+    pname = params[cmd.paramIndex].name;
+    xSemaphoreGive(dataMutex);
+
+    regLen = isBitArea(area) ? 1 : getDataLengthForType(type);
+    if (regLen < 1) regLen = 1;
+    if (regLen > 2) regLen = 2;
+
+    uint16_t regs[2] = { 0, 0 };
+    buildWriteRegs(area, type, cmd.value, regs);
+
+    xSemaphoreTake(serialMutex, portMAX_DELAY);
+    uint8_t result = modbusWrite(slaveId, area, regAddr, regLen, regs);
+    xSemaphoreGive(serialMutex);
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    params[cmd.paramIndex].lastWriteResult = result;
+    params[cmd.paramIndex].lastWriteTime = millis();
+    xSemaphoreGive(dataMutex);
+
+    logKeyEvent("WRITE " + String(result == MB_SUCCESS ? "OK" : ("FAILED code " + String(result))) + ": " + pname + " = " + String(cmd.value, 3));
+
+    delay(slaveRecoveryDelayMs);
+  }
+}
+
+// Same as processRtuWriteQueue(), but for TCP targets via modbusTcpWrite() -
+// called once per tcpPollTask cycle. No serialMutex: never touches Serial1.
+void processTcpWriteQueue() {
+  WriteCommand cmd;
+
+  while (xQueueReceive(tcpWriteQueue, &cmd, 0) == pdTRUE) {
+    if (cmd.paramIndex < 0 || cmd.paramIndex >= paramCount) {
+      continue;
+    }
+
+    uint8_t area, targetIndex;
+    uint16_t regAddr, regLen;
+    String type, pname;
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    area = params[cmd.paramIndex].area;
+    targetIndex = params[cmd.paramIndex].tcpTargetIndex;
+    regAddr = params[cmd.paramIndex].registerAddress;
+    type = params[cmd.paramIndex].type;
+    pname = params[cmd.paramIndex].name;
+    xSemaphoreGive(dataMutex);
+
+    regLen = isBitArea(area) ? 1 : getDataLengthForType(type);
+    if (regLen < 1) regLen = 1;
+    if (regLen > 2) regLen = 2;
+
+    uint16_t regs[2] = { 0, 0 };
+    buildWriteRegs(area, type, cmd.value, regs);
+
+    uint8_t result = modbusTcpWrite(targetIndex, area, regAddr, regLen, regs);
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    params[cmd.paramIndex].lastWriteResult = result;
+    params[cmd.paramIndex].lastWriteTime = millis();
+    xSemaphoreGive(dataMutex);
+
+    logKeyEvent("WRITE " + String(result == MB_SUCCESS ? "OK" : ("FAILED code " + String(result))) + ": " + pname + " = " + String(cmd.value, 3));
+  }
+}
+
 // ===================== Poll Modbus =====================
 // Runs entirely on modbusTask. The RS485 transaction always happens
 // OUTSIDE dataMutex, using values snapshotted under a brief lock, so the
@@ -2546,6 +3140,7 @@ void handleRoot() {
 <th>Value</th>
 <th>Status</th>
 <th>Last Update</th>
+<th>Write</th>
 </tr>
 </thead>
 <tbody id="dataBody"></tbody>
@@ -2570,11 +3165,21 @@ function formatAge(lastUpdateMs) {
   return ageSec + "s ago";
 }
 
+function writeResultText(p){
+  if (p.lastWriteResult === 255) return "";
+  if (p.lastWriteResult === 0) return ` <span style="color:green">(OK)</span>`;
+  return ` <span style="color:red">(ERR 0x${p.lastWriteResult.toString(16)})</span>`;
+}
+
 function renderTable(){
   let body = "";
-  lastData.forEach(p=>{
+  lastData.forEach((p,i)=>{
    let ageSec = p.lastUpdateMs ? Math.floor((lastServerNowMs + (Date.now() - lastFetchClientTime) - p.lastUpdateMs) / 1000) : null;
    let staleClass = (ageSec === null || ageSec > 10) ? "stale" : "";
+   let writeCell = p.writable
+     ? `<input type="text" id="wv${i}" style="width:70px" placeholder="value">
+        <button type="button" onclick="sendWriteCommand(${i})">Write</button>${writeResultText(p)}`
+     : "-";
    body += `<tr>
    <td>${p.name}</td>
    <td>${p.source ?? '-'}</td>
@@ -2582,9 +3187,23 @@ function renderTable(){
    <td>${p.value ?? '-'}</td>
    <td>${p.valid ? 'OK':'ERR'}</td>
    <td class="${staleClass}">${formatAge(p.lastUpdateMs)}</td>
+   <td>${writeCell}</td>
    </tr>`;
   });
   document.getElementById("dataBody").innerHTML = body;
+}
+
+function sendWriteCommand(index){
+  let input = document.getElementById("wv" + index);
+  let value = parseFloat(input.value);
+  if (isNaN(value)) {
+    alert("Enter a numeric value to write.");
+    return;
+  }
+  let body = "param=" + encodeURIComponent(index) + "&value=" + encodeURIComponent(value);
+  fetch('/writeCommand', { method: 'POST', headers: {'Content-Type':'application/x-www-form-urlencoded'}, body: body })
+   .then(r => { if (!r.ok) alert("Write rejected - check Status Log for the reason."); })
+   .then(loadData);
 }
 
 function loadData(){
@@ -2687,6 +3306,8 @@ void handleSettings() {
 <th>Data Length</th>
 <th>Device ID / TCP Target</th>
 <th>Register Address</th>
+<th>Writable</th>
+<th>Write Min / Max</th>
 <th>Enable</th>
 <th>Action</th>
 </tr>
@@ -2731,6 +3352,23 @@ void handleSettings() {
     html += "</td>";
 
     html += "<td><input name='addr" + String(i) + "' value='" + String(params[i].registerAddress) + "'></td>";
+
+    {
+      bool rowWritable = isWritableArea(params[i].area);
+      html += "<td><input type='checkbox' name='wr" + String(i) + "' onchange='updateWritableFields(this)'";
+      if (params[i].writable) html += " checked";
+      if (!rowWritable) html += " disabled";
+      html += "></td>";
+      html += "<td>";
+      html += "<input name='wmin" + String(i) + "' placeholder='Min' style='width:70px' value='" + String(params[i].minWriteValue) + "'";
+      if (!rowWritable) html += " disabled";
+      html += "> / ";
+      html += "<input name='wmax" + String(i) + "' placeholder='Max' style='width:70px' value='" + String(params[i].maxWriteValue) + "'";
+      if (!rowWritable) html += " disabled";
+      html += ">";
+      html += "</td>";
+    }
+
     html += "<td><input type='checkbox' name='en" + String(i) + "'";
     if (params[i].enabled) html += " checked";
     html += "></td>";
@@ -2806,6 +3444,25 @@ function isBitAreaValue(v) {
   return v == 2 || v == 3;  // Coil / Discrete Input
 }
 
+function isWritableAreaValue(v) {
+  return v == 0 || v == 2;  // Holding Register / Coil (matches isWritableArea() server-side)
+}
+
+function updateWritableFields(row) {
+  // Accepts either the checkbox itself or its containing <tr>.
+  if (row.tagName !== "TR") row = row.closest("tr");
+  let wrBox = row.querySelector("input[name^='wr']");
+  let minInput = row.querySelector("input[name^='wmin']");
+  let maxInput = row.querySelector("input[name^='wmax']");
+  let areaSel = row.querySelector("select[name^='area']");
+  let writableArea = areaSel && isWritableAreaValue(areaSel.value);
+
+  wrBox.disabled = !writableArea;
+  if (!writableArea) wrBox.checked = false;
+  minInput.disabled = !writableArea;
+  maxInput.disabled = !writableArea;
+}
+
 function updateDataLength(selectEl) {
   let row = selectEl.closest("tr");
   let areaSel = row.querySelector("select[name^='area']");
@@ -2834,6 +3491,7 @@ function updateAreaSelection(selectEl) {
   }
 
   updateDataLength(typeSel);
+  updateWritableFields(row);
 }
 
 function buildParamRow() {
@@ -2855,6 +3513,8 @@ function buildParamRow() {
       <div class="tcp-field" style="display:none"><select name="tcptgtX">${buildTcpTargetOptionsHTML(0)}</select></div>
     </td>
     <td><input name="addrX" value="0"></td>
+    <td><input type="checkbox" name="wrX" onchange="updateWritableFields(this)" disabled></td>
+    <td><input name="wminX" placeholder="Min" style="width:70px" value="0" disabled> / <input name="wmaxX" placeholder="Max" style="width:70px" value="0" disabled></td>
     <td><input type="checkbox" name="enX" checked></td>
     <td>
       <button type="button" class="add" onclick="addParamRowAtEnd()">Add</button>
@@ -2894,6 +3554,9 @@ function renumberParamRows() {
     row.querySelector("input[name^='sid']").name = "sid" + index;
     row.querySelector("select[name^='tcptgt']").name = "tcptgt" + index;
     row.querySelector("input[name^='addr']").name = "addr" + index;
+    row.querySelector("input[name^='wr']").name = "wr" + index;
+    row.querySelector("input[name^='wmin']").name = "wmin" + index;
+    row.querySelector("input[name^='wmax']").name = "wmax" + index;
     row.querySelector("input[name^='en']").name = "en" + index;
   });
 
@@ -3317,6 +3980,17 @@ void handleSave() {
     params[i].registerAddress = server.arg("addr" + index).toInt();
     params[i].registerLength = isBitArea(params[i].area) ? 1 : getDataLengthForType(params[i].type);
     params[i].enabled = server.hasArg("en" + index);
+
+    // Writable/min/max only apply to holding registers and coils - force
+    // off/cleared for any other area regardless of what was submitted.
+    params[i].writable = isWritableArea(params[i].area) && server.hasArg("wr" + index);
+    params[i].minWriteValue = server.arg("wmin" + index).toFloat();
+    params[i].maxWriteValue = server.arg("wmax" + index).toFloat();
+    if (!params[i].writable || params[i].maxWriteValue <= params[i].minWriteValue) {
+      // Invalid/absent range collapses to the "no limit configured" sentinel.
+      params[i].minWriteValue = 0;
+      params[i].maxWriteValue = 0;
+    }
 
     params[i].value = 0;
     params[i].valid = false;
@@ -3751,6 +4425,12 @@ void handleData() {
     json += "\"errorCode\":" + String(params[i].errorCode) + ",";
     json += "\"lastUpdateMs\":" + String(params[i].lastUpdateTime) + ",";
 
+    json += "\"writable\":" + String(params[i].writable ? "true" : "false") + ",";
+    json += "\"minWriteValue\":" + String(params[i].minWriteValue, 3) + ",";
+    json += "\"maxWriteValue\":" + String(params[i].maxWriteValue, 3) + ",";
+    json += "\"lastWriteResult\":" + String(params[i].lastWriteResult) + ",";
+    json += "\"lastWriteTime\":" + String(params[i].lastWriteTime) + ",";
+
     if (params[i].valid) {
       json += "\"value\":" + String(params[i].value, 3);
     } else {
@@ -3793,6 +4473,18 @@ void handleKeyLog() {
   server.send(200, "application/json", json);
 }
 
+// ===================== Manual Write Command Endpoint =====================
+// Dashboard-driven write, for manually testing the write path before the
+// automatic command channels (Device Shadow / raw TCP) exist.
+void handleWriteCommand() {
+  int paramIndex = server.arg("param").toInt();
+  float value = server.arg("value").toFloat();
+
+  bool ok = submitWriteCommand(paramIndex, value, "dashboard");
+
+  server.send(ok ? 200 : 400, "text/plain", ok ? "queued" : "rejected");
+}
+
 // ===================== Reset =====================
 void handleReset() {
   loadDefaultSettings();
@@ -3822,6 +4514,8 @@ void setup() {
   pollCompleteSem = xSemaphoreCreateBinary();
   tcpSendDoneSem = xSemaphoreCreateBinary();
   logQueue = xQueueCreate(LOG_QUEUE_LEN, sizeof(LogQueueItem));
+  rtuWriteQueue = xQueueCreate(WRITE_QUEUE_LEN, sizeof(WriteCommand));
+  tcpWriteQueue = xQueueCreate(WRITE_QUEUE_LEN, sizeof(WriteCommand));
 
   Serial.begin(115200);
   delay(1000);
@@ -3884,6 +4578,7 @@ void setup() {
   // before handleSaveCloud runs.
   server.on("/saveCloud", HTTP_POST, handleSaveCloud, handleCertUpload);
   server.on("/data", HTTP_GET, handleData);
+  server.on("/writeCommand", HTTP_POST, handleWriteCommand);
   server.on("/keylog", HTTP_GET, handleKeyLog);
   server.on("/types", HTTP_GET, handleTypes);
   server.on("/saveTypes", HTTP_POST, handleSaveTypes);
@@ -3993,6 +4688,7 @@ void modbusTask(void *parameter) {
     unsigned long cycleStart = millis();
 
     pollModbus();
+    processRtuWriteQueue();
 
     // Discard any stale signal from a previous cycle's late TCP feedback.
     xSemaphoreTake(tcpSendDoneSem, 0);
@@ -4030,6 +4726,7 @@ void tcpPollTask(void *parameter) {
     unsigned long cycleStart = millis();
 
     pollTcpTargets();
+    processTcpWriteQueue();
 
     uint32_t interval;
     xSemaphoreTake(dataMutex, portMAX_DELAY);
