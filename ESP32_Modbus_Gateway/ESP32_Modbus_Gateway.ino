@@ -3167,30 +3167,80 @@ function formatAge(lastUpdateMs) {
 
 function writeResultText(p){
   if (p.lastWriteResult === 255) return "";
-  if (p.lastWriteResult === 0) return ` <span style="color:green">(OK)</span>`;
-  return ` <span style="color:red">(ERR 0x${p.lastWriteResult.toString(16)})</span>`;
+  if (p.lastWriteResult === 0) return `<span style="color:green">(OK)</span>`;
+  return `<span style="color:red">(ERR 0x${p.lastWriteResult.toString(16)})</span>`;
 }
 
-function renderTable(){
+// Row identity (which params exist + which are writable) rarely changes -
+// only rebuild the row DOM when it does. The 1s tick just needs to update
+// the age counter, so it must NOT touch row markup: a full innerHTML
+// rebuild every tick would recreate the write <input> elements out from
+// under anyone mid-keystroke, wiping whatever they'd typed.
+let renderedRowSignature = "";
+
+function rowSignature(data){
+  return data.map(p => p.name + ":" + (p.writable ? 1 : 0)).join("|");
+}
+
+function buildRows(data){
   let body = "";
-  lastData.forEach((p,i)=>{
-   let ageSec = p.lastUpdateMs ? Math.floor((lastServerNowMs + (Date.now() - lastFetchClientTime) - p.lastUpdateMs) / 1000) : null;
-   let staleClass = (ageSec === null || ageSec > 10) ? "stale" : "";
+  data.forEach((p,i)=>{
    let writeCell = p.writable
      ? `<input type="text" id="wv${i}" style="width:70px" placeholder="value">
-        <button type="button" onclick="sendWriteCommand(${i})">Write</button>${writeResultText(p)}`
+        <button type="button" onclick="sendWriteCommand(${i})">Write</button>
+        <span id="wres${i}"></span>`
      : "-";
    body += `<tr>
    <td>${p.name}</td>
-   <td>${p.source ?? '-'}</td>
-   <td>${p.enabled ? 'Yes':'No'}</td>
-   <td>${p.value ?? '-'}</td>
-   <td>${p.valid ? 'OK':'ERR'}</td>
-   <td class="${staleClass}">${formatAge(p.lastUpdateMs)}</td>
+   <td id="src${i}"></td>
+   <td id="en${i}"></td>
+   <td id="val${i}"></td>
+   <td id="stat${i}"></td>
+   <td id="age${i}"></td>
    <td>${writeCell}</td>
    </tr>`;
   });
   document.getElementById("dataBody").innerHTML = body;
+}
+
+// Updates only the cells whose content can change between fetches/ticks.
+// Never touches the write <input> - that's why the Writable status is
+// baked into rowSignature() instead of being refreshed here.
+function updateRowFields(data){
+  data.forEach((p,i)=>{
+   let ageSec = p.lastUpdateMs ? Math.floor((lastServerNowMs + (Date.now() - lastFetchClientTime) - p.lastUpdateMs) / 1000) : null;
+   let staleClass = (ageSec === null || ageSec > 10) ? "stale" : "";
+
+   let srcEl = document.getElementById("src" + i);
+   if (srcEl) srcEl.textContent = p.source ?? '-';
+
+   let enEl = document.getElementById("en" + i);
+   if (enEl) enEl.textContent = p.enabled ? 'Yes' : 'No';
+
+   let valEl = document.getElementById("val" + i);
+   if (valEl) valEl.textContent = p.value ?? '-';
+
+   let statEl = document.getElementById("stat" + i);
+   if (statEl) statEl.textContent = p.valid ? 'OK' : 'ERR';
+
+   let ageEl = document.getElementById("age" + i);
+   if (ageEl) {
+     ageEl.className = staleClass;
+     ageEl.textContent = formatAge(p.lastUpdateMs);
+   }
+
+   let wresEl = document.getElementById("wres" + i);
+   if (wresEl) wresEl.innerHTML = writeResultText(p);
+  });
+}
+
+function renderTable(){
+  let sig = rowSignature(lastData);
+  if (sig !== renderedRowSignature) {
+    buildRows(lastData);
+    renderedRowSignature = sig;
+  }
+  updateRowFields(lastData);
 }
 
 function sendWriteCommand(index){
@@ -3202,7 +3252,13 @@ function sendWriteCommand(index){
   }
   let body = "param=" + encodeURIComponent(index) + "&value=" + encodeURIComponent(value);
   fetch('/writeCommand', { method: 'POST', headers: {'Content-Type':'application/x-www-form-urlencoded'}, body: body })
-   .then(r => { if (!r.ok) alert("Write rejected - check Status Log for the reason."); })
+   .then(r => {
+     if (!r.ok) {
+       alert("Write rejected - check Status Log for the reason.");
+     } else {
+       input.value = "";
+     }
+   })
    .then(loadData);
 }
 
