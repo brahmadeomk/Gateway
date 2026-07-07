@@ -3497,8 +3497,32 @@ loadKeyLog();
   server.send(200, "text/html", html);
 }
 
+// Sends and clears the accumulated HTML buffer as one chunk of a
+// chunked-transfer response (caller must have already started one via
+// server.setContentLength(CONTENT_LENGTH_UNKNOWN) + server.send(200, ...,
+// "")). Building the whole Settings page as a single String before sending
+// - with up to MAX_PARAMS (100) table rows, each expanding a full type
+// dropdown (getTypeOptions(), O(typeCount) per row) - could grow into tens
+// of KB; a single contiguous allocation/realloc that large can fail on the
+// ESP32's fragmented heap. Arduino String silently drops content it
+// couldn't append rather than raising an error, which desyncs the HTML tag
+// structure and was rendering as literal visible text (a live report: 30
+// param rows made the page unusable). Flushing periodically bounds peak
+// buffer size to one chunk regardless of row count.
+void flushHtmlChunk(String &html) {
+  if (html.length() > 0) {
+    server.sendContent(html);
+    html = "";
+  }
+}
+
 // ===================== Settings Page =====================
 void handleSettings() {
+  // Chunked response (see flushHtmlChunk()) instead of one server.send() at
+  // the end - required so the page can never need one giant contiguous
+  // buffer, no matter how many param/type/TCP-target rows are configured.
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
 
   String html = R"rawliteral(
 <!DOCTYPE html>
@@ -3627,6 +3651,11 @@ void handleSettings() {
     html += "<button type='button' class='remove' onclick='deleteParamRow(this)'>Delete</button>";
     html += "</td>";
     html += "</tr>";
+
+    // Flush every row - this is the loop whose total size scales with
+    // paramCount (up to MAX_PARAMS=100), so it's the one that must never
+    // be allowed to accumulate into one huge buffer.
+    flushHtmlChunk(html);
   }
 
   html += R"rawliteral(
@@ -3820,6 +3849,7 @@ function confirmResetModbus() {
 </script>
 )rawliteral";
 
+  flushHtmlChunk(html);
 
   // DEVICE / AP IDENTITY FORM
   html += "<div class='box'>";
@@ -3886,6 +3916,7 @@ function toggleApSsidField() {
 
   html += "</div>";
 
+  flushHtmlChunk(html);
 
   // NETWORK CONFIG FORM
   html += "<div class='box'>";
@@ -3909,6 +3940,7 @@ function toggleApSsidField() {
   html += "</form>";
   html += "</div>";
 
+  flushHtmlChunk(html);
 
   // CLOUD UPLINK FORM (raw TCP vs AWS IoT MQTT)
   html += "<div class='box'>";
@@ -3972,6 +4004,7 @@ function toggleApSsidField() {
   html += "</form>";
   html += "</div>";
 
+  flushHtmlChunk(html);
 
   // MODBUS TCP TARGETS FORM (second data source, e.g. a CNC controller)
   html += "<div class='box'>";
@@ -4007,6 +4040,7 @@ function toggleApSsidField() {
   html += "</form>";
   html += "</div>";
 
+  flushHtmlChunk(html);
 
   // COMMUNICATION (SERIAL) SETTINGS FORM
   html += "<div class='box'>";
@@ -4056,7 +4090,8 @@ function toggleApSsidField() {
 </html>
 )rawliteral";
 
-  server.send(200, "text/html", html);
+  flushHtmlChunk(html);
+  server.sendContent("");  // zero-length chunk: terminates the chunked response
 }
 
 // ===================== Types Page =====================
