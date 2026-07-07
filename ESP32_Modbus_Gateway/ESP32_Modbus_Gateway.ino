@@ -1325,7 +1325,10 @@ uint16_t getDataLengthForType(String typeName) {
 }
 
 // ===================== Communication Settings Save / Load =====================
-void saveCommunicationSettings() {
+// Returns true only if every NVS write succeeded - callers use this to
+// decide whether the web UI shows "Saved" or a flash-full warning, instead
+// of always claiming success once the write is merely attempted.
+bool saveCommunicationSettings() {
   nvsWriteFailures = 0;
   preferences.begin("comm", false);
 
@@ -1340,6 +1343,8 @@ void saveCommunicationSettings() {
   if (nvsWriteFailures > 0) {
     logKeyEvent("NVS SAVE INCOMPLETE (comm): " + String(nvsWriteFailures) + " write(s) failed - flash may be full, settings may not persist");
   }
+
+  return nvsWriteFailures == 0;
 }
 
 void loadCommunicationSettings() {
@@ -1375,7 +1380,7 @@ void loadCommunicationSettings() {
 }
 
 // ===================== TCP Uplink Config Save / Load =====================
-void saveUplinkConfig() {
+bool saveUplinkConfig() {
   logMessage("========== SAVE TCP CONFIG START ==========");
 
   logMessage("Saving SSID: " + uplinkConfig.ssid);
@@ -1400,6 +1405,8 @@ void saveUplinkConfig() {
 
   logMessage("TCP CONFIG SAVED TO FLASH");
   logMessage("========== SAVE TCP CONFIG END ==========");
+
+  return nvsWriteFailures == 0;
 }
 
 void loadUplinkConfig() {
@@ -1454,7 +1461,7 @@ void startNtp() {
 }
 
 // ===================== Cloud Uplink Config Save / Load =====================
-void saveCloudConfig() {
+bool saveCloudConfig() {
   nvsWriteFailures = 0;
   preferences.begin("cloud", false);
 
@@ -1470,6 +1477,8 @@ void saveCloudConfig() {
   if (nvsWriteFailures > 0) {
     logKeyEvent("NVS SAVE INCOMPLETE (cloud): " + String(nvsWriteFailures) + " write(s) failed - flash may be full, settings may not persist");
   }
+
+  return nvsWriteFailures == 0;
 }
 
 void loadCloudConfig() {
@@ -1499,7 +1508,7 @@ void loadCloudConfig() {
 
 // Certs are in their own namespace: PEM blocks are ~1.2-1.7KB each, well
 // within the NVS per-string limit but worth keeping apart from small keys.
-void saveCerts() {
+bool saveCerts() {
   // These three PEM strings are the largest single consumer of NVS space
   // in the whole gateway (often 1-2KB each) - the most likely place an
   // out-of-space failure first shows up.
@@ -1515,6 +1524,8 @@ void saveCerts() {
   if (nvsWriteFailures > 0) {
     logKeyEvent("NVS SAVE INCOMPLETE (certs): " + String(nvsWriteFailures) + " write(s) failed - flash may be full, certs may not persist");
   }
+
+  return nvsWriteFailures == 0;
 }
 
 void loadCerts() {
@@ -1528,7 +1539,7 @@ void loadCerts() {
 }
 
 // ===================== Device / AP Identity Save / Load =====================
-void saveDeviceConfig() {
+bool saveDeviceConfig() {
   nvsWriteFailures = 0;
   preferences.begin("device", false);
 
@@ -1541,6 +1552,8 @@ void saveDeviceConfig() {
   if (nvsWriteFailures > 0) {
     logKeyEvent("NVS SAVE INCOMPLETE (device): " + String(nvsWriteFailures) + " write(s) failed - flash may be full, settings may not persist");
   }
+
+  return nvsWriteFailures == 0;
 }
 
 void loadDeviceConfig() {
@@ -1665,7 +1678,7 @@ void finalizeLoadedTypeRow(int i) {
   typeList[i].dataLength = inferDataLengthFromType(typeList[i].name);
 }
 
-void saveTypes() {
+bool saveTypes() {
   nvsWriteFailures = 0;
   preferences.begin("types", false);
 
@@ -1699,6 +1712,8 @@ void saveTypes() {
   if (nvsWriteFailures > 0) {
     logKeyEvent("NVS SAVE INCOMPLETE (types): " + String(nvsWriteFailures) + " write(s) failed - flash may be full, settings may not persist");
   }
+
+  return nvsWriteFailures == 0;
 }
 
 void loadTypes() {
@@ -1750,7 +1765,7 @@ void loadTypes() {
 }
 
 // ===================== Save / Load Modbus TCP Targets =====================
-void saveTcpTargets() {
+bool saveTcpTargets() {
   nvsWriteFailures = 0;
   preferences.begin("tcptgt", false);
 
@@ -1786,6 +1801,8 @@ void saveTcpTargets() {
   if (nvsWriteFailures > 0) {
     logKeyEvent("NVS SAVE INCOMPLETE (tcptgt): " + String(nvsWriteFailures) + " write(s) failed - flash may be full, TCP targets may not persist");
   }
+
+  return nvsWriteFailures == 0;
 }
 
 void loadTcpTargets() {
@@ -1928,7 +1945,7 @@ void finalizeLoadedParamRow(int i) {
   resetDebugState(i);
 }
 
-void saveSettings() {
+bool saveSettings() {
   nvsWriteFailures = 0;
   preferences.begin("modbus", false);
 
@@ -1971,6 +1988,8 @@ void saveSettings() {
   if (nvsWriteFailures > 0) {
     logKeyEvent("NVS SAVE INCOMPLETE (modbus): " + String(nvsWriteFailures) + " write(s) failed - flash may be full, param changes may not persist across reboot");
   }
+
+  return nvsWriteFailures == 0;
 }
 
 // Reads the pre-blob one-key-per-field format, for configs saved by a
@@ -3545,6 +3564,7 @@ void handleSettings() {
     .insert { background:#17a2b8; }
     .remove { background:#f4a340; color:black; }
     .success { background:#d4edda; color:#155724; padding:10px; margin-bottom:15px; }
+    .error { background:#f8d7da; color:#721c24; padding:10px; margin-bottom:15px; }
   </style>
 </head>
 <body>
@@ -3557,7 +3577,9 @@ void handleSettings() {
 
 )rawliteral";
 
-  if (server.hasArg("saved")) {
+  if (server.hasArg("saveError")) {
+    html += "<div class='error'>Save FAILED - flash may be full. Check the Status Log; param changes may not have persisted across reboot.</div>";
+  } else if (server.hasArg("saved")) {
     html += "<div class='success'>Modbus Settings Saved Successfully</div>";
   }
 
@@ -3855,7 +3877,9 @@ function confirmResetModbus() {
   html += "<div class='box'>";
   html += "<h2>Device Identity</h2>";
 
-  if (server.hasArg("deviceSaved")) {
+  if (server.hasArg("deviceSaveError")) {
+    html += "<div class='error'>Save FAILED - flash may be full. Check the Status Log; device settings may not have persisted across reboot.</div>";
+  } else if (server.hasArg("deviceSaved")) {
     html += "<div class='success'>Device Settings Saved Successfully</div>";
   }
 
@@ -3922,7 +3946,9 @@ function toggleApSsidField() {
   html += "<div class='box'>";
   html += "<h2>WiFi &amp; TCP Configuration</h2>";
 
-  if (server.hasArg("uplinkSaved")) {
+  if (server.hasArg("uplinkSaveError")) {
+    html += "<div class='error'>Save FAILED - flash may be full. Check the Status Log; network settings may not have persisted across reboot.</div>";
+  } else if (server.hasArg("uplinkSaved")) {
     html += "<div class='success'>Network Settings Saved Successfully</div>";
   }
 
@@ -3946,7 +3972,9 @@ function toggleApSsidField() {
   html += "<div class='box'>";
   html += "<h2>Cloud Uplink</h2>";
 
-  if (server.hasArg("cloudSaved")) {
+  if (server.hasArg("cloudSaveError")) {
+    html += "<div class='error'>Save FAILED - flash may be full. Check the Status Log; cloud settings/certs may not have persisted across reboot.</div>";
+  } else if (server.hasArg("cloudSaved")) {
     html += "<div class='success'>Cloud Settings Saved Successfully</div>";
   }
 
@@ -4011,7 +4039,9 @@ function toggleApSsidField() {
   html += "<h2>Modbus TCP Targets</h2>";
   html += "<p><small>Remote Modbus TCP servers (e.g. a CNC controller) this gateway polls over WiFi, as a second data source alongside the RS485 RTU bus below. Reference a target from the \"TCP Target\" column in the Modbus Settings table. Leave Name/IP blank to leave a slot unused.</small></p>";
 
-  if (server.hasArg("tcpTargetsSaved")) {
+  if (server.hasArg("tcpTargetsSaveError")) {
+    html += "<div class='error'>Save FAILED - flash may be full. Check the Status Log; TCP targets may not have persisted across reboot.</div>";
+  } else if (server.hasArg("tcpTargetsSaved")) {
     html += "<div class='success'>Modbus TCP Targets Saved Successfully</div>";
   }
 
@@ -4046,7 +4076,9 @@ function toggleApSsidField() {
   html += "<div class='box'>";
   html += "<h2>RS485 Communication Settings</h2>";
 
-  if (server.hasArg("commSaved")) {
+  if (server.hasArg("commSaveError")) {
+    html += "<div class='error'>Save FAILED - flash may be full. Check the Status Log; communication settings may not have persisted across reboot.</div>";
+  } else if (server.hasArg("commSaved")) {
     html += "<div class='success'>Communication Settings Saved Successfully</div>";
   }
 
@@ -4116,6 +4148,7 @@ button { padding:9px 14px; margin:5px; border:none; border-radius:4px; cursor:po
 .reset { background:#dc3545; color:white; }
 .remove { background:#f4a340; color:black; }
 .success { background:#d4edda; color:#155724; padding:10px; margin-bottom:15px; }
+.error { background:#f8d7da; color:#721c24; padding:10px; margin-bottom:15px; }
 </style>
 </head>
 <body>
@@ -4125,7 +4158,9 @@ button { padding:9px 14px; margin:5px; border:none; border-radius:4px; cursor:po
 <button class="reset" type="button" onclick="confirmResetTypes()">Reset Data Types</button>
 )rawliteral";
 
-  if (server.hasArg("typeSaved")) {
+  if (server.hasArg("typeSaveError")) {
+    html += "<div class='error'>Save FAILED - flash may be full. Check the Status Log; data type changes may not have persisted across reboot.</div>";
+  } else if (server.hasArg("typeSaved")) {
     html += "<div class='success'>Data Types Saved Successfully</div>";
   }
 
@@ -4299,9 +4334,9 @@ void handleSave() {
 
   // registerLength persisted here is recomputed from type on every load
   // anyway (see loadSettings()), so it's safe to persist without the lock.
-  saveSettings();
+  bool ok = saveSettings();
 
-  server.sendHeader("Location", "/settings?saved=1");
+  server.sendHeader("Location", ok ? "/settings?saved=1" : "/settings?saveError=1");
   server.send(303);
 }
 
@@ -4352,7 +4387,7 @@ void handleSaveCommunication() {
   }
   xSemaphoreGive(dataMutex);
 
-  saveCommunicationSettings();
+  bool ok = saveCommunicationSettings();
 
   // serialMutex blocks until modbusTask finishes any in-flight RS485
   // transaction, so we never reconfigure Serial1 out from under it.
@@ -4371,7 +4406,7 @@ void handleSaveCommunication() {
 
   logKeyEvent("COMM SETTINGS SAVED: " + String(commBaudRate) + " baud, poll " + String(pollIntervalMs) + "ms, recovery " + String(slaveRecoveryDelayMs) + "ms");
 
-  server.sendHeader("Location", "/settings?commSaved=1");
+  server.sendHeader("Location", ok ? "/settings?commSaved=1" : "/settings?commSaveError=1");
   server.send(303);
 }
 
@@ -4408,7 +4443,7 @@ void handleSaveUplink() {
     uplinkConfig.port = 5000;
   }
 
-  saveUplinkConfig();
+  bool ok = saveUplinkConfig();
 
   WiFi.disconnect();
   delay(200);
@@ -4422,7 +4457,7 @@ void handleSaveUplink() {
   logKeyEvent("NETWORK CONFIG SAVED: ssid=" + uplinkConfig.ssid + " tcp=" + uplinkConfig.serverIP + ":" + String(uplinkConfig.port)
               + (uplinkConfig.ntpServer.length() > 0 ? (" ntp=" + uplinkConfig.ntpServer) : ""));
 
-  server.sendHeader("Location", "/settings?uplinkSaved=1");
+  server.sendHeader("Location", ok ? "/settings?uplinkSaved=1" : "/settings?uplinkSaveError=1");
   server.send(303);
 }
 
@@ -4449,14 +4484,14 @@ void handleSaveDevice() {
 
   deviceConfig.apMatchesDeviceName = server.hasArg("apMatchDevice");
 
-  saveDeviceConfig();
+  bool ok = saveDeviceConfig();
 
   String apSsidToUse = getEffectiveApSsid();
   WiFi.softAP(apSsidToUse.c_str(), AP_PASSWORD);
 
   logKeyEvent("DEVICE SETTINGS SAVED: AP=" + apSsidToUse + " deviceName=" + getDeviceName());
 
-  server.sendHeader("Location", "/settings?deviceSaved=1");
+  server.sendHeader("Location", ok ? "/settings?deviceSaved=1" : "/settings?deviceSaveError=1");
   server.send(303);
 }
 
@@ -4500,7 +4535,7 @@ void handleSaveTcpTargets() {
   tcpTargetCount = newCount;
   xSemaphoreGive(dataMutex);
 
-  saveTcpTargets();
+  bool ok = saveTcpTargets();
 
   // Force reconnects so any changed IP/port/unit ID for an existing slot
   // index takes effect immediately rather than on next reboot.
@@ -4512,7 +4547,7 @@ void handleSaveTcpTargets() {
 
   logKeyEvent("MODBUS TCP TARGETS SAVED: " + String(tcpTargetCount) + " configured");
 
-  server.sendHeader("Location", "/settings?tcpTargetsSaved=1");
+  server.sendHeader("Location", ok ? "/settings?tcpTargetsSaved=1" : "/settings?tcpTargetsSaveError=1");
   server.send(303);
 }
 
@@ -4611,7 +4646,7 @@ void handleSaveCloud() {
 
   cloudConfig.shadowEnabled = server.hasArg("shadowEnabled");
 
-  saveCloudConfig();
+  bool ok = saveCloudConfig();
 
   // Per slot: uploaded file > pasted text > blank keeps stored value (same
   // pattern as the WiFi password), so re-saving other cloud settings never
@@ -4622,7 +4657,7 @@ void handleSaveCloud() {
   certsChanged |= applyCertUpdate(certPrivKey, uploadPrivKey, "privKey", "Private Key");
 
   if (certsChanged) {
-    saveCerts();
+    ok = saveCerts() && ok;
   }
 
   // Drop any live session so the next cycle reconnects with the new
@@ -4638,7 +4673,7 @@ void handleSaveCloud() {
               + (cloudConfig.endpoint.length() > 0 ? (" endpoint=" + cloudConfig.endpoint) : "")
               + (certsChanged ? " (certs updated)" : ""));
 
-  server.sendHeader("Location", "/settings?cloudSaved=1");
+  server.sendHeader("Location", ok ? "/settings?cloudSaved=1" : "/settings?cloudSaveError=1");
   server.send(303);
 }
 
@@ -4673,11 +4708,11 @@ void handleSaveTypes() {
 
   xSemaphoreGive(dataMutex);
 
-  saveTypes();
+  bool ok = saveTypes();
 
   logKeyEvent("DATA TYPES SAVED: " + String(rows) + " types");
 
-  server.sendHeader("Location", "/types?typeSaved=1");
+  server.sendHeader("Location", ok ? "/types?typeSaved=1" : "/types?typeSaveError=1");
   server.send(303);
 }
 
