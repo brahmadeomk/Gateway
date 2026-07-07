@@ -81,6 +81,19 @@
      sendTcpQueryResponse() - separate from the periodic all-params
      telemetry broadcast, which keeps flowing regardless). Only active
      when cloudConfig.mode == UPLINK_MODE_TCP.
+   - Local Digital I/O: 4 Digital In (D7-D10), 4 Digital Out (D11-D13,A4),
+     4 Analog In (A0-A3) - plain GPIO, entirely independent of the Modbus
+     buses (no slave ID/register address). D5/D6 are reserved, unused, for
+     a future Serial2. Polled/drained on webTask (Core 0) on its own timer
+     (pollDigitalIO()) - never on modbusTask/Core 1, since these reads
+     never need to be, but keeping Core 1 exclusive to RS485 is the one
+     invariant this whole program is built around. Digital Out reuses the
+     Modbus write path's shape: submitDoWriteCommand() -> doWriteQueue ->
+     processDoWriteQueue() (drained on webTask, not a dedicated task, since
+     digitalWrite() can't block), with the same WRITE_SOURCE_* tags - so
+     Dashboard/AWS Shadow/raw-TCP can all address a DO channel by name,
+     falling back from findParamIndexByName() to findDoChannelIndexByName()
+     wherever a command name doesn't match a Modbus param.
    ====================================================================== */
 
 #include <WiFi.h>
@@ -182,6 +195,33 @@ const char* AP_PASSWORD = "12345678";
 #define RXD2 D2
 #define TXD2 D3
 #define RS485_DE_RE D4
+
+// ===================== Reserved for future Serial2 =====================
+// Not used by any code yet - reserved so a future second UART (e.g. a
+// SIM7600G cellular modem's AT command interface, or a second RS232/RS485
+// device) has known-free pins instead of colliding with Digital I/O below.
+#define SERIAL2_RX_PIN D5
+#define SERIAL2_TX_PIN D6
+
+// ===================== Digital I/O Pins =====================
+// Local GPIO only - no Modbus/RS485/TCP transaction involved, so polling
+// these never touches modbusTask/Core 1 (see pollDigitalIO(), run from
+// webTask on Core 0). D0/D1 are the USB-CDC serial pins (avoided); D2-D6
+// are taken above.
+#define DI_CHANNEL_COUNT 4
+#define DO_CHANNEL_COUNT 4
+#define AI_CHANNEL_COUNT 4
+
+const uint8_t DI_PINS[DI_CHANNEL_COUNT] = { D7, D8, D9, D10 };
+const uint8_t DO_PINS[DO_CHANNEL_COUNT] = { D11, D12, D13, A4 };
+const uint8_t AI_PINS[AI_CHANNEL_COUNT] = { A0, A1, A2, A3 };
+
+// Board silkscreen labels matching the pin arrays above, purely for
+// display on the Settings page (the D../A.. macros resolve to raw GPIO
+// numbers at compile time, which wouldn't mean anything useful in the UI).
+const char *DI_PIN_LABELS[DI_CHANNEL_COUNT] = { "D7", "D8", "D9", "D10" };
+const char *DO_PIN_LABELS[DO_CHANNEL_COUNT] = { "D11", "D12", "D13", "A4" };
+const char *AI_PIN_LABELS[AI_CHANNEL_COUNT] = { "A0", "A1", "A2", "A3" };
 
 // ===================== Limits =====================
 #define MAX_PARAMS 100
@@ -332,6 +372,23 @@ struct TcpAckItem {
 };
 
 QueueHandle_t tcpAckQueue;
+
+// ===================== Digital Out Write Queue =====================
+// Mirrors the Modbus write-queue pattern (WriteCommand/rtuWriteQueue/
+// tcpWriteQueue) above, but for local Digital Out channels. A plain
+// digitalWrite() takes microseconds and can't block, so unlike the Modbus
+// writes it doesn't need its own dedicated drain task - processDoWriteQueue()
+// just runs inline on webTask (Core 0). Reuses the same WRITE_SOURCE_*
+// tags, so shadow/tcp acks work identically to the Modbus write path.
+#define DO_QUEUE_LEN 16
+
+struct DoWriteCommand {
+  int channelIndex;
+  bool value;
+  uint8_t source;
+};
+
+QueueHandle_t doWriteQueue;
 
 // Guards only the RS485_DE_RE pin toggle inside preTransmission()/
 // postTransmission(). This is the single most timing-critical line in the
@@ -536,6 +593,45 @@ struct ModbusParam {
 
 ModbusParam params[MAX_PARAMS];
 int paramCount = 0;
+
+// ===================== Local Digital I/O =====================
+// Independent of the Modbus params[] table above - plain local GPIO, no
+// slave ID/register address/transport, polled directly (pollDigitalIO(),
+// webTask/Core 0) instead of via a Modbus transaction. Kept as three small
+// fixed-size arrays (DI_CHANNEL_COUNT/DO_CHANNEL_COUNT/AI_CHANNEL_COUNT are
+// small constants, unlike the up-to-100-row params[] table) rather than a
+// user-resizable table.
+struct DigitalInChannel {
+  String name;
+  bool enabled;
+  bool value;
+  unsigned long lastUpdateTime;
+};
+
+struct DigitalOutChannel {
+  String name;
+  bool enabled;
+  bool value;  // last commanded state (what the pin is currently driven to)
+  unsigned long lastWriteTime;
+};
+
+struct AnalogInChannel {
+  String name;
+  bool enabled;
+  // Engineering value = raw ADC counts * scale + offset - a simple 2-point
+  // linear calibration (e.g. mapping the ESP32's 0-4095 ADC range to a
+  // 0-10V or 4-20mA field signal), same spirit as the Modbus type list's
+  // divisor but general enough to also handle a non-zero offset.
+  float scale;
+  float offset;
+  int rawValue;
+  float value;
+  unsigned long lastUpdateTime;
+};
+
+DigitalInChannel diChannels[DI_CHANNEL_COUNT];
+DigitalOutChannel doChannels[DO_CHANNEL_COUNT];
+AnalogInChannel aiChannels[AI_CHANNEL_COUNT];
 
 // ===================== Compact Blob Storage =====================
 // params[]/typeList[]/tcpTargets[] used to persist as one NVS key per
@@ -1895,6 +1991,131 @@ void loadTcpTargets() {
   logKeyEvent("MODBUS TCP TARGETS MIGRATED to compact storage - freed flash space");
 }
 
+// ===================== Digital I/O Save / Load =====================
+// Brand new feature (no earlier firmware version ever stored anything
+// here), so unlike the tables above there's no legacy per-key format to
+// migrate from - just a single "load compact blobs, or default+save if
+// they don't exist/match yet" path.
+#define DIGITAL_IO_SCHEMA_VERSION 1
+
+struct StoredDiRow {
+  char name[STORED_NAME_LEN];
+  uint8_t enabled;
+};
+
+struct StoredDoRow {
+  char name[STORED_NAME_LEN];
+  uint8_t enabled;
+};
+
+struct StoredAiRow {
+  char name[STORED_NAME_LEN];
+  uint8_t enabled;
+  float scale;
+  float offset;
+};
+
+bool saveDigitalIOSettings() {
+  nvsWriteFailures = 0;
+  preferences.begin("digio", false);
+
+  trackNvsWrite(preferences.putUInt("schema", DIGITAL_IO_SCHEMA_VERSION));
+
+  StoredDiRow diRows[DI_CHANNEL_COUNT];
+  StoredDoRow doRows[DO_CHANNEL_COUNT];
+  StoredAiRow aiRows[AI_CHANNEL_COUNT];
+
+  for (int i = 0; i < DI_CHANNEL_COUNT; i++) {
+    memset(&diRows[i], 0, sizeof(StoredDiRow));
+    diChannels[i].name.toCharArray(diRows[i].name, STORED_NAME_LEN);
+    diRows[i].enabled = diChannels[i].enabled ? 1 : 0;
+  }
+
+  for (int i = 0; i < DO_CHANNEL_COUNT; i++) {
+    memset(&doRows[i], 0, sizeof(StoredDoRow));
+    doChannels[i].name.toCharArray(doRows[i].name, STORED_NAME_LEN);
+    doRows[i].enabled = doChannels[i].enabled ? 1 : 0;
+  }
+
+  for (int i = 0; i < AI_CHANNEL_COUNT; i++) {
+    memset(&aiRows[i], 0, sizeof(StoredAiRow));
+    aiChannels[i].name.toCharArray(aiRows[i].name, STORED_NAME_LEN);
+    aiRows[i].enabled = aiChannels[i].enabled ? 1 : 0;
+    aiRows[i].scale = aiChannels[i].scale;
+    aiRows[i].offset = aiChannels[i].offset;
+  }
+
+  if (preferences.putBytes("di", diRows, sizeof(diRows)) != sizeof(diRows)) nvsWriteFailures++;
+  if (preferences.putBytes("do", doRows, sizeof(doRows)) != sizeof(doRows)) nvsWriteFailures++;
+  if (preferences.putBytes("ai", aiRows, sizeof(aiRows)) != sizeof(aiRows)) nvsWriteFailures++;
+
+  preferences.end();
+
+  if (nvsWriteFailures > 0) {
+    logKeyEvent("NVS SAVE INCOMPLETE (digio): " + String(nvsWriteFailures) + " write(s) failed - flash may be full, I/O settings may not persist");
+  }
+
+  return nvsWriteFailures == 0;
+}
+
+void loadDigitalIOSettings() {
+  preferences.begin("digio", true);
+
+  uint32_t savedSchema = preferences.getUInt("schema", 0);
+  bool freshOrMismatched = (savedSchema != DIGITAL_IO_SCHEMA_VERSION)
+    || (preferences.getBytesLength("di") != sizeof(StoredDiRow) * DI_CHANNEL_COUNT)
+    || (preferences.getBytesLength("do") != sizeof(StoredDoRow) * DO_CHANNEL_COUNT)
+    || (preferences.getBytesLength("ai") != sizeof(StoredAiRow) * AI_CHANNEL_COUNT);
+
+  if (freshOrMismatched) {
+    preferences.end();
+    loadDefaultDigitalIO();
+    saveDigitalIOSettings();
+    return;
+  }
+
+  StoredDiRow diRows[DI_CHANNEL_COUNT];
+  StoredDoRow doRows[DO_CHANNEL_COUNT];
+  StoredAiRow aiRows[AI_CHANNEL_COUNT];
+
+  preferences.getBytes("di", diRows, sizeof(diRows));
+  preferences.getBytes("do", doRows, sizeof(doRows));
+  preferences.getBytes("ai", aiRows, sizeof(aiRows));
+
+  preferences.end();
+
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+
+  for (int i = 0; i < DI_CHANNEL_COUNT; i++) {
+    diRows[i].name[STORED_NAME_LEN - 1] = '\0';
+    diChannels[i].name = String(diRows[i].name);
+    diChannels[i].enabled = diRows[i].enabled != 0;
+    diChannels[i].value = false;
+    diChannels[i].lastUpdateTime = 0;
+  }
+
+  for (int i = 0; i < DO_CHANNEL_COUNT; i++) {
+    doRows[i].name[STORED_NAME_LEN - 1] = '\0';
+    doChannels[i].name = String(doRows[i].name);
+    doChannels[i].enabled = doRows[i].enabled != 0;
+    doChannels[i].value = false;
+    doChannels[i].lastWriteTime = 0;
+  }
+
+  for (int i = 0; i < AI_CHANNEL_COUNT; i++) {
+    aiRows[i].name[STORED_NAME_LEN - 1] = '\0';
+    aiChannels[i].name = String(aiRows[i].name);
+    aiChannels[i].enabled = aiRows[i].enabled != 0;
+    aiChannels[i].scale = (aiRows[i].scale == 0) ? 1 : aiRows[i].scale;
+    aiChannels[i].offset = aiRows[i].offset;
+    aiChannels[i].rawValue = 0;
+    aiChannels[i].value = 0;
+    aiChannels[i].lastUpdateTime = 0;
+  }
+
+  xSemaphoreGive(dataMutex);
+}
+
 // ===================== Debug State =====================
 void resetDebugState(int index) {
   params[index].lastLoggedValid = false;
@@ -1928,6 +2149,36 @@ void loadDefaultSettings() {
     params[i].lastWriteResult = 0xFF;
     params[i].lastWriteTime = 0;
     resetDebugState(i);
+  }
+
+  xSemaphoreGive(dataMutex);
+}
+
+void loadDefaultDigitalIO() {
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+
+  for (int i = 0; i < DI_CHANNEL_COUNT; i++) {
+    diChannels[i].name = "DI" + String(i + 1);
+    diChannels[i].enabled = false;
+    diChannels[i].value = false;
+    diChannels[i].lastUpdateTime = 0;
+  }
+
+  for (int i = 0; i < DO_CHANNEL_COUNT; i++) {
+    doChannels[i].name = "DO" + String(i + 1);
+    doChannels[i].enabled = false;
+    doChannels[i].value = false;
+    doChannels[i].lastWriteTime = 0;
+  }
+
+  for (int i = 0; i < AI_CHANNEL_COUNT; i++) {
+    aiChannels[i].name = "AI" + String(i + 1);
+    aiChannels[i].enabled = false;
+    aiChannels[i].scale = 1;
+    aiChannels[i].offset = 0;
+    aiChannels[i].rawValue = 0;
+    aiChannels[i].value = 0;
+    aiChannels[i].lastUpdateTime = 0;
   }
 
   xSemaphoreGive(dataMutex);
@@ -2391,7 +2642,8 @@ String paramStatusText(int i) {
 
 String buildTcpJson() {
   String json = "{";
-  json.reserve(128 + paramCount * 96);  // avoid repeated reallocation while appending below
+  // +12 rows covers the worst case of every Digital/Analog I/O channel enabled.
+  json.reserve(128 + (paramCount + DI_CHANNEL_COUNT + DO_CHANNEL_COUNT + AI_CHANNEL_COUNT) * 96);
 
   // Same identity the user sees on the Settings page (Device Name):
   // prefix_XXXXX when a prefix is set, full MAC otherwise.
@@ -2402,10 +2654,13 @@ String buildTcpJson() {
 
   xSemaphoreTake(dataMutex, portMAX_DELAY);
 
+  bool firstSensor = true;
+
   for (int i = 0; i < paramCount; i++) {
-    if (i > 0) {
+    if (!firstSensor) {
       json += ",";
     }
+    firstSensor = false;
 
     String deviceId = String(params[i].slaveId);
 
@@ -2421,6 +2676,44 @@ String buildTcpJson() {
 
     json += "\"status\":\"" + paramStatusText(i) + "\"";
     json += "}";
+  }
+
+  // Local Digital/Analog I/O channels ride the same sensors[] array
+  // (sensor_id = pin label, since there's no slave ID for local GPIO) -
+  // disabled channels are skipped entirely rather than emitting a
+  // placeholder, so telemetry is unchanged for anyone not using this
+  // feature at all.
+  for (int i = 0; i < DI_CHANNEL_COUNT; i++) {
+    if (!diChannels[i].enabled) continue;
+    if (!firstSensor) json += ",";
+    firstSensor = false;
+
+    json += "{\"sensor_id\":\"" + String(DI_PIN_LABELS[i]) + "\",";
+    json += "\"sensor_name\":\"" + jsonEscape(diChannels[i].name) + "\",";
+    json += "\"value\":" + String(diChannels[i].value ? 1 : 0) + ",";
+    json += "\"status\":\"OK\"}";
+  }
+
+  for (int i = 0; i < DO_CHANNEL_COUNT; i++) {
+    if (!doChannels[i].enabled) continue;
+    if (!firstSensor) json += ",";
+    firstSensor = false;
+
+    json += "{\"sensor_id\":\"" + String(DO_PIN_LABELS[i]) + "\",";
+    json += "\"sensor_name\":\"" + jsonEscape(doChannels[i].name) + "\",";
+    json += "\"value\":" + String(doChannels[i].value ? 1 : 0) + ",";
+    json += "\"status\":\"OK\"}";
+  }
+
+  for (int i = 0; i < AI_CHANNEL_COUNT; i++) {
+    if (!aiChannels[i].enabled) continue;
+    if (!firstSensor) json += ",";
+    firstSensor = false;
+
+    json += "{\"sensor_id\":\"" + String(AI_PIN_LABELS[i]) + "\",";
+    json += "\"sensor_name\":\"" + jsonEscape(aiChannels[i].name) + "\",";
+    json += "\"value\":" + String(aiChannels[i].value, 3) + ",";
+    json += "\"status\":\"OK\"}";
   }
 
   xSemaphoreGive(dataMutex);
@@ -2547,12 +2840,55 @@ void sendTcpAckLine(const String &name, float value, bool ok, uint8_t code, cons
   tcpClient.write((const uint8_t *)line.c_str(), line.length());
 }
 
+// Searches DI/DO/AI channels by name (in that order) as a fallback for the
+// raw-TCP query command, mirroring findDoChannelIndexByName()'s role in the
+// write path. Returns true and fills the outputs if found. Caller must NOT
+// already hold dataMutex.
+bool findDigitalIOValueByName(const String &name, float &outValue, bool &outEnabled, unsigned long &outLastUpdateMs) {
+  bool found = false;
+
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+
+  for (int i = 0; i < DI_CHANNEL_COUNT && !found; i++) {
+    if (diChannels[i].name == name) {
+      outValue = diChannels[i].value ? 1 : 0;
+      outEnabled = diChannels[i].enabled;
+      outLastUpdateMs = diChannels[i].lastUpdateTime;
+      found = true;
+    }
+  }
+
+  for (int i = 0; i < DO_CHANNEL_COUNT && !found; i++) {
+    if (doChannels[i].name == name) {
+      outValue = doChannels[i].value ? 1 : 0;
+      outEnabled = doChannels[i].enabled;
+      outLastUpdateMs = doChannels[i].lastWriteTime;
+      found = true;
+    }
+  }
+
+  for (int i = 0; i < AI_CHANNEL_COUNT && !found; i++) {
+    if (aiChannels[i].name == name) {
+      outValue = aiChannels[i].value;
+      outEnabled = aiChannels[i].enabled;
+      outLastUpdateMs = aiChannels[i].lastUpdateTime;
+      found = true;
+    }
+  }
+
+  xSemaphoreGive(dataMutex);
+
+  return found;
+}
+
 // On-demand read for one parameter, e.g. {"query":"SetpointTemp"} ->
 // {"query":"SetpointTemp","value":72.5,"status":"OK","ageMs":1500} - unlike
 // the periodic telemetry broadcast (buildTcpJson(), all params, every poll
 // cycle, unprompted), this replies about exactly the one parameter asked
 // for, on request. "ageMs" is how long ago that value was last updated by a
 // poll; omitted (along with value) if it's never been successfully polled.
+// Falls back to Digital/Analog I/O channels by name if no Modbus param
+// matches, so one query command covers both namespaces.
 void sendTcpQueryResponse(const String &name) {
   if (!tcpClient.connected()) {
     return;
@@ -2560,33 +2896,49 @@ void sendTcpQueryResponse(const String &name) {
 
   int idx = findParamIndexByName(name);
 
-  if (idx < 0) {
-    logKeyEvent("TCP QUERY REJECTED: no parameter named '" + name + "'");
-    String line = "{\"query\":\"" + jsonEscape(name) + "\",\"status\":\"ERR\",\"reason\":\"unknown parameter\"}\n";
+  if (idx >= 0) {
+    bool valid;
+    float value;
+    unsigned long lastUpdateTime;
+    String statusText;
+
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    valid = params[idx].valid;
+    value = params[idx].value;
+    lastUpdateTime = params[idx].lastUpdateTime;
+    statusText = paramStatusText(idx);
+    xSemaphoreGive(dataMutex);
+
+    String line = "{\"query\":\"" + jsonEscape(name) + "\",\"value\":";
+    line += valid ? String(value, 3) : "null";
+    line += ",\"status\":\"" + statusText + "\"";
+    if (lastUpdateTime > 0) {
+      line += ",\"ageMs\":" + String(millis() - lastUpdateTime);
+    }
+    line += "}\n";
+
     tcpClient.write((const uint8_t *)line.c_str(), line.length());
     return;
   }
 
-  bool valid;
-  float value;
-  unsigned long lastUpdateTime;
-  String statusText;
+  float dioValue;
+  bool dioEnabled;
+  unsigned long dioLastUpdateMs;
 
-  xSemaphoreTake(dataMutex, portMAX_DELAY);
-  valid = params[idx].valid;
-  value = params[idx].value;
-  lastUpdateTime = params[idx].lastUpdateTime;
-  statusText = paramStatusText(idx);
-  xSemaphoreGive(dataMutex);
+  if (findDigitalIOValueByName(name, dioValue, dioEnabled, dioLastUpdateMs)) {
+    String line = "{\"query\":\"" + jsonEscape(name) + "\",\"value\":" + String(dioValue, 3);
+    line += ",\"status\":\"" + String(dioEnabled ? "OK" : "Disabled") + "\"";
+    if (dioLastUpdateMs > 0) {
+      line += ",\"ageMs\":" + String(millis() - dioLastUpdateMs);
+    }
+    line += "}\n";
 
-  String line = "{\"query\":\"" + jsonEscape(name) + "\",\"value\":";
-  line += valid ? String(value, 3) : "null";
-  line += ",\"status\":\"" + statusText + "\"";
-  if (lastUpdateTime > 0) {
-    line += ",\"ageMs\":" + String(millis() - lastUpdateTime);
+    tcpClient.write((const uint8_t *)line.c_str(), line.length());
+    return;
   }
-  line += "}\n";
 
+  logKeyEvent("TCP QUERY REJECTED: no parameter named '" + name + "'");
+  String line = "{\"query\":\"" + jsonEscape(name) + "\",\"status\":\"ERR\",\"reason\":\"unknown parameter\"}\n";
   tcpClient.write((const uint8_t *)line.c_str(), line.length());
 }
 
@@ -2620,17 +2972,25 @@ void handleTcpCommandLine(const String &line) {
   float value = doc["value"].as<float>();
 
   int idx = findParamIndexByName(paramName);
-  if (idx < 0) {
-    logKeyEvent("TCP CMD REJECTED: no parameter named '" + paramName + "'");
-    sendTcpAckLine(paramName, value, false, 0xFF, "unknown parameter");
+  if (idx >= 0) {
+    if (!submitWriteCommand(idx, value, WRITE_SOURCE_TCP)) {
+      // submitWriteCommand() already logged the specific reason.
+      sendTcpAckLine(paramName, value, false, 0xFF, "rejected - see Status Log");
+    }
+    // else: queued OK - the real ack comes later via tcpAckQueue.
     return;
   }
 
-  if (!submitWriteCommand(idx, value, WRITE_SOURCE_TCP)) {
-    // submitWriteCommand() already logged the specific reason.
-    sendTcpAckLine(paramName, value, false, 0xFF, "rejected - see Status Log");
+  int doIdx = findDoChannelIndexByName(paramName);
+  if (doIdx >= 0) {
+    if (!submitDoWriteCommand(doIdx, value != 0, WRITE_SOURCE_TCP)) {
+      sendTcpAckLine(paramName, value, false, 0xFF, "rejected - see Status Log");
+    }
+    return;
   }
-  // else: queued OK - the real ack comes later via tcpAckQueue.
+
+  logKeyEvent("TCP CMD REJECTED: no parameter named '" + paramName + "'");
+  sendTcpAckLine(paramName, value, false, 0xFF, "unknown parameter");
 }
 
 // Drains any bytes currently buffered on tcpClient into newline-framed
@@ -2727,13 +3087,21 @@ void handleShadowDelta(byte *payload, unsigned int length) {
       continue;
     }
 
+    float value = kv.value().as<float>();
+
     int idx = findParamIndexByName(paramName);
-    if (idx < 0) {
-      logKeyEvent("SHADOW DELTA REJECTED: no parameter named '" + paramName + "'");
+    if (idx >= 0) {
+      submitWriteCommand(idx, value, WRITE_SOURCE_SHADOW);
       continue;
     }
 
-    submitWriteCommand(idx, kv.value().as<float>(), WRITE_SOURCE_SHADOW);
+    int doIdx = findDoChannelIndexByName(paramName);
+    if (doIdx >= 0) {
+      submitDoWriteCommand(doIdx, value != 0, WRITE_SOURCE_SHADOW);
+      continue;
+    }
+
+    logKeyEvent("SHADOW DELTA REJECTED: no parameter named '" + paramName + "'");
   }
 }
 
@@ -3015,6 +3383,24 @@ int findParamIndexByName(const String &name) {
   return found;
 }
 
+// Same idea, for Digital Out channels - checked as a fallback wherever a
+// command name doesn't match a Modbus param (see handleShadowDelta(),
+// handleTcpCommandLine()), so the two namespaces share one command surface.
+int findDoChannelIndexByName(const String &name) {
+  int found = -1;
+
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  for (int i = 0; i < DO_CHANNEL_COUNT; i++) {
+    if (doChannels[i].name == name) {
+      found = i;
+      break;
+    }
+  }
+  xSemaphoreGive(dataMutex);
+
+  return found;
+}
+
 // Human-readable tag for key-log lines - keeps the WRITE_SOURCE_* routing
 // value as the single source of truth instead of passing a parallel string.
 String writeSourceLabel(uint8_t source) {
@@ -3201,6 +3587,75 @@ void processTcpWriteQueue() {
       queueShadowReport(pname, cmd.value);
     } else if (cmd.source == WRITE_SOURCE_TCP) {
       queueTcpAck(pname, cmd.value, result);
+    }
+  }
+}
+
+// ===================== Digital Out Write Submission/Drain =====================
+// Same validate-then-queue shape as submitWriteCommand(), simplified: no
+// min/max clamp (a boolean has nothing to clamp), just an enabled check.
+bool submitDoWriteCommand(int channelIndex, bool value, uint8_t source) {
+  String sourceLabel = writeSourceLabel(source);
+
+  if (channelIndex < 0 || channelIndex >= DO_CHANNEL_COUNT) {
+    logKeyEvent("DO WRITE REJECTED (" + sourceLabel + "): invalid channel index " + String(channelIndex));
+    return false;
+  }
+
+  bool enabled;
+  String cname;
+
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  enabled = doChannels[channelIndex].enabled;
+  cname = doChannels[channelIndex].name;
+  xSemaphoreGive(dataMutex);
+
+  if (!enabled) {
+    logKeyEvent("DO WRITE REJECTED (" + sourceLabel + "): " + cname + " is not enabled");
+    return false;
+  }
+
+  DoWriteCommand cmd;
+  cmd.channelIndex = channelIndex;
+  cmd.value = value;
+  cmd.source = source;
+
+  if (xQueueSend(doWriteQueue, &cmd, 0) != pdTRUE) {
+    logKeyEvent("DO WRITE QUEUE FULL (" + sourceLabel + ") - dropped command for " + cname);
+    return false;
+  }
+
+  logKeyEvent("DO WRITE QUEUED (" + sourceLabel + "): " + cname + " = " + String(value ? "ON" : "OFF"));
+  return true;
+}
+
+// Drains doWriteQueue - called every webTask cycle (see webTask()). A
+// digitalWrite() can't fail the way a Modbus transaction can, so unlike
+// processRtuWriteQueue()/processTcpWriteQueue() there's no result code:
+// shadow/tcp acks always report success once a queued command reaches here.
+void processDoWriteQueue() {
+  DoWriteCommand cmd;
+
+  while (xQueueReceive(doWriteQueue, &cmd, 0) == pdTRUE) {
+    if (cmd.channelIndex < 0 || cmd.channelIndex >= DO_CHANNEL_COUNT) {
+      continue;
+    }
+
+    digitalWrite(DO_PINS[cmd.channelIndex], cmd.value ? HIGH : LOW);
+
+    String cname;
+    xSemaphoreTake(dataMutex, portMAX_DELAY);
+    doChannels[cmd.channelIndex].value = cmd.value;
+    doChannels[cmd.channelIndex].lastWriteTime = millis();
+    cname = doChannels[cmd.channelIndex].name;
+    xSemaphoreGive(dataMutex);
+
+    logKeyEvent("DO WRITE OK: " + cname + " = " + String(cmd.value ? "ON" : "OFF"));
+
+    if (cmd.source == WRITE_SOURCE_SHADOW) {
+      queueShadowReport(cname, cmd.value ? 1 : 0);
+    } else if (cmd.source == WRITE_SOURCE_TCP) {
+      queueTcpAck(cname, cmd.value ? 1 : 0, MB_SUCCESS);
     }
   }
 }
@@ -3567,12 +4022,33 @@ void handleRoot() {
 </div>
 
 <div class="box">
+<h2>Digital I/O</h2>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>Name</th>
+<th>Pin</th>
+<th>Enabled</th>
+<th>Value</th>
+<th>Last Update</th>
+<th>Control</th>
+</tr>
+</thead>
+<tbody id="digioBody"></tbody>
+</table>
+</div>
+
+<div class="box">
 <h2>Status Log</h2>
 <div id="keyLogBox" class="logbox"></div>
 </div>
 
 <script>
 let lastData = [];
+let lastDigitalIn = [];
+let lastDigitalOut = [];
+let lastAnalogIn = [];
 let lastServerNowMs = 0;
 let lastFetchClientTime = 0;
 
@@ -3681,19 +4157,55 @@ function sendWriteCommand(index){
    .then(loadData);
 }
 
+function sendDoCommand(index, value){
+  let body = "channel=" + encodeURIComponent(index) + "&value=" + (value ? "1" : "0");
+  fetch('/writeDigitalOut', { method: 'POST', headers: {'Content-Type':'application/x-www-form-urlencoded'}, body: body })
+   .then(r => { if (!r.ok) alert("Write rejected - check Status Log for the reason."); })
+   .then(loadData);
+}
+
+function renderDigitalIO(){
+  let body = "";
+
+  lastDigitalIn.forEach(c => {
+    body += `<tr><td>DI</td><td>${c.name}</td><td>${c.pin}</td><td>${c.enabled ? 'Yes':'No'}</td>`
+          + `<td>${c.enabled ? (c.value ? 'Active' : 'Idle') : '-'}</td><td>${c.enabled ? formatAge(c.lastUpdateMs) : '-'}</td><td>-</td></tr>`;
+  });
+
+  lastDigitalOut.forEach((c,i) => {
+    let control = c.enabled
+      ? `<button type="button" onclick="sendDoCommand(${i},true)">ON</button><button type="button" onclick="sendDoCommand(${i},false)">OFF</button>`
+      : "-";
+    body += `<tr><td>DO</td><td>${c.name}</td><td>${c.pin}</td><td>${c.enabled ? 'Yes':'No'}</td>`
+          + `<td>${c.enabled ? (c.value ? 'On' : 'Off') : '-'}</td><td>${c.enabled ? formatAge(c.lastWriteMs) : '-'}</td><td>${control}</td></tr>`;
+  });
+
+  lastAnalogIn.forEach(c => {
+    body += `<tr><td>AI</td><td>${c.name}</td><td>${c.pin}</td><td>${c.enabled ? 'Yes':'No'}</td>`
+          + `<td>${c.enabled ? (c.value.toFixed(3) + ' (raw ' + c.raw + ')') : '-'}</td><td>${c.enabled ? formatAge(c.lastUpdateMs) : '-'}</td><td>-</td></tr>`;
+  });
+
+  document.getElementById("digioBody").innerHTML = body;
+}
+
 function loadData(){
  fetch('/data')
  .then(r=>r.json())
  .then(d=>{
   lastData = d.data;
+  lastDigitalIn = d.digitalIn || [];
+  lastDigitalOut = d.digitalOut || [];
+  lastAnalogIn = d.analogIn || [];
   lastServerNowMs = d.nowMs;
   lastFetchClientTime = Date.now();
   renderTable();
+  renderDigitalIO();
  });
 }
 
 setInterval(loadData, 2000);
 setInterval(renderTable, 1000);
+setInterval(renderDigitalIO, 1000);
 loadData();
 
 function escapeHtml(s){
@@ -4280,6 +4792,55 @@ function toggleApSsidField() {
 
   flushHtmlChunk(html);
 
+  // DIGITAL I/O FORM (local GPIO - independent of the Modbus buses above)
+  html += "<div class='box'>";
+  html += "<h2>Digital I/O</h2>";
+  html += "<p><small>Local GPIO channels, read/written directly - not Modbus. Digital In reads inverted (see firmware notes: HIGH/idle = false, pulled LOW = true) to match a typical opto-isolator input module; Digital Out writes go through the same write-queue/command-channel path as writable Modbus parameters (Dashboard, AWS Shadow, raw TCP), keyed by name.</small></p>";
+
+  if (server.hasArg("digioSaveError")) {
+    html += "<div class='error'>Save FAILED - flash may be full. Check the Status Log; Digital I/O settings may not have persisted across reboot.</div>";
+  } else if (server.hasArg("digioSaved")) {
+    html += "<div class='success'>Digital I/O Settings Saved Successfully</div>";
+  }
+
+  html += "<form action='/saveDigitalIO' method='POST'>";
+
+  html += "<h3>Digital In</h3><table>";
+  html += "<tr><th>#</th><th>Pin</th><th>Name</th><th>Enable</th></tr>";
+  for (int i = 0; i < DI_CHANNEL_COUNT; i++) {
+    html += "<tr><td>" + String(i) + "</td><td>" + String(DI_PIN_LABELS[i]) + "</td>";
+    html += "<td><input name='diName" + String(i) + "' value='" + htmlEscape(diChannels[i].name) + "'></td>";
+    html += "<td><input type='checkbox' name='diEn" + String(i) + "'" + String(diChannels[i].enabled ? " checked" : "") + "></td></tr>";
+  }
+  html += "</table>";
+
+  html += "<h3>Digital Out</h3><table>";
+  html += "<tr><th>#</th><th>Pin</th><th>Name</th><th>Enable</th></tr>";
+  for (int i = 0; i < DO_CHANNEL_COUNT; i++) {
+    html += "<tr><td>" + String(i) + "</td><td>" + String(DO_PIN_LABELS[i]) + "</td>";
+    html += "<td><input name='doName" + String(i) + "' value='" + htmlEscape(doChannels[i].name) + "'></td>";
+    html += "<td><input type='checkbox' name='doEn" + String(i) + "'" + String(doChannels[i].enabled ? " checked" : "") + "></td></tr>";
+  }
+  html += "</table>";
+
+  html += "<h3>Analog In</h3><table>";
+  html += "<tr><th>#</th><th>Pin</th><th>Name</th><th>Enable</th><th>Scale</th><th>Offset</th></tr>";
+  for (int i = 0; i < AI_CHANNEL_COUNT; i++) {
+    html += "<tr><td>" + String(i) + "</td><td>" + String(AI_PIN_LABELS[i]) + "</td>";
+    html += "<td><input name='aiName" + String(i) + "' value='" + htmlEscape(aiChannels[i].name) + "'></td>";
+    html += "<td><input type='checkbox' name='aiEn" + String(i) + "'" + String(aiChannels[i].enabled ? " checked" : "") + "></td>";
+    html += "<td><input name='aiScale" + String(i) + "' value='" + String(aiChannels[i].scale, 5) + "'></td>";
+    html += "<td><input name='aiOffset" + String(i) + "' value='" + String(aiChannels[i].offset, 3) + "'></td></tr>";
+  }
+  html += "</table>";
+  html += "<p><small>Engineering value = raw ADC (0-4095) &times; Scale + Offset.</small></p>";
+
+  html += "<button type='submit'>Save Digital I/O</button>";
+  html += "</form>";
+  html += "</div>";
+
+  flushHtmlChunk(html);
+
   // COMMUNICATION (SERIAL) SETTINGS FORM
   html += "<div class='box'>";
   html += "<h2>RS485 Communication Settings</h2>";
@@ -4759,6 +5320,51 @@ void handleSaveTcpTargets() {
   server.send(303);
 }
 
+// ===================== Save Digital I/O =====================
+void handleSaveDigitalIO() {
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+
+  for (int i = 0; i < DI_CHANNEL_COUNT; i++) {
+    String index = String(i);
+    diChannels[i].name = server.arg("diName" + index);
+    if (diChannels[i].name.length() == 0) {
+      diChannels[i].name = "DI" + String(i + 1);
+    }
+    diChannels[i].enabled = server.hasArg("diEn" + index);
+  }
+
+  for (int i = 0; i < DO_CHANNEL_COUNT; i++) {
+    String index = String(i);
+    doChannels[i].name = server.arg("doName" + index);
+    if (doChannels[i].name.length() == 0) {
+      doChannels[i].name = "DO" + String(i + 1);
+    }
+    doChannels[i].enabled = server.hasArg("doEn" + index);
+  }
+
+  for (int i = 0; i < AI_CHANNEL_COUNT; i++) {
+    String index = String(i);
+    aiChannels[i].name = server.arg("aiName" + index);
+    if (aiChannels[i].name.length() == 0) {
+      aiChannels[i].name = "AI" + String(i + 1);
+    }
+    aiChannels[i].enabled = server.hasArg("aiEn" + index);
+
+    float scale = server.arg("aiScale" + index).toFloat();
+    aiChannels[i].scale = (scale == 0) ? 1 : scale;
+    aiChannels[i].offset = server.arg("aiOffset" + index).toFloat();
+  }
+
+  xSemaphoreGive(dataMutex);
+
+  bool ok = saveDigitalIOSettings();
+
+  logKeyEvent("DIGITAL I/O SETTINGS SAVED");
+
+  server.sendHeader("Location", ok ? "/settings?digioSaved=1" : "/settings?digioSaveError=1");
+  server.send(303);
+}
+
 // ===================== Save Cloud Uplink =====================
 // Minimal sanity check that content is PEM text, not an accidentally
 // selected binary (DER/.p12) or wrong file - protects the stored certs.
@@ -4973,9 +5579,44 @@ void handleData() {
     json += "}";
   }
 
+  json += "],";
+
+  json += "\"digitalIn\":[";
+  for (int i = 0; i < DI_CHANNEL_COUNT; i++) {
+    if (i > 0) json += ",";
+    json += "{\"name\":\"" + jsonEscape(diChannels[i].name) + "\",";
+    json += "\"pin\":\"" + String(DI_PIN_LABELS[i]) + "\",";
+    json += "\"enabled\":" + String(diChannels[i].enabled ? "true" : "false") + ",";
+    json += "\"value\":" + String(diChannels[i].value ? "true" : "false") + ",";
+    json += "\"lastUpdateMs\":" + String(diChannels[i].lastUpdateTime) + "}";
+  }
+  json += "],";
+
+  json += "\"digitalOut\":[";
+  for (int i = 0; i < DO_CHANNEL_COUNT; i++) {
+    if (i > 0) json += ",";
+    json += "{\"name\":\"" + jsonEscape(doChannels[i].name) + "\",";
+    json += "\"pin\":\"" + String(DO_PIN_LABELS[i]) + "\",";
+    json += "\"enabled\":" + String(doChannels[i].enabled ? "true" : "false") + ",";
+    json += "\"value\":" + String(doChannels[i].value ? "true" : "false") + ",";
+    json += "\"lastWriteMs\":" + String(doChannels[i].lastWriteTime) + "}";
+  }
+  json += "],";
+
+  json += "\"analogIn\":[";
+  for (int i = 0; i < AI_CHANNEL_COUNT; i++) {
+    if (i > 0) json += ",";
+    json += "{\"name\":\"" + jsonEscape(aiChannels[i].name) + "\",";
+    json += "\"pin\":\"" + String(AI_PIN_LABELS[i]) + "\",";
+    json += "\"enabled\":" + String(aiChannels[i].enabled ? "true" : "false") + ",";
+    json += "\"value\":" + String(aiChannels[i].value, 3) + ",";
+    json += "\"raw\":" + String(aiChannels[i].rawValue) + ",";
+    json += "\"lastUpdateMs\":" + String(aiChannels[i].lastUpdateTime) + "}";
+  }
+  json += "]";
+
   xSemaphoreGive(dataMutex);
 
-  json += "]";
   json += "}";
 
   server.send(200, "application/json", json);
@@ -5018,6 +5659,17 @@ void handleWriteCommand() {
   server.send(ok ? 200 : 400, "text/plain", ok ? "queued" : "rejected");
 }
 
+// Dashboard-driven Digital Out write - same role as handleWriteCommand()
+// above, for the local I/O channels instead of Modbus params.
+void handleWriteDigitalOut() {
+  int channel = server.arg("channel").toInt();
+  bool value = server.arg("value").toInt() != 0;
+
+  bool ok = submitDoWriteCommand(channel, value, WRITE_SOURCE_DASHBOARD);
+
+  server.send(ok ? 200 : 400, "text/plain", ok ? "queued" : "rejected");
+}
+
 // ===================== Reset =====================
 void handleReset() {
   loadDefaultSettings();
@@ -5051,6 +5703,7 @@ void setup() {
   tcpWriteQueue = xQueueCreate(WRITE_QUEUE_LEN, sizeof(WriteCommand));
   shadowReportQueue = xQueueCreate(SHADOW_REPORT_QUEUE_LEN, sizeof(ShadowReportItem));
   tcpAckQueue = xQueueCreate(TCP_ACK_QUEUE_LEN, sizeof(TcpAckItem));
+  doWriteQueue = xQueueCreate(DO_QUEUE_LEN, sizeof(DoWriteCommand));
 
   mqttClient.setCallback(mqttCallback);
 
@@ -5073,6 +5726,23 @@ void setup() {
   pinMode(RS485_DE_RE, OUTPUT);
   digitalWrite(RS485_DE_RE, LOW);
 
+  // Digital In: INPUT_PULLUP is the common default for opto-isolator input
+  // modules with an open-collector output stage - change to plain INPUT if
+  // your specific module already drives a clean logic level (has its own
+  // pull-up/pull-down) rather than relying on the ESP32's internal one.
+  for (int i = 0; i < DI_CHANNEL_COUNT; i++) {
+    pinMode(DI_PINS[i], INPUT_PULLUP);
+  }
+
+  // Digital Out: driven LOW (off) at boot - the safe default for a
+  // relay/driver module before any configured state is loaded/commanded.
+  for (int i = 0; i < DO_CHANNEL_COUNT; i++) {
+    pinMode(DO_PINS[i], OUTPUT);
+    digitalWrite(DO_PINS[i], LOW);
+  }
+
+  analogReadResolution(12);  // explicit: full 0-4095 range, don't rely on core default
+
   loadCommunicationSettings();
   loadUplinkConfig();
   loadDeviceConfig();
@@ -5088,6 +5758,7 @@ void setup() {
   loadTypes();
   loadSettings();
   loadTcpTargets();
+  loadDigitalIOSettings();
 
   WiFi.mode(WIFI_AP_STA);
 
@@ -5116,10 +5787,12 @@ void setup() {
   server.on("/saveCloud", HTTP_POST, handleSaveCloud, handleCertUpload);
   server.on("/data", HTTP_GET, handleData);
   server.on("/writeCommand", HTTP_POST, handleWriteCommand);
+  server.on("/writeDigitalOut", HTTP_POST, handleWriteDigitalOut);
   server.on("/keylog", HTTP_GET, handleKeyLog);
   server.on("/types", HTTP_GET, handleTypes);
   server.on("/saveTypes", HTTP_POST, handleSaveTypes);
   server.on("/saveTcpTargets", HTTP_POST, handleSaveTcpTargets);
+  server.on("/saveDigitalIO", HTTP_POST, handleSaveDigitalIO);
   server.on("/reset", HTTP_GET, handleReset);
   server.on("/resetTypes", HTTP_GET, handleResetTypes);
 
@@ -5350,6 +6023,47 @@ void drainTcpAckQueue() {
   }
 }
 
+// ===================== Local Digital I/O Polling =====================
+// Plain GPIO reads/writes - no bus transaction, never blocks - so this runs
+// on webTask (Core 0) on its own timer, fully decoupled from the Modbus
+// poll cycle. Never touches modbusTask/Core 1.
+unsigned long lastDigitalIoPollTime = 0;
+#define DIGITAL_IO_POLL_INTERVAL_MS 200
+
+void pollDigitalIO() {
+  if (millis() - lastDigitalIoPollTime < DIGITAL_IO_POLL_INTERVAL_MS) {
+    return;
+  }
+  lastDigitalIoPollTime = millis();
+
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+
+  for (int i = 0; i < DI_CHANNEL_COUNT; i++) {
+    if (!diChannels[i].enabled) {
+      continue;
+    }
+    // Pins are INPUT_PULLUP (see setup()): idle/open reads HIGH, an
+    // opto-isolator's open-collector output pulls it LOW when active.
+    // Inverted here so "value" means "input asserted", not "pin
+    // electrically low" - verify this matches your specific I/O module's
+    // output polarity.
+    diChannels[i].value = (digitalRead(DI_PINS[i]) == LOW);
+    diChannels[i].lastUpdateTime = millis();
+  }
+
+  for (int i = 0; i < AI_CHANNEL_COUNT; i++) {
+    if (!aiChannels[i].enabled) {
+      continue;
+    }
+    int raw = analogRead(AI_PINS[i]);
+    aiChannels[i].rawValue = raw;
+    aiChannels[i].value = (float)raw * aiChannels[i].scale + aiChannels[i].offset;
+    aiChannels[i].lastUpdateTime = millis();
+  }
+
+  xSemaphoreGive(dataMutex);
+}
+
 // ===================== Web / TCP / WiFi Task (Core 0) =====================
 // Web server, TCP push, and WiFi retry - pinned to Core 0 so Core 1 stays
 // dedicated to modbusTask.
@@ -5361,6 +6075,8 @@ void webTask(void *parameter) {
 
     handleUplinkWiFiRetry();
     checkWifiUplinkStatusChange();
+    pollDigitalIO();
+    processDoWriteQueue();
 
     // One-time key-log entry the first time SNTP produces real time, so
     // the field log shows when timestamps switched from uptime to UTC.
