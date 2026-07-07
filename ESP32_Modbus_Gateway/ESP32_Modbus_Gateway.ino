@@ -57,6 +57,17 @@
      a key event if any failed, and every load*() transparently migrates
      a config saved by an older per-key firmware version to the compact
      format on next boot, reclaiming the old keys via preferences.clear().
+   - Write (command) path: a param opts in via writable/min/maxWriteValue
+     (holding registers/coils only - see isWritableArea()). Every source
+     (dashboard /writeCommand, AWS IoT Device Shadow delta) funnels through
+     submitWriteCommand(), which validates and enqueues onto rtuWriteQueue
+     or tcpWriteQueue by transport; modbusTask/tcpPollTask drain their own
+     queue once per cycle (processRtuWriteQueue()/processTcpWriteQueue()),
+     so a write never crosses onto the other task's transport. Shadow
+     writes additionally get a best-effort "reported" ack published by
+     webTask via shadowReportQueue - see queueShadowReport()/
+     drainShadowReportQueue() - never published directly from
+     modbusTask/tcpPollTask, which must not touch the network/TLS stack.
    ====================================================================== */
 
 #include <WiFi.h>
@@ -69,6 +80,11 @@
 // External library: "PubSubClient" by Nick O'Leary, v2.8+ (Arduino Library
 // Manager). v2.8 is required for setBufferSize() at runtime.
 #include <PubSubClient.h>
+// External library: "ArduinoJson" by Benoit Blanchon, v6+ (Arduino Library
+// Manager). Used only to parse small inbound command payloads (AWS IoT
+// Device Shadow deltas) - all outgoing JSON is still hand-built via
+// jsonEscape()/String concatenation, unchanged.
+#include <ArduinoJson.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -241,22 +257,50 @@ struct LogQueueItem {
 };
 
 // ===================== Write Command Queues =====================
-// A write request (from the manual dashboard control now, and MQTT/raw-TCP
-// command channels in a follow-up) is validated and enqueued by
-// submitWriteCommand(), then routed to one of two queues by the target
-// parameter's transport - RTU writes are drained by modbusTask (Core 1,
-// under serialMutex, interleaved with polling); TCP writes are drained by
-// tcpPollTask (Core 0). Keeping them as two separate queues means each
-// task only ever touches its own transport, with no cross-task filtering.
+// A write request (from the manual dashboard control, the AWS IoT Device
+// Shadow delta channel, and a future raw-TCP command channel) is validated
+// and enqueued by submitWriteCommand(), then routed to one of two queues by
+// the target parameter's transport - RTU writes are drained by modbusTask
+// (Core 1, under serialMutex, interleaved with polling); TCP writes are
+// drained by tcpPollTask (Core 0). Keeping them as two separate queues
+// means each task only ever touches its own transport, with no cross-task
+// filtering.
 #define WRITE_QUEUE_LEN 16
+
+#define WRITE_SOURCE_DASHBOARD 0
+#define WRITE_SOURCE_SHADOW 1
+#define WRITE_SOURCE_TCP 2
 
 struct WriteCommand {
   int paramIndex;
   float value;  // engineering-unit value to write
+  uint8_t source;  // WRITE_SOURCE_* - lets the drain functions know whether
+                   // a completed write needs a shadow "reported" ack
 };
 
 QueueHandle_t rtuWriteQueue;
 QueueHandle_t tcpWriteQueue;
+
+// A write drain function (modbusTask/tcpPollTask) can't publish MQTT itself
+// - that would pull TLS/network work onto the real-time core or block on a
+// socket outside webTask's control. Instead it drops a tiny fixed-size item
+// here (non-blocking) whenever a WRITE_SOURCE_SHADOW command completes
+// successfully; webTask drains it and publishes the shadow "reported"
+// update. Best-effort: if this small queue is ever full, that one ack is
+// just dropped - it only affects cloud shadow sync fidelity, never the
+// actual Modbus write, which has already happened.
+#define SHADOW_REPORT_QUEUE_LEN 8
+// Matches STORED_NAME_LEN (param name field length) - kept as its own
+// constant here since that's defined later, alongside the blob storage
+// structs, and this queue item has nothing to do with blob storage.
+#define SHADOW_REPORT_NAME_LEN 32
+
+struct ShadowReportItem {
+  char name[SHADOW_REPORT_NAME_LEN];
+  float value;
+};
+
+QueueHandle_t shadowReportQueue;
 
 // Guards only the RS485_DE_RE pin toggle inside preTransmission()/
 // postTransmission(). This is the single most timing-critical line in the
@@ -338,6 +382,10 @@ struct CloudConfig {
   int port;
   String clientId;
   String topic;
+  // AWS IoT Device Shadow command channel (see getShadowThingName()/
+  // connectMqtt()/mqttCallback()). Reuses clientId as the Thing name -
+  // the UI already documents "Should match the AWS IoT Thing name".
+  bool shadowEnabled;
 };
 
 CloudConfig cloudConfig;
@@ -1415,6 +1463,7 @@ void saveCloudConfig() {
   trackNvsWrite(preferences.putInt("port", cloudConfig.port));
   trackNvsWrite(preferences.putString("cid", cloudConfig.clientId));
   trackNvsWrite(preferences.putString("topic", cloudConfig.topic));
+  trackNvsWrite(preferences.putBool("shadowEn", cloudConfig.shadowEnabled));
 
   preferences.end();
 
@@ -1431,6 +1480,7 @@ void loadCloudConfig() {
   cloudConfig.port = preferences.getInt("port", DEFAULT_MQTT_PORT);
   cloudConfig.clientId = preferences.getString("cid", "");
   cloudConfig.topic = preferences.getString("topic", DEFAULT_MQTT_TOPIC);
+  cloudConfig.shadowEnabled = preferences.getBool("shadowEn", false);
 
   preferences.end();
 
@@ -2403,6 +2453,86 @@ bool sendPayloadTcp(const String &payload) {
   return true;
 }
 
+// ===================== AWS IoT Device Shadow (command channel) =====================
+// Reuses the MQTT client ID as the Thing name - the Cloud settings page
+// already documents "Should match the AWS IoT Thing name / policy", so no
+// separate Thing Name field is needed. Only active when
+// cloudConfig.shadowEnabled is set - see connectMqtt()/mqttCallback().
+#define SHADOW_DELTA_MAX_LEN 512
+
+String getShadowThingName() {
+  if (cloudConfig.clientId.length() > 0) return cloudConfig.clientId;
+  return getDeviceName();
+}
+
+String shadowDeltaTopic() {
+  return "$aws/things/" + getShadowThingName() + "/shadow/update/delta";
+}
+
+String shadowUpdateTopic() {
+  return "$aws/things/" + getShadowThingName() + "/shadow/update";
+}
+
+// PubSubClient's buffer holds one full message (topic+payload) in either
+// direction and never auto-grows mid-message - it must already be large
+// enough for the biggest shadow delta/report before mqttClient.loop() can
+// receive one. sendPayloadMqtt() separately grows the buffer to fit each
+// outgoing telemetry publish; this is just the floor for shadow traffic,
+// applied right after connect so it covers messages that arrive before the
+// first telemetry publish.
+uint16_t shadowMqttBufferFloor() {
+  if (!cloudConfig.shadowEnabled) return 0;
+  uint16_t topicLen = (uint16_t)max(shadowDeltaTopic().length(), shadowUpdateTopic().length());
+  return topicLen + SHADOW_DELTA_MAX_LEN + 64;
+}
+
+// Parses an AWS IoT Device Shadow delta payload
+// ({"state":{"paramName":value,...},...}) and queues a write for each key
+// that matches an existing parameter by name. Unrecognized/non-numeric
+// keys are logged and skipped rather than aborting the rest of the delta.
+void handleShadowDelta(byte *payload, unsigned int length) {
+  if (length == 0 || length > SHADOW_DELTA_MAX_LEN) {
+    logKeyEvent("SHADOW DELTA IGNORED: payload size " + String(length) + " out of bounds");
+    return;
+  }
+
+  DynamicJsonDocument doc(length + 256);
+  DeserializationError err = deserializeJson(doc, payload, length);
+  if (err) {
+    logKeyEvent("SHADOW DELTA PARSE ERROR: " + String(err.c_str()));
+    return;
+  }
+
+  JsonObject state = doc["state"];
+  if (state.isNull()) {
+    return;
+  }
+
+  for (JsonPair kv : state) {
+    String paramName = String(kv.key().c_str());
+
+    if (!kv.value().is<float>()) {
+      logKeyEvent("SHADOW DELTA REJECTED: " + paramName + " is not numeric");
+      continue;
+    }
+
+    int idx = findParamIndexByName(paramName);
+    if (idx < 0) {
+      logKeyEvent("SHADOW DELTA REJECTED: no parameter named '" + paramName + "'");
+      continue;
+    }
+
+    submitWriteCommand(idx, kv.value().as<float>(), WRITE_SOURCE_SHADOW);
+  }
+}
+
+// PubSubClient callback - runs inside mqttClient.loop() on webTask (Core 0).
+// Only the shadow delta topic is ever subscribed today, so no topic
+// dispatch table is needed yet.
+void mqttCallback(char *topic, byte *payload, unsigned int length) {
+  handleShadowDelta(payload, length);
+}
+
 // ===================== MQTT / AWS IoT Uplink =====================
 // Runs entirely on webTask (Core 0), like the raw-TCP path, so a slow TLS
 // handshake can never disturb Modbus polling. A failed attempt backs off
@@ -2472,6 +2602,20 @@ bool connectMqtt() {
   }
 
   logMessage("MQTT OK");
+
+  if (cloudConfig.shadowEnabled) {
+    // Must be sized before subscribing - a delta could arrive on the very
+    // next mqttClient.loop() call, and the buffer never auto-grows mid-message.
+    mqttClient.setBufferSize(shadowMqttBufferFloor());
+
+    String deltaTopic = shadowDeltaTopic();
+    if (mqttClient.subscribe(deltaTopic.c_str())) {
+      logKeyEvent("SHADOW SUBSCRIBED: " + deltaTopic);
+    } else {
+      logKeyEvent("SHADOW SUBSCRIBE FAILED: " + deltaTopic);
+    }
+  }
+
   return true;
 }
 
@@ -2498,8 +2642,11 @@ bool sendPayloadMqtt(const String &payload) {
 
   // PubSubClient's default packet buffer (256 bytes) is far too small for
   // this payload - grow it to fit before every publish (no-op when already
-  // large enough).
+  // large enough). Never shrink below the shadow floor - the client stays
+  // subscribed to the delta topic across publishes, and an inbound delta
+  // must still fit.
   uint16_t needed = payload.length() + cloudConfig.topic.length() + 16;
+  needed = max(needed, shadowMqttBufferFloor());
   if (!mqttClient.setBufferSize(needed)) {
     logMessage("MQTT BUFFER ALLOC FAILED (" + String(needed) + " bytes)");
     return false;
@@ -2639,14 +2786,41 @@ void logModbusStatusChange(int index) {
 #endif
 }
 
+// Case-sensitive lookup by the user-assigned param name, for command
+// channels (shadow, raw-TCP) that address a parameter by name rather than
+// by table index. Returns -1 if no enabled or disabled row matches.
+int findParamIndexByName(const String &name) {
+  int found = -1;
+
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  for (int i = 0; i < paramCount; i++) {
+    if (params[i].name == name) {
+      found = i;
+      break;
+    }
+  }
+  xSemaphoreGive(dataMutex);
+
+  return found;
+}
+
+// Human-readable tag for key-log lines - keeps the WRITE_SOURCE_* routing
+// value as the single source of truth instead of passing a parallel string.
+String writeSourceLabel(uint8_t source) {
+  if (source == WRITE_SOURCE_SHADOW) return "shadow";
+  if (source == WRITE_SOURCE_TCP) return "tcp-cmd";
+  return "dashboard";
+}
+
 // ===================== Write Command Submission =====================
 // Validates a write request against the target parameter's writable flag
 // and optional min/max safety limits, then queues it for whichever task
-// owns that parameter's transport. `source` is just for the key-log line
-// (e.g. "dashboard", later "shadow"/"tcp-cmd"). Returns true if queued.
-bool submitWriteCommand(int paramIndex, float value, const String &source) {
+// owns that parameter's transport. Returns true if queued.
+bool submitWriteCommand(int paramIndex, float value, uint8_t source) {
+  String sourceLabel = writeSourceLabel(source);
+
   if (paramIndex < 0 || paramIndex >= paramCount) {
-    logKeyEvent("WRITE REJECTED (" + source + "): invalid parameter index " + String(paramIndex));
+    logKeyEvent("WRITE REJECTED (" + sourceLabel + "): invalid parameter index " + String(paramIndex));
     return false;
   }
 
@@ -2664,30 +2838,41 @@ bool submitWriteCommand(int paramIndex, float value, const String &source) {
   xSemaphoreGive(dataMutex);
 
   if (!writable) {
-    logKeyEvent("WRITE REJECTED (" + source + "): " + pname + " is not writable");
+    logKeyEvent("WRITE REJECTED (" + sourceLabel + "): " + pname + " is not writable");
     return false;
   }
 
   // maxV > minV is the signal that a limit is actually configured (the
   // default 0/0 means "no limit set" - see the ModbusParam field comment).
   if (maxV > minV && (value < minV || value > maxV)) {
-    logKeyEvent("WRITE REJECTED (" + source + "): " + pname + " value " + String(value, 3) + " outside allowed range [" + String(minV, 3) + ", " + String(maxV, 3) + "]");
+    logKeyEvent("WRITE REJECTED (" + sourceLabel + "): " + pname + " value " + String(value, 3) + " outside allowed range [" + String(minV, 3) + ", " + String(maxV, 3) + "]");
     return false;
   }
 
   WriteCommand cmd;
   cmd.paramIndex = paramIndex;
   cmd.value = value;
+  cmd.source = source;
 
   QueueHandle_t q = (transport == TRANSPORT_TCP) ? tcpWriteQueue : rtuWriteQueue;
 
   if (xQueueSend(q, &cmd, 0) != pdTRUE) {
-    logKeyEvent("WRITE QUEUE FULL (" + source + ") - dropped command for " + pname);
+    logKeyEvent("WRITE QUEUE FULL (" + sourceLabel + ") - dropped command for " + pname);
     return false;
   }
 
-  logKeyEvent("WRITE QUEUED (" + source + "): " + pname + " = " + String(value, 3));
+  logKeyEvent("WRITE QUEUED (" + sourceLabel + "): " + pname + " = " + String(value, 3));
   return true;
+}
+
+// Non-blocking best-effort handoff to webTask - see the ShadowReportItem
+// comment near shadowReportQueue. Called by both drain functions below
+// right after a successful WRITE_SOURCE_SHADOW write.
+void queueShadowReport(const String &name, float value) {
+  ShadowReportItem item;
+  name.toCharArray(item.name, SHADOW_REPORT_NAME_LEN);
+  item.value = value;
+  xQueueSend(shadowReportQueue, &item, 0);
 }
 
 // Converts an engineering-unit write value into the raw register(s)/bit
@@ -2742,6 +2927,10 @@ void processRtuWriteQueue() {
 
     logKeyEvent("WRITE " + String(result == MB_SUCCESS ? "OK" : ("FAILED code " + String(result))) + ": " + pname + " = " + String(cmd.value, 3));
 
+    if (cmd.source == WRITE_SOURCE_SHADOW && result == MB_SUCCESS) {
+      queueShadowReport(pname, cmd.value);
+    }
+
     delay(slaveRecoveryDelayMs);
   }
 }
@@ -2783,6 +2972,10 @@ void processTcpWriteQueue() {
     xSemaphoreGive(dataMutex);
 
     logKeyEvent("WRITE " + String(result == MB_SUCCESS ? "OK" : ("FAILED code " + String(result))) + ": " + pname + " = " + String(cmd.value, 3));
+
+    if (cmd.source == WRITE_SOURCE_SHADOW && result == MB_SUCCESS) {
+      queueShadowReport(pname, cmd.value);
+    }
   }
 }
 
@@ -3745,6 +3938,10 @@ function toggleApSsidField() {
           "<br><small>Should match the AWS IoT Thing name / policy.</small></td></tr>";
   html += "<tr><th>Publish Topic</th><td><input type='text' name='mqttTopic' value='" + htmlEscape(cloudConfig.topic) + "'></td></tr>";
 
+  html += "<tr><th>Device Shadow Commands</th><td><input type='checkbox' name='shadowEnabled'";
+  if (cloudConfig.shadowEnabled) html += " checked";
+  html += "> Enable (subscribes to <code>$aws/things/&lt;Client ID&gt;/shadow/update/delta</code> - writes come from the shadow's <b>desired</b> state, keyed by parameter name)</td></tr>";
+
   // Certs: never echoed back - a blank/empty field keeps the stored value,
   // same pattern as the WiFi password above. Each can be provided either
   // by uploading the file from AWS as-is or by pasting the PEM text; the
@@ -4377,6 +4574,8 @@ void handleSaveCloud() {
     cloudConfig.topic = DEFAULT_MQTT_TOPIC;
   }
 
+  cloudConfig.shadowEnabled = server.hasArg("shadowEnabled");
+
   saveCloudConfig();
 
   // Per slot: uploaded file > pasted text > blank keeps stored value (same
@@ -4536,7 +4735,7 @@ void handleWriteCommand() {
   int paramIndex = server.arg("param").toInt();
   float value = server.arg("value").toFloat();
 
-  bool ok = submitWriteCommand(paramIndex, value, "dashboard");
+  bool ok = submitWriteCommand(paramIndex, value, WRITE_SOURCE_DASHBOARD);
 
   server.send(ok ? 200 : 400, "text/plain", ok ? "queued" : "rejected");
 }
@@ -4572,6 +4771,9 @@ void setup() {
   logQueue = xQueueCreate(LOG_QUEUE_LEN, sizeof(LogQueueItem));
   rtuWriteQueue = xQueueCreate(WRITE_QUEUE_LEN, sizeof(WriteCommand));
   tcpWriteQueue = xQueueCreate(WRITE_QUEUE_LEN, sizeof(WriteCommand));
+  shadowReportQueue = xQueueCreate(SHADOW_REPORT_QUEUE_LEN, sizeof(ShadowReportItem));
+
+  mqttClient.setCallback(mqttCallback);
 
   Serial.begin(115200);
   delay(1000);
@@ -4836,6 +5038,28 @@ void logTask(void *parameter) {
   }
 }
 
+// Publishes a shadow "reported" update for each completed shadow-sourced
+// write - see the shadowReportQueue comment near its declaration. Only
+// webTask touches mqttClient.publish(), so this is the only place that
+// drains this queue.
+void drainShadowReportQueue() {
+  ShadowReportItem item;
+
+  while (xQueueReceive(shadowReportQueue, &item, 0) == pdTRUE) {
+    if (!cloudConfig.shadowEnabled || !mqttClient.connected()) {
+      continue;  // shadow turned off / uplink dropped since this was queued
+    }
+
+    String payload = "{\"state\":{\"reported\":{\"" + jsonEscape(String(item.name)) + "\":" + String(item.value, 3) + "}}}";
+
+    if (mqttClient.publish(shadowUpdateTopic().c_str(), payload.c_str())) {
+      logMessage("SHADOW REPORTED: " + String(item.name) + " = " + String(item.value, 3));
+    } else {
+      logKeyEvent("SHADOW REPORT PUBLISH FAILED: " + String(item.name));
+    }
+  }
+}
+
 // ===================== Web / TCP / WiFi Task (Core 0) =====================
 // Web server, TCP push, and WiFi retry - pinned to Core 0 so Core 1 stays
 // dedicated to modbusTask.
@@ -4866,6 +5090,7 @@ void webTask(void *parameter) {
       // Services MQTT keepalive pings and inbound packets between publishes.
       if (mqttClient.connected()) {
         mqttClient.loop();
+        drainShadowReportQueue();
       }
       checkMqttUplinkStatusChange();
     } else {
