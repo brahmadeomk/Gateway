@@ -59,15 +59,25 @@
      format on next boot, reclaiming the old keys via preferences.clear().
    - Write (command) path: a param opts in via writable/min/maxWriteValue
      (holding registers/coils only - see isWritableArea()). Every source
-     (dashboard /writeCommand, AWS IoT Device Shadow delta) funnels through
-     submitWriteCommand(), which validates and enqueues onto rtuWriteQueue
-     or tcpWriteQueue by transport; modbusTask/tcpPollTask drain their own
-     queue once per cycle (processRtuWriteQueue()/processTcpWriteQueue()),
-     so a write never crosses onto the other task's transport. Shadow
-     writes additionally get a best-effort "reported" ack published by
-     webTask via shadowReportQueue - see queueShadowReport()/
-     drainShadowReportQueue() - never published directly from
-     modbusTask/tcpPollTask, which must not touch the network/TLS stack.
+     (dashboard /writeCommand, AWS IoT Device Shadow delta, raw-TCP command
+     line) funnels through submitWriteCommand(), which validates and
+     enqueues onto rtuWriteQueue or tcpWriteQueue by transport;
+     modbusTask/tcpPollTask drain their own queue once per cycle
+     (processRtuWriteQueue()/processTcpWriteQueue()), so a write never
+     crosses onto the other task's transport. Shadow writes get a
+     best-effort "reported" update on success only (queueShadowReport()/
+     drainShadowReportQueue()); raw-TCP writes get a JSON ack either way
+     (success or failure, queueTcpAck()/drainTcpAckQueue()/
+     sendTcpAckLine()) since that peer has no other channel to observe the
+     result on. Both are only ever published/sent from webTask, never
+     directly from modbusTask/tcpPollTask, which must not touch the
+     network/TLS stack.
+   - Raw TCP command channel: reuses the existing outbound tcpClient
+     connection (the same one sendPayloadTcp() pushes telemetry on) instead
+     of a separate listening socket - the master can send back newline-
+     framed JSON commands ({"param":"Name","value":42}), read by
+     pollTcpCommands() once per webTask cycle. Only active when
+     cloudConfig.mode == UPLINK_MODE_TCP.
    ====================================================================== */
 
 #include <WiFi.h>
@@ -275,7 +285,8 @@ struct WriteCommand {
   int paramIndex;
   float value;  // engineering-unit value to write
   uint8_t source;  // WRITE_SOURCE_* - lets the drain functions know whether
-                   // a completed write needs a shadow "reported" ack
+                   // a completed write needs a shadow "reported" update or
+                   // a raw-TCP command ack
 };
 
 QueueHandle_t rtuWriteQueue;
@@ -301,6 +312,23 @@ struct ShadowReportItem {
 };
 
 QueueHandle_t shadowReportQueue;
+
+// Same idea as shadowReportQueue, but for the raw-TCP command channel (see
+// handleTcpCommandLine()/pollTcpCommands()): unlike shadow (which only acks
+// success, leaving a failure's delta pending for visibility in the AWS
+// console), a raw-TCP peer has no other channel, so every completed
+// WRITE_SOURCE_TCP command gets an ack either way - hence carrying the
+// result code here.
+#define TCP_ACK_QUEUE_LEN 8
+#define TCP_ACK_NAME_LEN 32
+
+struct TcpAckItem {
+  char name[TCP_ACK_NAME_LEN];
+  float value;
+  uint8_t result;  // MB_SUCCESS or an MB_ERR_*/exception code
+};
+
+QueueHandle_t tcpAckQueue;
 
 // Guards only the RS485_DE_RE pin toggle inside preTransmission()/
 // postTransmission(). This is the single most timing-critical line in the
@@ -2472,6 +2500,104 @@ bool sendPayloadTcp(const String &payload) {
   return true;
 }
 
+// ===================== Raw TCP Command Channel =====================
+// Bidirectional use of the same outbound tcpClient connection used by
+// sendPayloadTcp() above - no separate listening socket. The same peer this
+// gateway pushes telemetry to can send newline-framed JSON commands back on
+// the connection ({"param":"ParamName","value":42}); each is acked, also
+// newline-framed, on the same socket. Only relevant when cloudConfig.mode
+// == UPLINK_MODE_TCP - see pollTcpCommands()/webTask().
+#define TCP_CMD_MAX_LEN 512
+
+String tcpCmdBuffer;
+
+// Sends one newline-framed JSON ack line back to the connected TCP peer.
+// `reason` is only for the immediate-rejection path (invalid/unknown param,
+// submitWriteCommand() validation failure) where there's no Modbus result
+// code yet (code is sent as 0xFF, the same "never written" sentinel used
+// elsewhere); the delayed completion ack (queued via tcpAckQueue) passes
+// reason="" and the real Modbus result code instead.
+void sendTcpAckLine(const String &name, float value, bool ok, uint8_t code, const String &reason) {
+  if (!tcpClient.connected()) {
+    return;
+  }
+
+  String line = "{\"ack\":\"" + jsonEscape(name) + "\",\"value\":" + String(value, 3) + ",\"ok\":" + (ok ? "true" : "false") + ",\"code\":" + String(code);
+  if (reason.length() > 0) {
+    line += ",\"reason\":\"" + jsonEscape(reason) + "\"";
+  }
+  line += "}\n";
+
+  tcpClient.write((const uint8_t *)line.c_str(), line.length());
+}
+
+// Parses one inbound command line and queues a write via the same
+// validated submitWriteCommand() path as the dashboard/shadow channels.
+// Immediate rejections (parse error, unknown param, submitWriteCommand()
+// validation failure) are acked right away; a successfully queued
+// command's real result is acked later, once modbusTask/tcpPollTask
+// actually executes it - see queueTcpAck()/drainTcpAckQueue().
+void handleTcpCommandLine(const String &line) {
+  DynamicJsonDocument doc(line.length() + 128);
+  DeserializationError err = deserializeJson(doc, line);
+  if (err) {
+    logKeyEvent("TCP CMD PARSE ERROR: " + String(err.c_str()));
+    return;
+  }
+
+  if (!doc["param"].is<const char *>() || !doc["value"].is<float>()) {
+    logKeyEvent("TCP CMD REJECTED: malformed command (missing param/value)");
+    return;
+  }
+
+  String paramName = doc["param"].as<String>();
+  float value = doc["value"].as<float>();
+
+  int idx = findParamIndexByName(paramName);
+  if (idx < 0) {
+    logKeyEvent("TCP CMD REJECTED: no parameter named '" + paramName + "'");
+    sendTcpAckLine(paramName, value, false, 0xFF, "unknown parameter");
+    return;
+  }
+
+  if (!submitWriteCommand(idx, value, WRITE_SOURCE_TCP)) {
+    // submitWriteCommand() already logged the specific reason.
+    sendTcpAckLine(paramName, value, false, 0xFF, "rejected - see Status Log");
+  }
+  // else: queued OK - the real ack comes later via tcpAckQueue.
+}
+
+// Drains any bytes currently buffered on tcpClient into newline-framed
+// command lines - never blocks (only reads what's already available), so
+// it's safe to call every webTask iteration alongside the telemetry push.
+void pollTcpCommands() {
+  if (!tcpClient.connected()) {
+    tcpCmdBuffer = "";  // discard any partial line from a dropped connection
+    return;
+  }
+
+  while (tcpClient.available() > 0) {
+    char c = (char)tcpClient.read();
+
+    if (c == '\n') {
+      tcpCmdBuffer.trim();
+      if (tcpCmdBuffer.length() > 0) {
+        handleTcpCommandLine(tcpCmdBuffer);
+      }
+      tcpCmdBuffer = "";
+    } else if (c != '\r') {
+      if (tcpCmdBuffer.length() < TCP_CMD_MAX_LEN) {
+        tcpCmdBuffer += c;
+      } else {
+        // No newline in sight - drop it so a malformed peer can't grow
+        // this buffer unbounded.
+        logKeyEvent("TCP CMD IGNORED: line exceeded " + String(TCP_CMD_MAX_LEN) + " bytes");
+        tcpCmdBuffer = "";
+      }
+    }
+  }
+}
+
 // ===================== AWS IoT Device Shadow (command channel) =====================
 // Reuses the MQTT client ID as the Thing name - the Cloud settings page
 // already documents "Should match the AWS IoT Thing name / policy", so no
@@ -2894,6 +3020,17 @@ void queueShadowReport(const String &name, float value) {
   xQueueSend(shadowReportQueue, &item, 0);
 }
 
+// Same non-blocking best-effort handoff, for a completed WRITE_SOURCE_TCP
+// write - called by both drain functions below regardless of the result,
+// since (unlike shadow) the raw-TCP peer needs an ack either way.
+void queueTcpAck(const String &name, float value, uint8_t result) {
+  TcpAckItem item;
+  name.toCharArray(item.name, TCP_ACK_NAME_LEN);
+  item.value = value;
+  item.result = result;
+  xQueueSend(tcpAckQueue, &item, 0);
+}
+
 // Converts an engineering-unit write value into the raw register(s)/bit
 // for the wire, per the target parameter's area/type - shared by both
 // drain functions below so the conversion rule lives in one place.
@@ -2948,6 +3085,8 @@ void processRtuWriteQueue() {
 
     if (cmd.source == WRITE_SOURCE_SHADOW && result == MB_SUCCESS) {
       queueShadowReport(pname, cmd.value);
+    } else if (cmd.source == WRITE_SOURCE_TCP) {
+      queueTcpAck(pname, cmd.value, result);
     }
 
     delay(slaveRecoveryDelayMs);
@@ -2994,6 +3133,8 @@ void processTcpWriteQueue() {
 
     if (cmd.source == WRITE_SOURCE_SHADOW && result == MB_SUCCESS) {
       queueShadowReport(pname, cmd.value);
+    } else if (cmd.source == WRITE_SOURCE_TCP) {
+      queueTcpAck(pname, cmd.value, result);
     }
   }
 }
@@ -3957,7 +4098,8 @@ function toggleApSsidField() {
   html += "<tr><th>WiFi SSID</th><td><input type='text' name='ssid' value='" + htmlEscape(uplinkConfig.ssid) + "'></td></tr>";
   html += "<tr><th>WiFi Password</th><td><input type='password' name='password' placeholder='Leave blank to keep unchanged'></td></tr>";
   html += "<tr><th>Master IP</th><td><input type='text' name='ip' value='" + htmlEscape(uplinkConfig.serverIP) + "'></td></tr>";
-  html += "<tr><th>Master Port</th><td><input type='number' name='port' value='" + String(uplinkConfig.port) + "'></td></tr>";
+  html += "<tr><th>Master Port</th><td><input type='number' name='port' value='" + String(uplinkConfig.port) + "'>"
+          "<br><small>When Uplink Mode below is Raw TCP, this connection is bidirectional: the master can send newline-framed JSON commands back, e.g. <code>{\"param\":\"Name\",\"value\":42}</code>, and gets a JSON ack (also newline-framed) in reply.</small></td></tr>";
 
   html += "<tr><th>On-Premise NTP Server</th><td><input type='text' name='ntpServer' maxlength='" + String(NTP_SERVER_MAX_LEN - 1) + "' placeholder='Optional, e.g. 192.168.1.10 or ntp.local' value='" + htmlEscape(uplinkConfig.ntpServer) + "'>"
           "<br><small>Tried first for time sync; falls back to public NTP (" + String(NTP_SERVER_1) + "), then uptime-based timestamps. Leave blank to use public NTP only.</small></td></tr>";
@@ -4842,6 +4984,7 @@ void setup() {
   rtuWriteQueue = xQueueCreate(WRITE_QUEUE_LEN, sizeof(WriteCommand));
   tcpWriteQueue = xQueueCreate(WRITE_QUEUE_LEN, sizeof(WriteCommand));
   shadowReportQueue = xQueueCreate(SHADOW_REPORT_QUEUE_LEN, sizeof(ShadowReportItem));
+  tcpAckQueue = xQueueCreate(TCP_ACK_QUEUE_LEN, sizeof(TcpAckItem));
 
   mqttClient.setCallback(mqttCallback);
 
@@ -5130,6 +5273,17 @@ void drainShadowReportQueue() {
   }
 }
 
+// Sends a completion ack for each finished WRITE_SOURCE_TCP command - see
+// the TcpAckItem comment near tcpAckQueue. Only webTask touches tcpClient,
+// so this is the only place that drains this queue.
+void drainTcpAckQueue() {
+  TcpAckItem item;
+
+  while (xQueueReceive(tcpAckQueue, &item, 0) == pdTRUE) {
+    sendTcpAckLine(String(item.name), item.value, item.result == MB_SUCCESS, item.result, "");
+  }
+}
+
 // ===================== Web / TCP / WiFi Task (Core 0) =====================
 // Web server, TCP push, and WiFi retry - pinned to Core 0 so Core 1 stays
 // dedicated to modbusTask.
@@ -5165,6 +5319,8 @@ void webTask(void *parameter) {
       checkMqttUplinkStatusChange();
     } else {
       checkTcpUplinkStatusChange();
+      pollTcpCommands();
+      drainTcpAckQueue();
     }
 
     vTaskDelay(pdMS_TO_TICKS(1));
