@@ -75,9 +75,12 @@
    - Raw TCP command channel: reuses the existing outbound tcpClient
      connection (the same one sendPayloadTcp() pushes telemetry on) instead
      of a separate listening socket - the master can send back newline-
-     framed JSON commands ({"param":"Name","value":42}), read by
-     pollTcpCommands() once per webTask cycle. Only active when
-     cloudConfig.mode == UPLINK_MODE_TCP.
+     framed JSON commands, read by pollTcpCommands() once per webTask
+     cycle: a write ({"param":"Name","value":42}, queued/acked) or an
+     on-demand read ({"query":"Name"}, answered immediately by
+     sendTcpQueryResponse() - separate from the periodic all-params
+     telemetry broadcast, which keeps flowing regardless). Only active
+     when cloudConfig.mode == UPLINK_MODE_TCP.
    ====================================================================== */
 
 #include <WiFi.h>
@@ -2373,6 +2376,19 @@ unsigned long getTimestamp() {
   return millis() / 1000;
 }
 
+// Shared by the periodic telemetry payload (buildTcpJson()) and the
+// on-demand raw-TCP query response (sendTcpQueryResponse()), so both report
+// a param's status the same way. Caller must already hold dataMutex.
+String paramStatusText(int i) {
+  if (!params[i].enabled) {
+    return "Disabled";
+  }
+  if (params[i].valid) {
+    return "OK";
+  }
+  return "Disconnected";
+}
+
 String buildTcpJson() {
   String json = "{";
   json.reserve(128 + paramCount * 96);  // avoid repeated reallocation while appending below
@@ -2393,16 +2409,6 @@ String buildTcpJson() {
 
     String deviceId = String(params[i].slaveId);
 
-    String statusText;
-
-    if (!params[i].enabled) {
-      statusText = "Disabled";
-    } else if (params[i].valid) {
-      statusText = "OK";
-    } else {
-      statusText = "Disconnected";
-    }
-
     json += "{";
     json += "\"sensor_id\":\"" + jsonEscape(deviceId) + "\",";
     json += "\"sensor_name\":\"" + jsonEscape(params[i].name) + "\",";
@@ -2413,7 +2419,7 @@ String buildTcpJson() {
       json += "\"value\":null,";
     }
 
-    json += "\"status\":\"" + statusText + "\"";
+    json += "\"status\":\"" + paramStatusText(i) + "\"";
     json += "}";
   }
 
@@ -2541,12 +2547,57 @@ void sendTcpAckLine(const String &name, float value, bool ok, uint8_t code, cons
   tcpClient.write((const uint8_t *)line.c_str(), line.length());
 }
 
-// Parses one inbound command line and queues a write via the same
-// validated submitWriteCommand() path as the dashboard/shadow channels.
-// Immediate rejections (parse error, unknown param, submitWriteCommand()
-// validation failure) are acked right away; a successfully queued
-// command's real result is acked later, once modbusTask/tcpPollTask
-// actually executes it - see queueTcpAck()/drainTcpAckQueue().
+// On-demand read for one parameter, e.g. {"query":"SetpointTemp"} ->
+// {"query":"SetpointTemp","value":72.5,"status":"OK","ageMs":1500} - unlike
+// the periodic telemetry broadcast (buildTcpJson(), all params, every poll
+// cycle, unprompted), this replies about exactly the one parameter asked
+// for, on request. "ageMs" is how long ago that value was last updated by a
+// poll; omitted (along with value) if it's never been successfully polled.
+void sendTcpQueryResponse(const String &name) {
+  if (!tcpClient.connected()) {
+    return;
+  }
+
+  int idx = findParamIndexByName(name);
+
+  if (idx < 0) {
+    logKeyEvent("TCP QUERY REJECTED: no parameter named '" + name + "'");
+    String line = "{\"query\":\"" + jsonEscape(name) + "\",\"status\":\"ERR\",\"reason\":\"unknown parameter\"}\n";
+    tcpClient.write((const uint8_t *)line.c_str(), line.length());
+    return;
+  }
+
+  bool valid;
+  float value;
+  unsigned long lastUpdateTime;
+  String statusText;
+
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+  valid = params[idx].valid;
+  value = params[idx].value;
+  lastUpdateTime = params[idx].lastUpdateTime;
+  statusText = paramStatusText(idx);
+  xSemaphoreGive(dataMutex);
+
+  String line = "{\"query\":\"" + jsonEscape(name) + "\",\"value\":";
+  line += valid ? String(value, 3) : "null";
+  line += ",\"status\":\"" + statusText + "\"";
+  if (lastUpdateTime > 0) {
+    line += ",\"ageMs\":" + String(millis() - lastUpdateTime);
+  }
+  line += "}\n";
+
+  tcpClient.write((const uint8_t *)line.c_str(), line.length());
+}
+
+// Parses one inbound command line - either a read {"query":"Name"} (answered
+// immediately by sendTcpQueryResponse()) or a write
+// {"param":"Name","value":N} queued via the same validated
+// submitWriteCommand() path as the dashboard/shadow channels. Immediate
+// write rejections (parse error, unknown param, submitWriteCommand()
+// validation failure) are acked right away; a successfully queued write's
+// real result is acked later, once modbusTask/tcpPollTask actually
+// executes it - see queueTcpAck()/drainTcpAckQueue().
 void handleTcpCommandLine(const String &line) {
   DynamicJsonDocument doc(line.length() + 128);
   DeserializationError err = deserializeJson(doc, line);
@@ -2555,8 +2606,13 @@ void handleTcpCommandLine(const String &line) {
     return;
   }
 
+  if (doc["query"].is<const char *>()) {
+    sendTcpQueryResponse(doc["query"].as<String>());
+    return;
+  }
+
   if (!doc["param"].is<const char *>() || !isJsonNumber(doc["value"])) {
-    logKeyEvent("TCP CMD REJECTED: malformed command (missing param/value)");
+    logKeyEvent("TCP CMD REJECTED: malformed command (missing param/value, or query)");
     return;
   }
 
@@ -4109,7 +4165,7 @@ function toggleApSsidField() {
   html += "<tr><th>WiFi Password</th><td><input type='password' name='password' placeholder='Leave blank to keep unchanged'></td></tr>";
   html += "<tr><th>Master IP</th><td><input type='text' name='ip' value='" + htmlEscape(uplinkConfig.serverIP) + "'></td></tr>";
   html += "<tr><th>Master Port</th><td><input type='number' name='port' value='" + String(uplinkConfig.port) + "'>"
-          "<br><small>When Uplink Mode below is Raw TCP, this connection is bidirectional: the master can send newline-framed JSON commands back, e.g. <code>{\"param\":\"Name\",\"value\":42}</code>, and gets a JSON ack (also newline-framed) in reply.</small></td></tr>";
+          "<br><small>When Uplink Mode below is Raw TCP, this connection is bidirectional: the master can send newline-framed JSON commands back - write: <code>{\"param\":\"Name\",\"value\":42}</code> (acked), or on-demand read: <code>{\"query\":\"Name\"}</code> (answered immediately, separate from the periodic telemetry broadcast).</small></td></tr>";
 
   html += "<tr><th>On-Premise NTP Server</th><td><input type='text' name='ntpServer' maxlength='" + String(NTP_SERVER_MAX_LEN - 1) + "' placeholder='Optional, e.g. 192.168.1.10 or ntp.local' value='" + htmlEscape(uplinkConfig.ntpServer) + "'>"
           "<br><small>Tried first for time sync; falls back to public NTP (" + String(NTP_SERVER_1) + "), then uptime-based timestamps. Leave blank to use public NTP only.</small></td></tr>";
