@@ -2500,6 +2500,16 @@ bool sendPayloadTcp(const String &payload) {
   return true;
 }
 
+// ArduinoJson quirk (documented in their own FAQ): is<float>() alone does
+// NOT reliably detect a JSON number written without a decimal point (e.g.
+// a plain `72` vs `72.0`) - it can come back false for integer literals,
+// which silently rejected every whole-number command as "malformed".
+// Checking is<long>() too catches both forms. Shared by both inbound
+// command parsers below (raw-TCP, shadow delta).
+bool isJsonNumber(JsonVariantConst v) {
+  return v.is<float>() || v.is<long>();
+}
+
 // ===================== Raw TCP Command Channel =====================
 // Bidirectional use of the same outbound tcpClient connection used by
 // sendPayloadTcp() above - no separate listening socket. The same peer this
@@ -2545,7 +2555,7 @@ void handleTcpCommandLine(const String &line) {
     return;
   }
 
-  if (!doc["param"].is<const char *>() || !doc["value"].is<float>()) {
+  if (!doc["param"].is<const char *>() || !isJsonNumber(doc["value"])) {
     logKeyEvent("TCP CMD REJECTED: malformed command (missing param/value)");
     return;
   }
@@ -2656,7 +2666,7 @@ void handleShadowDelta(byte *payload, unsigned int length) {
   for (JsonPair kv : state) {
     String paramName = String(kv.key().c_str());
 
-    if (!kv.value().is<float>()) {
+    if (!isJsonNumber(kv.value())) {
       logKeyEvent("SHADOW DELTA REJECTED: " + paramName + " is not numeric");
       continue;
     }
