@@ -83,17 +83,26 @@
      when cloudConfig.mode == UPLINK_MODE_TCP.
    - Local Digital I/O: 4 Digital In (D7-D10), 4 Digital Out (D11-D13,A4),
      4 Analog In (A0-A3) - plain GPIO, entirely independent of the Modbus
-     buses (no slave ID/register address). D5/D6 are reserved, unused, for
-     a future Serial2. Polled/drained on webTask (Core 0) on its own timer
-     (pollDigitalIO()) - never on modbusTask/Core 1, since these reads
-     never need to be, but keeping Core 1 exclusive to RS485 is the one
-     invariant this whole program is built around. Digital Out reuses the
-     Modbus write path's shape: submitDoWriteCommand() -> doWriteQueue ->
-     processDoWriteQueue() (drained on webTask, not a dedicated task, since
-     digitalWrite() can't block), with the same WRITE_SOURCE_* tags - so
-     Dashboard/AWS Shadow/raw-TCP can all address a DO channel by name,
-     falling back from findParamIndexByName() to findDoChannelIndexByName()
-     wherever a command name doesn't match a Modbus param.
+     buses (no slave ID/register address). Polled/drained on webTask
+     (Core 0) on its own timer (pollDigitalIO()) - never on modbusTask/
+     Core 1, since these reads never need to be, but keeping Core 1
+     exclusive to RS485 is the one invariant this whole program is built
+     around. Digital Out reuses the Modbus write path's shape:
+     submitDoWriteCommand() -> doWriteQueue -> processDoWriteQueue()
+     (drained on webTask, not a dedicated task, since digitalWrite() can't
+     block), with the same WRITE_SOURCE_* tags - so Dashboard/AWS Shadow/
+     raw-TCP can all address a DO channel by name, falling back from
+     findParamIndexByName() to findDoChannelIndexByName() wherever a
+     command name doesn't match a Modbus param.
+   - Cellular modem (SIM7600G-H): status monitoring only for now (SIM/
+     network registration/signal quality, visible on the Dashboard and in
+     the Status Log) - not yet wired into the uplink data path, no
+     TCP/MQTT-over-cellular, no WiFi/cellular failover. UART AT command
+     interface on D5(RX)/D6(TX) via Serial2, PWRKEY power-on pulse on A5,
+     driven by TinyGSM. Runs on its own dedicated task (cellularTask,
+     Core 0) because modem.init()/testAT() etc. can block for several
+     seconds - long enough that running it inline on webTask would stall
+     the web UI and every other uplink alongside it.
    ====================================================================== */
 
 #include <WiFi.h>
@@ -111,6 +120,13 @@
 // Device Shadow deltas) - all outgoing JSON is still hand-built via
 // jsonEscape()/String concatenation, unchanged.
 #include <ArduinoJson.h>
+// External library: "TinyGSM" by Volodymyr Shymanskyy, v0.11+ (Arduino
+// Library Manager). Drives the SIM7600G-H cellular modem over its UART AT
+// command interface - handles power-on handshake, SIM/network status
+// queries, and (later) a Client-compatible TCP/TLS socket, all far more
+// robustly than a hand-rolled AT parser would.
+#define TINY_GSM_MODEM_SIM7600
+#include <TinyGsmClient.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -196,12 +212,15 @@ const char* AP_PASSWORD = "12345678";
 #define TXD2 D3
 #define RS485_DE_RE D4
 
-// ===================== Reserved for future Serial2 =====================
-// Not used by any code yet - reserved so a future second UART (e.g. a
-// SIM7600G cellular modem's AT command interface, or a second RS232/RS485
-// device) has known-free pins instead of colliding with Digital I/O below.
+// ===================== Cellular Modem (SIM7600G-H) Pins =====================
+// UART AT command interface (not the module's USB port) - ESP32 ships two
+// remappable HardwareSerial instances beyond USB-CDC; Serial1 is RS485
+// above, so the modem gets Serial2. A5 drives PWRKEY (power-on pulse - see
+// powerOnModem()); A6/A7 stay free for RESET/STATUS if ever needed.
 #define SERIAL2_RX_PIN D5
 #define SERIAL2_TX_PIN D6
+#define MODEM_PWRKEY_PIN A5
+#define MODEM_BAUD 115200
 
 // ===================== Digital I/O Pins =====================
 // Local GPIO only - no Modbus/RS485/TCP transaction involved, so polling
@@ -278,6 +297,12 @@ WiFiClient tcpClient;
 WiFiClientSecure tlsClient;
 PubSubClient mqttClient(tlsClient);
 
+// Cellular modem (SIM7600G-H) - status monitoring only in this pass, not
+// yet wired into the uplink data path (no TCP/MQTT-over-cellular, no
+// failover). See cellularTask()/CellularStatus.
+HardwareSerial SerialAT(2);
+TinyGsm modem(SerialAT);
+
 // ===================== Timers =====================
 unsigned long lastSummaryPrintTime = 0;
 unsigned long lastWifiAttempt = 0;
@@ -287,15 +312,38 @@ unsigned long lastMqttAttempt = 0;
 // dataMutex: params[]/typeList[] (webTask writes, modbusTask reads/writes).
 // logMutex: debugLogs/keyLog, mainly guarding webTask's keyLog[] reads.
 // serialMutex: the RS485 UART, so settings can't change mid-transaction.
+// cellularMutex: cellularStatus, kept separate from dataMutex since it's
+// written by its own dedicated task (cellularTask), not webTask/modbusTask.
 // pollCompleteSem/tcpSendDoneSem: two-way handshake so each cycle's TCP
 // push finishes (or is skipped) before the next poll cycle starts.
 SemaphoreHandle_t dataMutex;
 SemaphoreHandle_t logMutex;
 SemaphoreHandle_t serialMutex;
+SemaphoreHandle_t cellularMutex;
 SemaphoreHandle_t pollCompleteSem;
 SemaphoreHandle_t tcpSendDoneSem;
 TaskHandle_t modbusTaskHandle;
 TaskHandle_t tcpPollTaskHandle;
+TaskHandle_t cellularTaskHandle;
+
+// ===================== Cellular Modem Status =====================
+// Written only by cellularTask; read by webTask for the Dashboard/data
+// endpoint. registrationStatus/operatorName are the raw AT+CREG/AT+COPS
+// results turned into something readable - see cellularTask().
+#define CELLULAR_TASK_CORE 0
+#define CELLULAR_TASK_PRIORITY 1
+#define CELLULAR_TASK_STACK 4096
+
+struct CellularStatus {
+  bool modemResponding;
+  bool simReady;
+  bool networkRegistered;
+  int signalQuality;  // AT+CSQ raw value: 0-31 (higher = better), 99 = unknown
+  String operatorName;
+  unsigned long lastUpdateTime;
+};
+
+CellularStatus cellularStatus;
 
 // Carries log entries from any task to logTask (Core 0), which does the
 // actual Serial/String/keyLog work off the real-time core.
@@ -4002,6 +4050,44 @@ void handleRoot() {
   }
   html += "</div>";
 
+  // Status monitoring only (see cellularTask()) - not yet part of the
+  // uplink data path, so this box is informational, independent of the
+  // WiFi/MQTT/TCP status above.
+  {
+    bool modemResponding, simReady, networkRegistered;
+    int signalQuality;
+    String operatorName;
+    unsigned long lastUpdateTime;
+
+    xSemaphoreTake(cellularMutex, portMAX_DELAY);
+    modemResponding = cellularStatus.modemResponding;
+    simReady = cellularStatus.simReady;
+    networkRegistered = cellularStatus.networkRegistered;
+    signalQuality = cellularStatus.signalQuality;
+    operatorName = cellularStatus.operatorName;
+    lastUpdateTime = cellularStatus.lastUpdateTime;
+    xSemaphoreGive(cellularMutex);
+
+    html += "<div class='box'>";
+    html += "<b>Cellular Modem (SIM7600G-H):</b> ";
+
+    if (lastUpdateTime == 0) {
+      html += "Initializing...";
+    } else if (!modemResponding) {
+      html += "Not Responding (check wiring/power)";
+    } else {
+      html += "<br><b>SIM:</b> " + String(simReady ? "Ready" : "Not Ready");
+      html += "<br><b>Network:</b> " + String(networkRegistered ? ("Registered (" + operatorName + ")") : "Not Registered");
+      if (signalQuality >= 0 && signalQuality <= 31) {
+        html += "<br><b>Signal:</b> " + String(signalQuality) + "/31";
+      } else {
+        html += "<br><b>Signal:</b> Unknown";
+      }
+    }
+
+    html += "</div>";
+  }
+
   html += R"rawliteral(
 <div class="box">
 <h2>Dashboard</h2>
@@ -5696,6 +5782,7 @@ void setup() {
   dataMutex = xSemaphoreCreateMutex();
   logMutex = xSemaphoreCreateMutex();
   serialMutex = xSemaphoreCreateMutex();
+  cellularMutex = xSemaphoreCreateMutex();
   pollCompleteSem = xSemaphoreCreateBinary();
   tcpSendDoneSem = xSemaphoreCreateBinary();
   logQueue = xQueueCreate(LOG_QUEUE_LEN, sizeof(LogQueueItem));
@@ -5835,6 +5922,19 @@ void setup() {
     TCP_POLL_TASK_CORE);
 
   logKeyEvent("MODBUS TCP POLLING STARTED (core " + String(TCP_POLL_TASK_CORE) + ")");
+
+  // Cellular modem status monitoring - own task since modem AT commands
+  // can block for seconds at a time (see cellularTask()'s comment).
+  xTaskCreatePinnedToCore(
+    cellularTask,
+    "CellularTask",
+    CELLULAR_TASK_STACK,
+    NULL,
+    CELLULAR_TASK_PRIORITY,
+    &cellularTaskHandle,
+    CELLULAR_TASK_CORE);
+
+  logKeyEvent("CELLULAR MODEM TASK STARTED (core " + String(CELLULAR_TASK_CORE) + ")");
 }
 
 // ===================== Summary Debug =====================
@@ -6062,6 +6162,93 @@ void pollDigitalIO() {
   }
 
   xSemaphoreGive(dataMutex);
+}
+
+// ===================== Cellular Modem (SIM7600G-H) =====================
+// Status monitoring only in this pass - proves the UART/AT link and power
+// sequencing work before anything is built on top (TCP/MQTT-over-cellular,
+// WiFi/cellular failover). Runs on its own dedicated task, NOT webTask,
+// because modem.init()/testAT() etc. can block for several seconds each -
+// stalling webTask that long would stall the web UI, MQTT/TCP uplink
+// servicing, and Digital I/O polling right along with it.
+#define MODEM_PWRKEY_PULSE_MS 1000
+#define MODEM_BOOT_WAIT_MS 10000
+#define CELLULAR_POLL_INTERVAL_MS 15000
+
+// PWRKEY pulse per the SIM7600 series' usual convention: briefly pull LOW
+// to trigger power-on, then release. Idle level, pulse polarity, and pulse
+// duration all vary a bit by board revision - verify against your specific
+// SIM7600G-H board's documentation if the modem never responds.
+void powerOnModem() {
+  pinMode(MODEM_PWRKEY_PIN, OUTPUT);
+  digitalWrite(MODEM_PWRKEY_PIN, HIGH);
+  delay(100);
+  digitalWrite(MODEM_PWRKEY_PIN, LOW);
+  delay(MODEM_PWRKEY_PULSE_MS);
+  digitalWrite(MODEM_PWRKEY_PIN, HIGH);
+
+  logMessage("CELLULAR MODEM POWER-ON PULSE SENT - waiting for boot");
+  delay(MODEM_BOOT_WAIT_MS);
+}
+
+void cellularTask(void *parameter) {
+  SerialAT.begin(MODEM_BAUD, SERIAL_8N1, SERIAL2_RX_PIN, SERIAL2_TX_PIN);
+
+  powerOnModem();
+
+  bool everInitialized = false;
+
+  for (;;) {
+    if (!everInitialized) {
+      logKeyEvent("CELLULAR MODEM INIT - sending AT handshake");
+
+      if (modem.testAT(10000)) {
+        logKeyEvent("CELLULAR MODEM RESPONDING");
+        modem.init();
+        everInitialized = true;
+      } else {
+        logKeyEvent("CELLULAR MODEM NOT RESPONDING - check wiring/power, retrying");
+        vTaskDelay(pdMS_TO_TICKS(10000));
+        continue;
+      }
+    }
+
+    bool responding = modem.testAT(3000);
+    bool simReady = responding && (modem.getSimStatus() == SIM_READY);
+    bool registered = false;
+    int signal = 99;
+    String opName = "";
+
+    if (simReady) {
+      registered = modem.isNetworkConnected();
+      signal = modem.getSignalQuality();
+      if (registered) {
+        opName = modem.getOperator();
+      }
+    }
+
+    bool wasSimReady, wasRegistered;
+
+    xSemaphoreTake(cellularMutex, portMAX_DELAY);
+    wasSimReady = cellularStatus.simReady;
+    wasRegistered = cellularStatus.networkRegistered;
+    cellularStatus.modemResponding = responding;
+    cellularStatus.simReady = simReady;
+    cellularStatus.networkRegistered = registered;
+    cellularStatus.signalQuality = signal;
+    cellularStatus.operatorName = opName;
+    cellularStatus.lastUpdateTime = millis();
+    xSemaphoreGive(cellularMutex);
+
+    if (simReady != wasSimReady) {
+      logKeyEvent(simReady ? "CELLULAR SIM READY" : "CELLULAR SIM NOT READY");
+    }
+    if (registered != wasRegistered) {
+      logKeyEvent(registered ? ("CELLULAR NETWORK REGISTERED: " + opName) : "CELLULAR NETWORK LOST");
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(CELLULAR_POLL_INTERVAL_MS));
+  }
 }
 
 // ===================== Web / TCP / WiFi Task (Core 0) =====================
