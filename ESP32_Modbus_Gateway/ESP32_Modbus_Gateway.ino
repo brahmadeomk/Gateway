@@ -6568,17 +6568,6 @@ void cellularTask(void *parameter) {
           logMessage("CELLULAR DATA SESSION CONNECTING (APN='" + cellularConfig.apn + "')");
           dataConnected = modem.gprsConnect(cellularConfig.apn.c_str());
         }
-
-        // Cert provisioning needs the data session up (AT+CCERTDOWN/
-        // AT+CSSLCFG don't themselves transmit over it, but per the AT
-        // Command Manual's recommended order, GPRS should be available
-        // before any SSL-related operations) and is only worth doing at
-        // all when MQTT mode + certs are actually configured.
-        if (dataConnected && !certsProvisioned
-            && cloudConfig.mode == UPLINK_MODE_MQTT
-            && certRootCA.length() > 0 && certDevice.length() > 0 && certPrivKey.length() > 0) {
-          certsProvisioned = provisionCellularMqttCerts();
-        }
       }
     }
 
@@ -6606,6 +6595,22 @@ void cellularTask(void *parameter) {
     }
     if (dataConnected != wasDataConnected) {
       logKeyEvent(dataConnected ? "CELLULAR DATA SESSION UP" : "CELLULAR DATA SESSION DOWN");
+    }
+
+    // Runs after the transition logs above (SIM ready/registered/data
+    // session up) print, purely so the Status Log reads as a sensible
+    // chronological narrative on a cold boot where everything comes up in
+    // the same pass - cellularStatus.mqttCertsProvisioned itself may lag
+    // this by up to one poll interval, which is fine for a status display.
+    // Cert provisioning needs the data session up (AT+CCERTDOWN/
+    // AT+CSSLCFG don't themselves transmit over it, but per the AT
+    // Command Manual's recommended order, GPRS should be available before
+    // any SSL-related operations) and is only worth doing at all when
+    // MQTT mode + certs are actually configured.
+    if (dataConnected && !certsProvisioned
+        && cloudConfig.mode == UPLINK_MODE_MQTT
+        && certRootCA.length() > 0 && certDevice.length() > 0 && certPrivKey.length() > 0) {
+      certsProvisioned = provisionCellularMqttCerts();
     }
 
     vTaskDelay(pdMS_TO_TICKS(CELLULAR_POLL_INTERVAL_MS));
