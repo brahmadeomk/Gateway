@@ -302,7 +302,7 @@ const char *AI_PIN_LABELS[AI_CHANNEL_COUNT] = { "A0", "A1", "A2", "A3" };
 // How long WiFi must be continuously down before the MQTT uplink fails over
 // to cellular, and how long it must be continuously back up before failing
 // back - same grace period both directions, per user spec.
-#define UPLINK_FAILOVER_THRESHOLD_MS (5UL * 60UL * 1000UL)
+#define UPLINK_FAILOVER_THRESHOLD_MS (3UL * 60UL * 1000UL)  // 3 minutes
 #define TCP_CONNECT_TIMEOUT_MS 2000
 // Max wait for webTask's TCP-send feedback before moving to the next poll.
 #define TCP_SEND_TIMEOUT_MS 3000
