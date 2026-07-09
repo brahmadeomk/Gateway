@@ -6462,6 +6462,7 @@ bool waitForAtResponse(const String &expectedPrefix, unsigned long timeoutMs, St
             return true;
           }
           if (line == "ERROR" || line.startsWith("+CME ERROR") || line.startsWith("+CMS ERROR")) {
+            if (resultLine) *resultLine = line;
             return false;
           }
         }
@@ -6535,7 +6536,10 @@ bool sendAtCommandWithData(const String &cmd, const uint8_t *data, size_t len, c
 // unrelated lines including "OK" while scanning - is robust to that
 // ambiguity regardless of exactly when "OK" shows up. Parses the trailing
 // <err> field (or the only field, for CMQTTSTART); true only if it's 0.
-bool sendMqttCommand(const String &cmd, const String &resultPrefix, unsigned long timeoutMs) {
+// outResultLine, if given, is filled with the raw response line (or a
+// placeholder if none arrived) regardless of success/failure - lets callers
+// log the modem's actual error code on failure instead of just "it failed".
+bool sendMqttCommand(const String &cmd, const String &resultPrefix, unsigned long timeoutMs, String *outResultLine = nullptr) {
   while (SerialAT.available()) {
     SerialAT.read();
   }
@@ -6545,8 +6549,13 @@ bool sendMqttCommand(const String &cmd, const String &resultPrefix, unsigned lon
 
   String resultLine;
   if (!waitForAtResponse(resultPrefix, timeoutMs, &resultLine)) {
+    if (outResultLine) {
+      *outResultLine = (resultLine.length() > 0) ? resultLine : ("(no " + resultPrefix + " response within " + String(timeoutMs) + "ms)");
+    }
     return false;
   }
+
+  if (outResultLine) *outResultLine = resultLine;
 
   int lastComma = resultLine.lastIndexOf(',');
   int errCode = (lastComma >= 0) ? resultLine.substring(lastComma + 1).toInt() : resultLine.substring(resultPrefix.length()).toInt();
@@ -6612,10 +6621,17 @@ bool provisionCellularMqttCerts() {
 #define CELLULAR_MQTT_CONNECT_TIMEOUT_MS 60000
 #define CELLULAR_MQTT_PUB_TIMEOUT_MS 60000
 
-// AT+CMQTTACCQ's <clientID> must be UTF-8, 1-23 bytes - the device name
-// could exceed that, so truncate defensively.
+// Must match connectMqtt()'s WiFi-side clientId choice exactly - if the two
+// transports ever connected with different client IDs, an AWS IoT policy
+// scoped to a specific clientId (a common pattern, e.g.
+// iot:Connection.Thing.ThingName) would silently reject whichever transport
+// used the "wrong" one, and the two would also never contend for the same
+// AWS-side session, defeating the point of failover being seamless.
+// AT+CMQTTACCQ's <clientID> must additionally be UTF-8, 1-23 bytes - the
+// device name (or a configured client ID) could exceed that, so truncate
+// defensively.
 String cellularMqttClientId() {
-  String id = getDeviceName();
+  String id = (cloudConfig.clientId.length() > 0) ? cloudConfig.clientId : getDeviceName();
   if (id.length() > 23) {
     id = id.substring(0, 23);
   }
@@ -6634,8 +6650,9 @@ bool advanceCellularMqttSession(bool &started, bool &clientAcquired, bool &sslBo
   String ctx = String(CELLULAR_MQTT_CLIENT_INDEX);
 
   if (!started) {
-    if (!sendMqttCommand("AT+CMQTTSTART", "+CMQTTSTART:", CELLULAR_MQTT_START_TIMEOUT_MS)) {
-      logKeyEvent("CELLULAR MQTT SESSION FAILED (CMQTTSTART)");
+    String startResult;
+    if (!sendMqttCommand("AT+CMQTTSTART", "+CMQTTSTART:", CELLULAR_MQTT_START_TIMEOUT_MS, &startResult)) {
+      logKeyEvent("CELLULAR MQTT SESSION FAILED (CMQTTSTART): " + startResult);
       return false;
     }
     started = true;
@@ -6663,8 +6680,9 @@ bool advanceCellularMqttSession(bool &started, bool &clientAcquired, bool &sslBo
   // from the ACCQ server_type + SSLCFG steps above, not the URI scheme.
   String serverAddr = "tcp://" + cloudConfig.endpoint + ":" + String(cloudConfig.port);
   String connectCmd = "AT+CMQTTCONNECT=" + ctx + ",\"" + serverAddr + "\",60,1";
-  if (!sendMqttCommand(connectCmd, "+CMQTTCONNECT:", CELLULAR_MQTT_CONNECT_TIMEOUT_MS)) {
-    logKeyEvent("CELLULAR MQTT SESSION FAILED (CMQTTCONNECT)");
+  String connectResult;
+  if (!sendMqttCommand(connectCmd, "+CMQTTCONNECT:", CELLULAR_MQTT_CONNECT_TIMEOUT_MS, &connectResult)) {
+    logKeyEvent("CELLULAR MQTT SESSION FAILED (CMQTTCONNECT): " + connectResult);
     return false;
   }
 
@@ -6688,23 +6706,26 @@ void disconnectCellularMqttSession() {
 }
 
 // Publishes the same telemetry payload the WiFi/PubSubClient path sends
-// (buildTcpJson()), over the modem's own MQTT client instead.
-bool publishCellularMqttTelemetry() {
+// (buildTcpJson()), over the modem's own MQTT client instead. outResultLine,
+// if given, is filled with a short failure reason on any step's failure.
+bool publishCellularMqttTelemetry(String *outResultLine = nullptr) {
   String ctx = String(CELLULAR_MQTT_CLIENT_INDEX);
   String payload = buildTcpJson();
 
   String topicCmd = "AT+CMQTTTOPIC=" + ctx + "," + String(cloudConfig.topic.length());
   if (!sendAtCommandWithData(topicCmd, (const uint8_t *)cloudConfig.topic.c_str(), cloudConfig.topic.length(), "OK", AT_DEFAULT_TIMEOUT_MS)) {
+    if (outResultLine) *outResultLine = "(CMQTTTOPIC failed)";
     return false;
   }
 
   String payloadCmd = "AT+CMQTTPAYLOAD=" + ctx + "," + String(payload.length());
   if (!sendAtCommandWithData(payloadCmd, (const uint8_t *)payload.c_str(), payload.length(), "OK", AT_DEFAULT_TIMEOUT_MS)) {
+    if (outResultLine) *outResultLine = "(CMQTTPAYLOAD failed)";
     return false;
   }
 
   String pubCmd = "AT+CMQTTPUB=" + ctx + ",1,60";
-  return sendMqttCommand(pubCmd, "+CMQTTPUB:", CELLULAR_MQTT_PUB_TIMEOUT_MS);
+  return sendMqttCommand(pubCmd, "+CMQTTPUB:", CELLULAR_MQTT_PUB_TIMEOUT_MS, outResultLine);
 }
 
 void cellularTask(void *parameter) {
@@ -6824,11 +6845,14 @@ void cellularTask(void *parameter) {
     if (certsProvisioned && shouldBeConnected) {
       if (!mqttConnected) {
         advanceCellularMqttSession(mqttStarted, mqttClientAcquired, mqttSslBound, mqttConnected);
-      } else if (!publishCellularMqttTelemetry()) {
-        logKeyEvent("CELLULAR MQTT PUBLISH FAILED - will retry connect");
-        mqttConnected = false;  // re-attempt CONNECT next cycle; STARTED/ACCQ/SSLCFG stay done
       } else {
-        logMessage("CELLULAR MQTT TELEMETRY PUBLISHED");
+        String pubResult;
+        if (!publishCellularMqttTelemetry(&pubResult)) {
+          logKeyEvent("CELLULAR MQTT PUBLISH FAILED - will retry connect: " + pubResult);
+          mqttConnected = false;  // re-attempt CONNECT next cycle; STARTED/ACCQ/SSLCFG stay done
+        } else {
+          logMessage("CELLULAR MQTT TELEMETRY PUBLISHED");
+        }
       }
     } else if (mqttConnected && !shouldBeConnected) {
       // WiFi has failed back - release the broker connection so cellular
