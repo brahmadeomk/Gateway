@@ -94,15 +94,29 @@
      raw-TCP can all address a DO channel by name, falling back from
      findParamIndexByName() to findDoChannelIndexByName() wherever a
      command name doesn't match a Modbus param.
-   - Cellular modem (SIM7600G-H): status monitoring only for now (SIM/
-     network registration/signal quality, visible on the Dashboard and in
-     the Status Log) - not yet wired into the uplink data path, no
-     TCP/MQTT-over-cellular, no WiFi/cellular failover. UART AT command
+   - Cellular modem (SIM7600G-H): SIM/network registration/signal quality
+     and the PDP data session (modem.gprsConnect(), APN in Settings) are
+     live, visible on the Dashboard and in the Status Log. UART AT command
      interface on D5(RX)/D6(TX) via Serial2, PWRKEY power-on pulse on A5,
      driven by TinyGSM. Runs on its own dedicated task (cellularTask,
-     Core 0) because modem.init()/testAT() etc. can block for several
-     seconds - long enough that running it inline on webTask would stall
-     the web UI and every other uplink alongside it.
+     Core 0) because modem.init()/testAT()/gprsConnect() etc. can block
+     for several seconds - long enough that running it inline on webTask
+     would stall the web UI and every other uplink alongside it.
+   - WiFi/cellular uplink failover (in progress): the raw-TCP uplink
+     client is a Client* (tcpClient, pointing at wifiTcpClient or
+     cellularTcpClient - a TinyGsmClient) instead of a concrete WiFiClient,
+     so connectTcpServer()/sendPayloadTcp()/pollTcpCommands()/the command
+     ack helpers all work unchanged regardless of which transport is
+     active - see activeUplinkTransport (currently hardcoded to WiFi; a
+     later stage adds the actual switch-on-WiFi-loss decision logic).
+     WiFiClient-only APIs (setNoDelay(), the 3-arg connect() timeout
+     overload) aren't part of the generic Client interface, so those stay
+     gated to the concrete wifiTcpClient object. MQTT/TLS-over-cellular is
+     deliberately out of scope for now: TinyGsmClientSecure configures TLS
+     via the modem's own onboard SSL context (AT+CSSLCFG etc.), a
+     different mechanism than WiFiClientSecure's PEM-text
+     setCACert()/setCertificate()/setPrivateKey() API used for AWS IoT
+     today - needs its own design pass, not a drop-in swap.
    ====================================================================== */
 
 #include <WiFi.h>
@@ -293,15 +307,30 @@ const char *AI_PIN_LABELS[AI_CHANNEL_COUNT] = { "A0", "A1", "A2", "A3" };
 WebServer server(80);
 
 Preferences preferences;
-WiFiClient tcpClient;
+WiFiClient wifiTcpClient;
 WiFiClientSecure tlsClient;
 PubSubClient mqttClient(tlsClient);
 
-// Cellular modem (SIM7600G-H) - status monitoring only in this pass, not
-// yet wired into the uplink data path (no TCP/MQTT-over-cellular, no
-// failover). See cellularTask()/CellularStatus.
+// Cellular modem (SIM7600G-H). SIM/registration/signal/data-session
+// monitoring is live (cellularTask()/CellularStatus); this stage adds the
+// plumbing to actually route raw-TCP uplink traffic over it once selected
+// (see activeUplinkTransport) - MQTT/TLS-over-cellular is deliberately not
+// included yet: TinyGsmClientSecure configures TLS via the modem's own
+// onboard SSL context (AT+CSSLCFG etc.), a different mechanism than
+// WiFiClientSecure's setCACert()/setCertificate()/setPrivateKey() PEM-text
+// API used for AWS IoT today, and needs its own design pass rather than
+// being assumed to be a drop-in swap.
 HardwareSerial SerialAT(2);
 TinyGsm modem(SerialAT);
+TinyGsmClient cellularTcpClient(modem);
+
+// Raw-TCP uplink client currently in use - a Client* so it can point at
+// either the WiFi or cellular transport. Hardcoded to WiFi for now;
+// switchUplinkTransport() (a later stage) is what actually flips it.
+#define UPLINK_TRANSPORT_WIFI 0
+#define UPLINK_TRANSPORT_CELLULAR 1
+uint8_t activeUplinkTransport = UPLINK_TRANSPORT_WIFI;
+Client *tcpClient = &wifiTcpClient;
 
 // ===================== Timers =====================
 unsigned long lastSummaryPrintTime = 0;
@@ -2815,15 +2844,36 @@ bool connectTcpServer() {
     return false;
   }
 
-  if (WiFi.status() != WL_CONNECTED) {
-    logMessage("TCP SKIP: WIFI NOT CONNECTED");
-    return false;
+  if (activeUplinkTransport == UPLINK_TRANSPORT_WIFI) {
+    if (WiFi.status() != WL_CONNECTED) {
+      logMessage("TCP SKIP: WIFI NOT CONNECTED");
+      return false;
+    }
+  } else {
+    bool cellularDataUp;
+    xSemaphoreTake(cellularMutex, portMAX_DELAY);
+    cellularDataUp = cellularStatus.dataConnected;
+    xSemaphoreGive(cellularMutex);
+
+    if (!cellularDataUp) {
+      logMessage("TCP SKIP: CELLULAR DATA SESSION NOT UP");
+      return false;
+    }
   }
 
-  if (!tcpClient.connected()) {
+  if (!tcpClient->connected()) {
     logMessage("TCP TRY " + uplinkConfig.serverIP + ":" + String(uplinkConfig.port));
 
-    if (!tcpClient.connect(uplinkConfig.serverIP.c_str(), uplinkConfig.port, TCP_CONNECT_TIMEOUT_MS)) {
+    // The 3-arg connect(host, port, timeoutMs) is a WiFiClient-specific
+    // extension, not part of the generic Client interface TinyGsmClient
+    // also implements - only usable through the concrete object. Over
+    // cellular, the base 2-arg connect() is used instead (TinyGsmClient's
+    // own internal timeout applies).
+    bool connectOk = (activeUplinkTransport == UPLINK_TRANSPORT_WIFI)
+      ? wifiTcpClient.connect(uplinkConfig.serverIP.c_str(), uplinkConfig.port, TCP_CONNECT_TIMEOUT_MS)
+      : tcpClient->connect(uplinkConfig.serverIP.c_str(), uplinkConfig.port);
+
+    if (!connectOk) {
       // Throttled: a dead master would otherwise fail once per poll cycle
       // and flood the key log.
       if (millis() - lastTcpFailLogTime >= DEBUG_ERROR_REPEAT_MS) {
@@ -2833,10 +2883,16 @@ bool connectTcpServer() {
       return false;
     }
 
-    // Disable Nagle's algorithm so small JSON payloads go out immediately
-    // instead of being buffered/delayed. Must be set after connect() -
-    // some cores reset this flag to its default during connect().
-    tcpClient.setNoDelay(true);
+    if (activeUplinkTransport == UPLINK_TRANSPORT_WIFI) {
+      // Disable Nagle's algorithm so small JSON payloads go out immediately
+      // instead of being buffered/delayed. Must be set after connect() -
+      // some cores reset this flag to its default during connect(). Not
+      // part of the generic Client interface (TinyGsmClient doesn't have
+      // it - the modem's own TCP stack handles this internally), so this
+      // has to go through the concrete WiFiClient object, not the Client*
+      // pointer.
+      wifiTcpClient.setNoDelay(true);
+    }
 
     logMessage("TCP OK");
   }
@@ -2846,7 +2902,7 @@ bool connectTcpServer() {
 
 // Logs a key event only on TCP connect/disconnect transitions.
 void checkTcpUplinkStatusChange() {
-  bool connected = tcpClient.connected();
+  bool connected = tcpClient->connected();
 
   if (connected != lastTcpConnectedState) {
     if (connected) {
@@ -2870,11 +2926,11 @@ bool sendPayloadTcp(const String &payload) {
   framed += "\n";
 
   // Single write() call so the payload goes out as one TCP send instead of two.
-  size_t written = tcpClient.write((const uint8_t *)framed.c_str(), framed.length());
+  size_t written = tcpClient->write((const uint8_t *)framed.c_str(), framed.length());
 
   if (written != framed.length()) {
     logMessage("TCP SEND INCOMPLETE (" + String(written) + "/" + String(framed.length()) + ")");
-    tcpClient.stop();
+    tcpClient->stop();
     return false;
   }
 
@@ -2911,7 +2967,7 @@ String tcpCmdBuffer;
 // elsewhere); the delayed completion ack (queued via tcpAckQueue) passes
 // reason="" and the real Modbus result code instead.
 void sendTcpAckLine(const String &name, float value, bool ok, uint8_t code, const String &reason) {
-  if (!tcpClient.connected()) {
+  if (!tcpClient->connected()) {
     return;
   }
 
@@ -2921,7 +2977,7 @@ void sendTcpAckLine(const String &name, float value, bool ok, uint8_t code, cons
   }
   line += "}\n";
 
-  tcpClient.write((const uint8_t *)line.c_str(), line.length());
+  tcpClient->write((const uint8_t *)line.c_str(), line.length());
 }
 
 // Searches DI/DO/AI channels by name (in that order) as a fallback for the
@@ -2974,7 +3030,7 @@ bool findDigitalIOValueByName(const String &name, float &outValue, bool &outEnab
 // Falls back to Digital/Analog I/O channels by name if no Modbus param
 // matches, so one query command covers both namespaces.
 void sendTcpQueryResponse(const String &name) {
-  if (!tcpClient.connected()) {
+  if (!tcpClient->connected()) {
     return;
   }
 
@@ -3001,7 +3057,7 @@ void sendTcpQueryResponse(const String &name) {
     }
     line += "}\n";
 
-    tcpClient.write((const uint8_t *)line.c_str(), line.length());
+    tcpClient->write((const uint8_t *)line.c_str(), line.length());
     return;
   }
 
@@ -3017,13 +3073,13 @@ void sendTcpQueryResponse(const String &name) {
     }
     line += "}\n";
 
-    tcpClient.write((const uint8_t *)line.c_str(), line.length());
+    tcpClient->write((const uint8_t *)line.c_str(), line.length());
     return;
   }
 
   logKeyEvent("TCP QUERY REJECTED: no parameter named '" + name + "'");
   String line = "{\"query\":\"" + jsonEscape(name) + "\",\"status\":\"ERR\",\"reason\":\"unknown parameter\"}\n";
-  tcpClient.write((const uint8_t *)line.c_str(), line.length());
+  tcpClient->write((const uint8_t *)line.c_str(), line.length());
 }
 
 // Parses one inbound command line - either a read {"query":"Name"} (answered
@@ -3081,13 +3137,13 @@ void handleTcpCommandLine(const String &line) {
 // command lines - never blocks (only reads what's already available), so
 // it's safe to call every webTask iteration alongside the telemetry push.
 void pollTcpCommands() {
-  if (!tcpClient.connected()) {
+  if (!tcpClient->connected()) {
     tcpCmdBuffer = "";  // discard any partial line from a dropped connection
     return;
   }
 
-  while (tcpClient.available() > 0) {
-    char c = (char)tcpClient.read();
+  while (tcpClient->available() > 0) {
+    char c = (char)tcpClient->read();
 
     if (c == '\n') {
       tcpCmdBuffer.trim();
@@ -4075,7 +4131,7 @@ void handleRoot() {
     html += " (Endpoint " + htmlEscape(cloudConfig.endpoint) + ":" + String(cloudConfig.port) + ")<br>";
   } else {
     html += "<b>TCP:</b> ";
-    html += tcpClient.connected() ? "Connected" : "Disconnected";
+    html += tcpClient->connected() ? "Connected" : "Disconnected";
     html += " (Target " + htmlEscape(uplinkConfig.serverIP) + ":" + String(uplinkConfig.port) + ")<br>";
   }
   html += "<b>Poll Interval:</b> " + String(pollIntervalMs) + " ms";
