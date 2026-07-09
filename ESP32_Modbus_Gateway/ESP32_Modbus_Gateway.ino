@@ -376,7 +376,8 @@ struct CellularStatus {
   int signalQuality;  // AT+CSQ raw value: 0-31 (higher = better), 99 = unknown
   String operatorName;
   bool dataConnected;  // PDP/data context up (modem.gprsConnect()) - not yet used for any uplink traffic
-  bool mqttCertsProvisioned;  // modem's own cert store + SSL context set up - not yet used for any MQTT session
+  bool mqttCertsProvisioned;  // modem's own cert store + SSL context set up
+  bool mqttSessionConnected;  // modem's onboard MQTT client is connected + publishing telemetry (verification stage - not yet the active/failover uplink)
   unsigned long lastUpdateTime;
 };
 
@@ -4154,7 +4155,7 @@ void handleRoot() {
   // uplink data path, so this box is informational, independent of the
   // WiFi/MQTT/TCP status above.
   {
-    bool modemResponding, simReady, networkRegistered, dataConnected, mqttCertsProvisioned;
+    bool modemResponding, simReady, networkRegistered, dataConnected, mqttCertsProvisioned, mqttSessionConnected;
     int signalQuality;
     String operatorName;
     unsigned long lastUpdateTime;
@@ -4167,6 +4168,7 @@ void handleRoot() {
     operatorName = cellularStatus.operatorName;
     dataConnected = cellularStatus.dataConnected;
     mqttCertsProvisioned = cellularStatus.mqttCertsProvisioned;
+    mqttSessionConnected = cellularStatus.mqttSessionConnected;
     lastUpdateTime = cellularStatus.lastUpdateTime;
     xSemaphoreGive(cellularMutex);
 
@@ -4189,6 +4191,8 @@ void handleRoot() {
       html += " (not yet used for uplink traffic)";
       if (cloudConfig.mode == UPLINK_MODE_MQTT) {
         html += "<br><b>MQTT Certs on Modem:</b> " + String(mqttCertsProvisioned ? "Provisioned" : "Not yet provisioned");
+        html += "<br><b>MQTT Session (cellular):</b> " + String(mqttSessionConnected ? "Connected, publishing" : "Not connected");
+        html += " (verification only - not yet the active/failover uplink)";
       }
     }
 
@@ -6451,19 +6455,26 @@ bool sendAtCommandWithData(const String &cmd, const uint8_t *data, size_t len, c
   return waitForAtResponse(expectedPrefix, timeoutMs, nullptr);
 }
 
-// Many AT+CMQTT* commands (CONNECT/PUB/SUB/UNSUB/DISC/START) respond with
-// an immediate "OK" (command accepted) followed later by an asynchronous
-// "+CMQTTXXX: ...,<err>" line once the actual operation (which may involve
-// network round-trips) completes - see the MQTT AT Command Manual's
-// worked examples. Waits for both stages; true only if the trailing <err>
-// field (or, for CMQTTSTART, the only field) is 0.
-bool sendMqttCommand(const String &cmd, const String &resultPrefix, unsigned long ackTimeoutMs, unsigned long resultTimeoutMs) {
-  if (!sendAtCommand(cmd, "OK", ackTimeoutMs)) {
-    return false;
+// Many AT+CMQTT* commands (CONNECT/PUB/SUB/UNSUB/DISC/START) eventually
+// report their real result as an asynchronous "+CMQTTXXX: ...,<err>" line,
+// which can arrive either before or after (and separate from) the "OK"
+// that just means "command accepted" - the manual's own worked examples
+// aren't fully consistent on the ordering (e.g. CMQTTSTART's response
+// table lists both orders as valid). Waiting directly for the
+// result-prefixed line - via waitForAtResponse(), which skips over any
+// unrelated lines including "OK" while scanning - is robust to that
+// ambiguity regardless of exactly when "OK" shows up. Parses the trailing
+// <err> field (or the only field, for CMQTTSTART); true only if it's 0.
+bool sendMqttCommand(const String &cmd, const String &resultPrefix, unsigned long timeoutMs) {
+  while (SerialAT.available()) {
+    SerialAT.read();
   }
 
+  SerialAT.print(cmd);
+  SerialAT.print("\r\n");
+
   String resultLine;
-  if (!waitForAtResponse(resultPrefix, resultTimeoutMs, &resultLine)) {
+  if (!waitForAtResponse(resultPrefix, timeoutMs, &resultLine)) {
     return false;
   }
 
@@ -6519,6 +6530,101 @@ bool provisionCellularMqttCerts() {
   return true;
 }
 
+// ===================== Cellular Modem: MQTT Session + Telemetry Publish =====================
+// Runs the modem's onboard MQTT client in parallel with the WiFi/
+// PubSubClient path for now (verification stage, not yet the active
+// uplink - see the Client* abstraction note for how Stage 3d will decide
+// which transport is "live"). Reuses the same cloudConfig.endpoint/port/
+// topic and buildTcpJson() payload as the WiFi path - same AWS IoT Thing,
+// same telemetry shape, different transport.
+#define CELLULAR_MQTT_CLIENT_INDEX 0
+#define CELLULAR_MQTT_START_TIMEOUT_MS 120000  // matches the manual's stated max response time for CMQTTSTART
+#define CELLULAR_MQTT_CONNECT_TIMEOUT_MS 60000
+#define CELLULAR_MQTT_PUB_TIMEOUT_MS 60000
+
+// AT+CMQTTACCQ's <clientID> must be UTF-8, 1-23 bytes - the device name
+// could exceed that, so truncate defensively.
+String cellularMqttClientId() {
+  String id = getDeviceName();
+  if (id.length() > 23) {
+    id = id.substring(0, 23);
+  }
+  return id;
+}
+
+// Step-by-step session bring-up, matching the manual's worked "verify
+// server and client" example order: START -> ACCQ (server_type 1 =
+// SSL/TLS) -> SSLCFG (bind the SSL context provisionCellularMqttCerts()
+// configured) -> CONNECT. Each of started/clientAcquired/sslBound/
+// connected is a persistent flag owned by the caller (cellularTask), so a
+// retry after a partial failure only re-attempts whatever step didn't
+// complete last time, instead of e.g. re-issuing CMQTTSTART on an
+// already-started service.
+bool advanceCellularMqttSession(bool &started, bool &clientAcquired, bool &sslBound, bool &connected) {
+  String ctx = String(CELLULAR_MQTT_CLIENT_INDEX);
+
+  if (!started) {
+    if (!sendMqttCommand("AT+CMQTTSTART", "+CMQTTSTART:", CELLULAR_MQTT_START_TIMEOUT_MS)) {
+      logKeyEvent("CELLULAR MQTT SESSION FAILED (CMQTTSTART)");
+      return false;
+    }
+    started = true;
+  }
+
+  if (!clientAcquired) {
+    String accqCmd = "AT+CMQTTACCQ=" + ctx + ",\"" + cellularMqttClientId() + "\",1";
+    if (!sendAtCommand(accqCmd, "OK", AT_DEFAULT_TIMEOUT_MS)) {
+      logKeyEvent("CELLULAR MQTT SESSION FAILED (CMQTTACCQ)");
+      return false;
+    }
+    clientAcquired = true;
+  }
+
+  if (!sslBound) {
+    if (!sendAtCommand("AT+CMQTTSSLCFG=" + ctx + "," + String(CELLULAR_SSL_CTX_INDEX), "OK", AT_DEFAULT_TIMEOUT_MS)) {
+      logKeyEvent("CELLULAR MQTT SESSION FAILED (CMQTTSSLCFG)");
+      return false;
+    }
+    sslBound = true;
+  }
+
+  // "tcp://" is correct even for the SSL/TLS case - the manual's own
+  // mutual-TLS example uses this same prefix; SSL-ness comes entirely
+  // from the ACCQ server_type + SSLCFG steps above, not the URI scheme.
+  String serverAddr = "tcp://" + cloudConfig.endpoint + ":" + String(cloudConfig.port);
+  String connectCmd = "AT+CMQTTCONNECT=" + ctx + ",\"" + serverAddr + "\",60,1";
+  if (!sendMqttCommand(connectCmd, "+CMQTTCONNECT:", CELLULAR_MQTT_CONNECT_TIMEOUT_MS)) {
+    logKeyEvent("CELLULAR MQTT SESSION FAILED (CMQTTCONNECT)");
+    return false;
+  }
+
+  connected = true;
+  // Success is logged by the caller (cellularTask's mqttConnected
+  // transition check), which also has the endpoint/context to say it once
+  // cleanly rather than duplicating that here.
+  return true;
+}
+
+// Publishes the same telemetry payload the WiFi/PubSubClient path sends
+// (buildTcpJson()), over the modem's own MQTT client instead.
+bool publishCellularMqttTelemetry() {
+  String ctx = String(CELLULAR_MQTT_CLIENT_INDEX);
+  String payload = buildTcpJson();
+
+  String topicCmd = "AT+CMQTTTOPIC=" + ctx + "," + String(cloudConfig.topic.length());
+  if (!sendAtCommandWithData(topicCmd, (const uint8_t *)cloudConfig.topic.c_str(), cloudConfig.topic.length(), "OK", AT_DEFAULT_TIMEOUT_MS)) {
+    return false;
+  }
+
+  String payloadCmd = "AT+CMQTTPAYLOAD=" + ctx + "," + String(payload.length());
+  if (!sendAtCommandWithData(payloadCmd, (const uint8_t *)payload.c_str(), payload.length(), "OK", AT_DEFAULT_TIMEOUT_MS)) {
+    return false;
+  }
+
+  String pubCmd = "AT+CMQTTPUB=" + ctx + ",1,60";
+  return sendMqttCommand(pubCmd, "+CMQTTPUB:", CELLULAR_MQTT_PUB_TIMEOUT_MS);
+}
+
 void cellularTask(void *parameter) {
   SerialAT.begin(MODEM_BAUD, SERIAL_8N1, SERIAL2_RX_PIN, SERIAL2_TX_PIN);
 
@@ -6531,6 +6637,13 @@ void cellularTask(void *parameter) {
   // WiFi/PubSubClient path already reconnects live on a cert change -
   // matching that here is a later polish pass, not needed for this stage).
   bool certsProvisioned = false;
+  // MQTT session bring-up state (see advanceCellularMqttSession()) -
+  // separate flags so a retry after a partial failure only re-attempts
+  // whatever step didn't complete, not the whole sequence from scratch.
+  bool mqttStarted = false;
+  bool mqttClientAcquired = false;
+  bool mqttSslBound = false;
+  bool mqttConnected = false;
 
   for (;;) {
     if (!everInitialized) {
@@ -6611,6 +6724,32 @@ void cellularTask(void *parameter) {
         && cloudConfig.mode == UPLINK_MODE_MQTT
         && certRootCA.length() > 0 && certDevice.length() > 0 && certPrivKey.length() > 0) {
       certsProvisioned = provisionCellularMqttCerts();
+    }
+
+    // Verification stage: brings up an MQTT session and publishes
+    // telemetry over it every cycle, in parallel with whatever the WiFi
+    // path is doing - not yet the "active" uplink (see Stage 3d). Gated
+    // transitively through certsProvisioned (itself gated on MQTT mode),
+    // so this is a no-op in Raw TCP mode.
+    bool wasMqttConnected = mqttConnected;
+
+    if (certsProvisioned) {
+      if (!mqttConnected) {
+        advanceCellularMqttSession(mqttStarted, mqttClientAcquired, mqttSslBound, mqttConnected);
+      } else if (!publishCellularMqttTelemetry()) {
+        logKeyEvent("CELLULAR MQTT PUBLISH FAILED - will retry connect");
+        mqttConnected = false;  // re-attempt CONNECT next cycle; STARTED/ACCQ/SSLCFG stay done
+      } else {
+        logMessage("CELLULAR MQTT TELEMETRY PUBLISHED");
+      }
+    }
+
+    xSemaphoreTake(cellularMutex, portMAX_DELAY);
+    cellularStatus.mqttSessionConnected = mqttConnected;
+    xSemaphoreGive(cellularMutex);
+
+    if (mqttConnected != wasMqttConnected) {
+      logKeyEvent(mqttConnected ? ("CELLULAR MQTT SESSION UP: " + cloudConfig.endpoint) : "CELLULAR MQTT SESSION DOWN");
     }
 
     vTaskDelay(pdMS_TO_TICKS(CELLULAR_POLL_INTERVAL_MS));
