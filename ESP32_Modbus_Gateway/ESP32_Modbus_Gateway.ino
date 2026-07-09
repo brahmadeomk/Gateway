@@ -376,6 +376,7 @@ struct CellularStatus {
   int signalQuality;  // AT+CSQ raw value: 0-31 (higher = better), 99 = unknown
   String operatorName;
   bool dataConnected;  // PDP/data context up (modem.gprsConnect()) - not yet used for any uplink traffic
+  bool mqttCertsProvisioned;  // modem's own cert store + SSL context set up - not yet used for any MQTT session
   unsigned long lastUpdateTime;
 };
 
@@ -4153,7 +4154,7 @@ void handleRoot() {
   // uplink data path, so this box is informational, independent of the
   // WiFi/MQTT/TCP status above.
   {
-    bool modemResponding, simReady, networkRegistered, dataConnected;
+    bool modemResponding, simReady, networkRegistered, dataConnected, mqttCertsProvisioned;
     int signalQuality;
     String operatorName;
     unsigned long lastUpdateTime;
@@ -4165,6 +4166,7 @@ void handleRoot() {
     signalQuality = cellularStatus.signalQuality;
     operatorName = cellularStatus.operatorName;
     dataConnected = cellularStatus.dataConnected;
+    mqttCertsProvisioned = cellularStatus.mqttCertsProvisioned;
     lastUpdateTime = cellularStatus.lastUpdateTime;
     xSemaphoreGive(cellularMutex);
 
@@ -4185,6 +4187,9 @@ void handleRoot() {
       }
       html += "<br><b>Data Session:</b> " + String(dataConnected ? "Connected" : "Not Connected");
       html += " (not yet used for uplink traffic)";
+      if (cloudConfig.mode == UPLINK_MODE_MQTT) {
+        html += "<br><b>MQTT Certs on Modem:</b> " + String(mqttCertsProvisioned ? "Provisioned" : "Not yet provisioned");
+      }
     }
 
     html += "</div>";
@@ -6467,12 +6472,65 @@ bool sendMqttCommand(const String &cmd, const String &resultPrefix, unsigned lon
   return errCode == 0;
 }
 
+// ===================== Cellular Modem: MQTT Certificate Provisioning =====================
+// One-time (per boot) upload of the modem's own certificate store + SSL
+// context for mutual-TLS MQTT (AWS IoT) - see the MQTT AT Command
+// Manual's "Access to SSL/TLS MQTT server (verify server and client)"
+// worked example (authmode 2 = verify both server and client). Reuses the
+// same PEM Strings already held in RAM for the WiFi/WiFiClientSecure path
+// (certRootCA/certDevice/certPrivKey) - no separate storage, no re-parsing.
+#define CELLULAR_CA_CERT_FILENAME "ca_cert.pem"
+#define CELLULAR_CLIENT_CERT_FILENAME "client_cert.pem"
+#define CELLULAR_CLIENT_KEY_FILENAME "client_key.pem"
+#define CELLULAR_SSL_CTX_INDEX 0
+
+// Deletes any stale copy first (result ignored - it may simply not exist
+// yet, e.g. on first boot) so a re-provisioning always reflects the
+// current cert content, then uploads the fresh one.
+bool uploadCertFile(const String &filename, const String &pemContent) {
+  sendAtCommand("AT+CCERTDELE=\"" + filename + "\"", "OK", AT_DEFAULT_TIMEOUT_MS);
+
+  String cmd = "AT+CCERTDOWN=\"" + filename + "\"," + String(pemContent.length());
+  bool ok = sendAtCommandWithData(cmd, (const uint8_t *)pemContent.c_str(), pemContent.length(), "OK", 10000);
+
+  if (!ok) {
+    logKeyEvent("CELLULAR CERT UPLOAD FAILED: " + filename);
+  }
+
+  return ok;
+}
+
+bool provisionCellularMqttCerts() {
+  logKeyEvent("CELLULAR MQTT CERT PROVISIONING START");
+
+  if (!uploadCertFile(CELLULAR_CA_CERT_FILENAME, certRootCA)) return false;
+  if (!uploadCertFile(CELLULAR_CLIENT_CERT_FILENAME, certDevice)) return false;
+  if (!uploadCertFile(CELLULAR_CLIENT_KEY_FILENAME, certPrivKey)) return false;
+
+  String ctx = String(CELLULAR_SSL_CTX_INDEX);
+
+  if (!sendAtCommand("AT+CSSLCFG=\"sslversion\"," + ctx + ",4", "OK", AT_DEFAULT_TIMEOUT_MS)) return false;
+  if (!sendAtCommand("AT+CSSLCFG=\"authmode\"," + ctx + ",2", "OK", AT_DEFAULT_TIMEOUT_MS)) return false;
+  if (!sendAtCommand("AT+CSSLCFG=\"cacert\"," + ctx + ",\"" + CELLULAR_CA_CERT_FILENAME + "\"", "OK", AT_DEFAULT_TIMEOUT_MS)) return false;
+  if (!sendAtCommand("AT+CSSLCFG=\"clientcert\"," + ctx + ",\"" + CELLULAR_CLIENT_CERT_FILENAME + "\"", "OK", AT_DEFAULT_TIMEOUT_MS)) return false;
+  if (!sendAtCommand("AT+CSSLCFG=\"clientkey\"," + ctx + ",\"" + CELLULAR_CLIENT_KEY_FILENAME + "\"", "OK", AT_DEFAULT_TIMEOUT_MS)) return false;
+
+  logKeyEvent("CELLULAR MQTT CERT PROVISIONING OK (SSL context " + ctx + ")");
+  return true;
+}
+
 void cellularTask(void *parameter) {
   SerialAT.begin(MODEM_BAUD, SERIAL_8N1, SERIAL2_RX_PIN, SERIAL2_TX_PIN);
 
   powerOnModem();
 
   bool everInitialized = false;
+  // Set once provisionCellularMqttCerts() succeeds - only attempted again
+  // after a reboot. A cert changed live via Settings while running
+  // currently only reaches the cellular path on next reboot (the
+  // WiFi/PubSubClient path already reconnects live on a cert change -
+  // matching that here is a later polish pass, not needed for this stage).
+  bool certsProvisioned = false;
 
   for (;;) {
     if (!everInitialized) {
@@ -6510,6 +6568,17 @@ void cellularTask(void *parameter) {
           logMessage("CELLULAR DATA SESSION CONNECTING (APN='" + cellularConfig.apn + "')");
           dataConnected = modem.gprsConnect(cellularConfig.apn.c_str());
         }
+
+        // Cert provisioning needs the data session up (AT+CCERTDOWN/
+        // AT+CSSLCFG don't themselves transmit over it, but per the AT
+        // Command Manual's recommended order, GPRS should be available
+        // before any SSL-related operations) and is only worth doing at
+        // all when MQTT mode + certs are actually configured.
+        if (dataConnected && !certsProvisioned
+            && cloudConfig.mode == UPLINK_MODE_MQTT
+            && certRootCA.length() > 0 && certDevice.length() > 0 && certPrivKey.length() > 0) {
+          certsProvisioned = provisionCellularMqttCerts();
+        }
       }
     }
 
@@ -6525,6 +6594,7 @@ void cellularTask(void *parameter) {
     cellularStatus.signalQuality = signal;
     cellularStatus.operatorName = opName;
     cellularStatus.dataConnected = dataConnected;
+    cellularStatus.mqttCertsProvisioned = certsProvisioned;
     cellularStatus.lastUpdateTime = millis();
     xSemaphoreGive(cellularMutex);
 
