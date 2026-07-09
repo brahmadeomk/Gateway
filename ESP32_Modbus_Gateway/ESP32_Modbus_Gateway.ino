@@ -4256,6 +4256,19 @@ void handleRoot() {
         html += "<br><b>Active MQTT Uplink:</b> ";
         if (mqttFailoverActive) {
           html += "Cellular (failover)";
+          // Previously this branch gave no visibility into whether WiFi had
+          // already reconnected and was counting toward failback, or was
+          // still down, or was flapping (each reconnect blip resets
+          // wifiUpSince via checkWifiUplinkStatusChange(), restarting the
+          // stability timer from zero) - all three look identical from the
+          // Dashboard without this.
+          if (WiFi.status() == WL_CONNECTED && wifiUpSince != 0) {
+            unsigned long upSec = (millis() - wifiUpSince) / 1000;
+            unsigned long remainSec = (UPLINK_FAILOVER_THRESHOLD_MS / 1000 > upSec) ? (UPLINK_FAILOVER_THRESHOLD_MS / 1000 - upSec) : 0;
+            html += " - WiFi back up " + String(upSec) + "s (stable), failing back in " + String(remainSec) + "s if it stays up";
+          } else {
+            html += " - WiFi still down";
+          }
         } else if (wifiDownSince != 0) {
           unsigned long downSec = (millis() - wifiDownSince) / 1000;
           unsigned long remainSec = (UPLINK_FAILOVER_THRESHOLD_MS / 1000 > downSec) ? (UPLINK_FAILOVER_THRESHOLD_MS / 1000 - downSec) : 0;
