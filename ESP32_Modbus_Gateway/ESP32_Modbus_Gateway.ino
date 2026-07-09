@@ -111,12 +111,18 @@
      later stage adds the actual switch-on-WiFi-loss decision logic).
      WiFiClient-only APIs (setNoDelay(), the 3-arg connect() timeout
      overload) aren't part of the generic Client interface, so those stay
-     gated to the concrete wifiTcpClient object. MQTT/TLS-over-cellular is
-     deliberately out of scope for now: TinyGsmClientSecure configures TLS
-     via the modem's own onboard SSL context (AT+CSSLCFG etc.), a
-     different mechanism than WiFiClientSecure's PEM-text
-     setCACert()/setCertificate()/setPrivateKey() API used for AWS IoT
-     today - needs its own design pass, not a drop-in swap.
+     gated to the concrete wifiTcpClient object.
+   - MQTT-over-cellular does NOT reuse PubSubClient/tcpClient at all - per
+     the SIM7500/SIM7600/SIM7800 MQTT AT Command Manual, the modem has its
+     own onboard MQTT client (the AT+CMQTT* command family) with its own
+     certificate store (AT+CCERTDOWN) and SSL context (AT+CSSLCFG,
+     authmode 2 for AWS IoT's mutual TLS) - TLS runs on the modem's own
+     chip, not the ESP32's mbedTLS, which is also why this doesn't add the
+     RAM cost a second WiFiClientSecure-style session would. Driven via a
+     small raw AT command helper (sendAtCommand()/sendAtCommandWithData()/
+     sendMqttCommand(), right before cellularTask()) that talks to SerialAT
+     directly - safe because cellularTask is SerialAT's sole owner and
+     never overlaps these with a TinyGSM modem.xxx() call.
    ====================================================================== */
 
 #include <WiFi.h>
@@ -4135,6 +4141,7 @@ void handleRoot() {
     html += " (Target " + htmlEscape(uplinkConfig.serverIP) + ":" + String(uplinkConfig.port) + ")<br>";
   }
   html += "<b>Poll Interval:</b> " + String(pollIntervalMs) + " ms";
+  html += "<br><b>Free Heap:</b> " + String(ESP.getFreeHeap()) + " bytes (min ever: " + String(ESP.getMinFreeHeap()) + ")";
 
   // Only shown while there is an undelivered backlog (uplink outage).
   if (sfCount > 0) {
@@ -6256,6 +6263,27 @@ void drainTcpAckQueue() {
   }
 }
 
+// ===================== Free Heap Monitoring =====================
+// Independent of DEBUG_ENABLED (that gates printModbusSummary()'s
+// Serial-only poll-cycle stats) - this goes to the persistent Status Log
+// so heap headroom is visible in the field, not just during a debug
+// session. ESP.getMinFreeHeap() catches transient dips (e.g. a TLS
+// handshake's temporary buffers) that a plain getFreeHeap() snapshot
+// could land between and miss entirely.
+unsigned long lastFreeHeapLogTime = 0;
+uint32_t lastLoggedFreeHeap = 0;
+#define FREE_HEAP_LOG_INTERVAL_MS 60000
+
+void logFreeHeapPeriodic() {
+  if (millis() - lastFreeHeapLogTime < FREE_HEAP_LOG_INTERVAL_MS) {
+    return;
+  }
+  lastFreeHeapLogTime = millis();
+  lastLoggedFreeHeap = ESP.getFreeHeap();
+
+  logKeyEvent("FREE HEAP: " + String(lastLoggedFreeHeap) + " bytes (min ever since boot: " + String(ESP.getMinFreeHeap()) + ")");
+}
+
 // ===================== Local Digital I/O Polling =====================
 // Plain GPIO reads/writes - no bus transaction, never blocks - so this runs
 // on webTask (Core 0) on its own timer, fully decoupled from the Modbus
@@ -6322,6 +6350,121 @@ void powerOnModem() {
 
   logMessage("CELLULAR MODEM POWER-ON PULSE SENT - waiting for boot");
   delay(MODEM_BOOT_WAIT_MS);
+}
+
+// ===================== Cellular Modem: Raw AT Command Helper =====================
+// TinyGSM's modem.xxx() API is a portable abstraction covering registration/
+// signal/GPRS - it doesn't (and isn't meant to) cover the SIM7600's own
+// modem-specific AT+CMQTT*/AT+CSSLCFG/AT+CCERTDOWN command family used for
+// certificate-backed MQTT run directly on the modem's onboard MQTT client
+// (see the architecture note above). These talk to SerialAT directly.
+// Safe to do so because cellularTask is the sole owner of that UART and
+// never calls these concurrently with a modem.xxx() TinyGSM call - both
+// only ever run sequentially within this one task.
+#define AT_LINE_MAX_LEN 256
+#define AT_DEFAULT_TIMEOUT_MS 5000
+
+// Reads lines from SerialAT until one starts with expectedPrefix (success,
+// optionally copied into resultLine) or is "ERROR"/"+CME ERROR"/"+CMS
+// ERROR" (failure), or timeoutMs elapses with neither (failure).
+bool waitForAtResponse(const String &expectedPrefix, unsigned long timeoutMs, String *resultLine = nullptr) {
+  unsigned long start = millis();
+  String line;
+
+  while (millis() - start < timeoutMs) {
+    while (SerialAT.available()) {
+      char c = (char)SerialAT.read();
+
+      if (c == '\n') {
+        line.trim();
+        if (line.length() > 0) {
+          if (line.startsWith(expectedPrefix)) {
+            if (resultLine) *resultLine = line;
+            return true;
+          }
+          if (line == "ERROR" || line.startsWith("+CME ERROR") || line.startsWith("+CMS ERROR")) {
+            return false;
+          }
+        }
+        line = "";
+      } else if (c != '\r') {
+        if (line.length() < AT_LINE_MAX_LEN) {
+          line += c;
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+
+  return false;
+}
+
+// Sends a plain "AT...\r\n" command and waits for its response line.
+bool sendAtCommand(const String &cmd, const String &expectedPrefix, unsigned long timeoutMs, String *resultLine = nullptr) {
+  while (SerialAT.available()) {
+    SerialAT.read();  // flush any stale bytes (e.g. a late URC) before sending
+  }
+
+  SerialAT.print(cmd);
+  SerialAT.print("\r\n");
+
+  return waitForAtResponse(expectedPrefix, timeoutMs, resultLine);
+}
+
+// For commands that show a ">" prompt before accepting raw data
+// (AT+CCERTDOWN, AT+CMQTTTOPIC, AT+CMQTTPAYLOAD, AT+CMQTTSUBTOPIC, etc.):
+// sends the command, waits for the ">" prompt, writes the raw payload
+// bytes, then waits for the final response line.
+bool sendAtCommandWithData(const String &cmd, const uint8_t *data, size_t len, const String &expectedPrefix, unsigned long timeoutMs) {
+  while (SerialAT.available()) {
+    SerialAT.read();
+  }
+
+  SerialAT.print(cmd);
+  SerialAT.print("\r\n");
+
+  unsigned long start = millis();
+  bool gotPrompt = false;
+
+  while (millis() - start < timeoutMs) {
+    if (SerialAT.available()) {
+      if ((char)SerialAT.read() == '>') {
+        gotPrompt = true;
+        break;
+      }
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(5));
+    }
+  }
+
+  if (!gotPrompt) {
+    return false;
+  }
+
+  SerialAT.write(data, len);
+
+  return waitForAtResponse(expectedPrefix, timeoutMs, nullptr);
+}
+
+// Many AT+CMQTT* commands (CONNECT/PUB/SUB/UNSUB/DISC/START) respond with
+// an immediate "OK" (command accepted) followed later by an asynchronous
+// "+CMQTTXXX: ...,<err>" line once the actual operation (which may involve
+// network round-trips) completes - see the MQTT AT Command Manual's
+// worked examples. Waits for both stages; true only if the trailing <err>
+// field (or, for CMQTTSTART, the only field) is 0.
+bool sendMqttCommand(const String &cmd, const String &resultPrefix, unsigned long ackTimeoutMs, unsigned long resultTimeoutMs) {
+  if (!sendAtCommand(cmd, "OK", ackTimeoutMs)) {
+    return false;
+  }
+
+  String resultLine;
+  if (!waitForAtResponse(resultPrefix, resultTimeoutMs, &resultLine)) {
+    return false;
+  }
+
+  int lastComma = resultLine.lastIndexOf(',');
+  int errCode = (lastComma >= 0) ? resultLine.substring(lastComma + 1).toInt() : resultLine.substring(resultPrefix.length()).toInt();
+  return errCode == 0;
 }
 
 void cellularTask(void *parameter) {
@@ -6411,6 +6554,7 @@ void webTask(void *parameter) {
     handleUplinkWiFiRetry();
     checkWifiUplinkStatusChange();
     pollDigitalIO();
+    logFreeHeapPeriodic();
     processDoWriteQueue();
 
     // One-time key-log entry the first time SNTP produces real time, so
