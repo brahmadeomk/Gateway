@@ -102,13 +102,14 @@
      Core 0) because modem.init()/testAT()/gprsConnect() etc. can block
      for several seconds - long enough that running it inline on webTask
      would stall the web UI and every other uplink alongside it.
-   - WiFi/cellular uplink failover (in progress): the raw-TCP uplink
-     client is a Client* (tcpClient, pointing at wifiTcpClient or
-     cellularTcpClient - a TinyGsmClient) instead of a concrete WiFiClient,
-     so connectTcpServer()/sendPayloadTcp()/pollTcpCommands()/the command
-     ack helpers all work unchanged regardless of which transport is
-     active - see activeUplinkTransport (currently hardcoded to WiFi; a
-     later stage adds the actual switch-on-WiFi-loss decision logic).
+   - Raw-TCP uplink transport plumbing: the raw-TCP uplink client is a
+     Client* (tcpClient, pointing at wifiTcpClient or cellularTcpClient - a
+     TinyGsmClient) instead of a concrete WiFiClient, so
+     connectTcpServer()/sendPayloadTcp()/pollTcpCommands()/the command ack
+     helpers all work unchanged regardless of which transport is active -
+     see activeUplinkTransport. In practice this always stays WiFi: raw TCP
+     mode targets a private LAN IP that cellular data can't route to, so by
+     design it never fails over (only the MQTT uplink does - see below).
      WiFiClient-only APIs (setNoDelay(), the 3-arg connect() timeout
      overload) aren't part of the generic Client interface, so those stay
      gated to the concrete wifiTcpClient object.
@@ -123,6 +124,15 @@
      sendMqttCommand(), right before cellularTask()) that talks to SerialAT
      directly - safe because cellularTask is SerialAT's sole owner and
      never overlaps these with a TinyGSM modem.xxx() call.
+   - WiFi<->cellular MQTT failover: webTask tracks how long WiFi has been
+     continuously up/down (checkWifiUplinkStatusChange()) and flips
+     mqttFailoverActive once it crosses UPLINK_FAILOVER_THRESHOLD_MS (5 min)
+     in either direction (updateMqttFailoverState()). cellularTask reads
+     that flag to decide whether to bring up/publish over its onboard MQTT
+     client or tear the session back down; webTask's sendCloudData() skips
+     its own WiFi MQTT attempt (and store & forward buffering) while
+     cellular is active, so the two transports never both deliver the same
+     data. Raw TCP mode is unaffected (see above).
    ====================================================================== */
 
 #include <WiFi.h>
@@ -289,6 +299,10 @@ const char *AI_PIN_LABELS[AI_CHANNEL_COUNT] = { "A0", "A1", "A2", "A3" };
 #define DEBUG_ERROR_REPEAT_MS 30000
 #define DEBUG_SUMMARY_INTERVAL_MS 10000
 #define WIFI_RETRY_INTERVAL_MS 5000
+// How long WiFi must be continuously down before the MQTT uplink fails over
+// to cellular, and how long it must be continuously back up before failing
+// back - same grace period both directions, per user spec.
+#define UPLINK_FAILOVER_THRESHOLD_MS (5UL * 60UL * 1000UL)
 #define TCP_CONNECT_TIMEOUT_MS 2000
 // Max wait for webTask's TCP-send feedback before moving to the next poll.
 #define TCP_SEND_TIMEOUT_MS 3000
@@ -318,21 +332,23 @@ WiFiClientSecure tlsClient;
 PubSubClient mqttClient(tlsClient);
 
 // Cellular modem (SIM7600G-H). SIM/registration/signal/data-session
-// monitoring is live (cellularTask()/CellularStatus); this stage adds the
-// plumbing to actually route raw-TCP uplink traffic over it once selected
-// (see activeUplinkTransport) - MQTT/TLS-over-cellular is deliberately not
-// included yet: TinyGsmClientSecure configures TLS via the modem's own
-// onboard SSL context (AT+CSSLCFG etc.), a different mechanism than
-// WiFiClientSecure's setCACert()/setCertificate()/setPrivateKey() PEM-text
-// API used for AWS IoT today, and needs its own design pass rather than
-// being assumed to be a drop-in swap.
+// monitoring, cert/SSL provisioning and the modem's own onboard MQTT client
+// (AT+CMQTT*) are all live (cellularTask()/CellularStatus) - see
+// mqttFailoverActive below for the WiFi<->cellular MQTT failover decision.
+//
+// Raw TCP uplink mode (cloudConfig.mode == UPLINK_MODE_TCP) is intentionally
+// NOT part of this failover: its target is a private LAN IP (e.g. a local
+// Node-RED instance), which cellular data simply cannot route to, so per
+// design it always stays on WiFi - activeUplinkTransport below is never
+// switched to cellular and exists only as unused-for-now plumbing from an
+// earlier stage.
 HardwareSerial SerialAT(2);
 TinyGsm modem(SerialAT);
 TinyGsmClient cellularTcpClient(modem);
 
-// Raw-TCP uplink client currently in use - a Client* so it can point at
-// either the WiFi or cellular transport. Hardcoded to WiFi for now;
-// switchUplinkTransport() (a later stage) is what actually flips it.
+// Raw-TCP uplink client - a Client* so connectTcpServer()/sendPayloadTcp()/
+// pollTcpCommands() work unchanged regardless of transport, but always left
+// pointed at WiFi (see comment above - raw TCP mode never fails over).
 #define UPLINK_TRANSPORT_WIFI 0
 #define UPLINK_TRANSPORT_CELLULAR 1
 uint8_t activeUplinkTransport = UPLINK_TRANSPORT_WIFI;
@@ -531,6 +547,17 @@ bool lastMqttConnectedState = false;
 unsigned long lastTcpFailLogTime = 0;
 unsigned long lastWifiFailLogTime = 0;
 unsigned long lastMqttFailLogTime = 0;
+
+// ===================== MQTT WiFi<->Cellular Failover =====================
+// wifiDownSince/wifiUpSince are set on each WiFi state transition (see
+// checkWifiUplinkStatusChange()); 0 means "not currently in that state".
+// mqttFailoverActive is written only by webTask (updateMqttFailoverState())
+// and read only by cellularTask - a plain bool read/write is atomic on this
+// platform, so no mutex, matching how cloudConfig fields are already shared
+// across these two tasks.
+unsigned long wifiDownSince = 0;
+unsigned long wifiUpSince = 0;
+bool mqttFailoverActive = false;
 
 // ===================== TCP / WiFi Uplink Config =====================
 struct UplinkConfig {
@@ -1883,10 +1910,34 @@ void checkWifiUplinkStatusChange() {
   if (connected != lastWifiUplinkConnected) {
     if (connected) {
       logKeyEvent("WIFI CONNECTED: " + WiFi.localIP().toString());
+      wifiUpSince = millis();
+      wifiDownSince = 0;
     } else {
       logKeyEvent("WIFI DISCONNECTED");
+      wifiDownSince = millis();
+      wifiUpSince = 0;
     }
     lastWifiUplinkConnected = connected;
+  }
+}
+
+// Decides whether the MQTT uplink should be on WiFi (primary) or cellular
+// (failover), based on how long WiFi has been continuously down/up - see
+// UPLINK_FAILOVER_THRESHOLD_MS. Only meaningful in MQTT mode; raw TCP mode
+// always stays on WiFi (see the activeUplinkTransport comment).
+void updateMqttFailoverState() {
+  bool wifiUp = (WiFi.status() == WL_CONNECTED);
+
+  if (!mqttFailoverActive) {
+    if (!wifiUp && wifiDownSince != 0 && millis() - wifiDownSince >= UPLINK_FAILOVER_THRESHOLD_MS) {
+      mqttFailoverActive = true;
+      logKeyEvent("UPLINK FAILOVER: MQTT switching to cellular (WiFi down " + String(UPLINK_FAILOVER_THRESHOLD_MS / 60000) + "+ min)");
+    }
+  } else {
+    if (wifiUp && wifiUpSince != 0 && millis() - wifiUpSince >= UPLINK_FAILOVER_THRESHOLD_MS) {
+      mqttFailoverActive = false;
+      logKeyEvent("UPLINK FAILBACK: MQTT switching back to WiFi (stable " + String(UPLINK_FAILOVER_THRESHOLD_MS / 60000) + "+ min)");
+    }
   }
 }
 
@@ -3450,6 +3501,16 @@ void sendCloudData() {
     return;
   }
 
+  // Cellular has taken over the MQTT uplink (see updateMqttFailoverState())
+  // and cellularTask independently publishes a fresh snapshot every cycle -
+  // nothing for the WiFi path to do. Skipping rather than buffering into
+  // store & forward is deliberate: if this still queued into sfBuffer,
+  // WiFi reconnecting would replay the whole outage window a second time
+  // on top of what cellular already delivered.
+  if (cloudConfig.mode == UPLINK_MODE_MQTT && mqttFailoverActive) {
+    return;
+  }
+
   String payload = buildTcpJson();
 
   int drained = 0;
@@ -4188,11 +4249,20 @@ void handleRoot() {
         html += "<br><b>Signal:</b> Unknown";
       }
       html += "<br><b>Data Session:</b> " + String(dataConnected ? "Connected" : "Not Connected");
-      html += " (not yet used for uplink traffic)";
       if (cloudConfig.mode == UPLINK_MODE_MQTT) {
         html += "<br><b>MQTT Certs on Modem:</b> " + String(mqttCertsProvisioned ? "Provisioned" : "Not yet provisioned");
         html += "<br><b>MQTT Session (cellular):</b> " + String(mqttSessionConnected ? "Connected, publishing" : "Not connected");
-        html += " (verification only - not yet the active/failover uplink)";
+
+        html += "<br><b>Active MQTT Uplink:</b> ";
+        if (mqttFailoverActive) {
+          html += "Cellular (failover)";
+        } else if (wifiDownSince != 0) {
+          unsigned long downSec = (millis() - wifiDownSince) / 1000;
+          unsigned long remainSec = (UPLINK_FAILOVER_THRESHOLD_MS / 1000 > downSec) ? (UPLINK_FAILOVER_THRESHOLD_MS / 1000 - downSec) : 0;
+          html += "WiFi (down " + String(downSec) + "s - failing over to cellular in " + String(remainSec) + "s if not restored)";
+        } else {
+          html += "WiFi (primary)";
+        }
       }
     }
 
@@ -6605,6 +6675,18 @@ bool advanceCellularMqttSession(bool &started, bool &clientAcquired, bool &sslBo
   return true;
 }
 
+// Closes the broker connection when WiFi has failed back and cellular MQTT
+// is no longer needed as the active uplink. Deliberately leaves
+// started/clientAcquired/sslBound alone (only the caller's `connected` flag
+// is reset) - AT+CMQTTSTART/ACCQ/SSLCFG don't need repeating for the next
+// failover, only AT+CMQTTCONNECT does, same as the existing publish-failure
+// retry path. Best-effort: even if the modem doesn't ack cleanly, the
+// session is being abandoned either way.
+void disconnectCellularMqttSession() {
+  String cmd = "AT+CMQTTDISC=" + String(CELLULAR_MQTT_CLIENT_INDEX) + ",60";
+  sendMqttCommand(cmd, "+CMQTTDISC:", CELLULAR_MQTT_CONNECT_TIMEOUT_MS);
+}
+
 // Publishes the same telemetry payload the WiFi/PubSubClient path sends
 // (buildTcpJson()), over the modem's own MQTT client instead.
 bool publishCellularMqttTelemetry() {
@@ -6726,14 +6808,20 @@ void cellularTask(void *parameter) {
       certsProvisioned = provisionCellularMqttCerts();
     }
 
-    // Verification stage: brings up an MQTT session and publishes
-    // telemetry over it every cycle, in parallel with whatever the WiFi
-    // path is doing - not yet the "active" uplink (see Stage 3d). Gated
-    // transitively through certsProvisioned (itself gated on MQTT mode),
-    // so this is a no-op in Raw TCP mode.
+    // Cellular MQTT is only brought up/published while it's actually the
+    // active uplink (mqttFailoverActive, set by webTask's
+    // updateMqttFailoverState() once WiFi has been down UPLINK_FAILOVER_
+    // THRESHOLD_MS) - not run continuously in parallel with WiFi, both to
+    // avoid duplicate telemetry reaching AWS IoT over two transports at
+    // once and to avoid burning cellular data while WiFi is healthy.
     bool wasMqttConnected = mqttConnected;
+    // mqttFailoverActive is only meaningful in MQTT mode (webTask stops
+    // updating it otherwise) - re-checking cloudConfig.mode here too covers
+    // the edge case of the uplink mode being switched away from MQTT while
+    // a cellular failover was active, so the session still tears down.
+    bool shouldBeConnected = mqttFailoverActive && cloudConfig.mode == UPLINK_MODE_MQTT;
 
-    if (certsProvisioned) {
+    if (certsProvisioned && shouldBeConnected) {
       if (!mqttConnected) {
         advanceCellularMqttSession(mqttStarted, mqttClientAcquired, mqttSslBound, mqttConnected);
       } else if (!publishCellularMqttTelemetry()) {
@@ -6742,6 +6830,13 @@ void cellularTask(void *parameter) {
       } else {
         logMessage("CELLULAR MQTT TELEMETRY PUBLISHED");
       }
+    } else if (mqttConnected && !shouldBeConnected) {
+      // WiFi has failed back - release the broker connection so cellular
+      // MQTT doesn't sit connected (and costing data) once it's no longer
+      // the active uplink. START/ACCQ/SSLCFG stay done for a fast reconnect
+      // on the next failover.
+      disconnectCellularMqttSession();
+      mqttConnected = false;
     }
 
     xSemaphoreTake(cellularMutex, portMAX_DELAY);
@@ -6767,6 +6862,9 @@ void webTask(void *parameter) {
 
     handleUplinkWiFiRetry();
     checkWifiUplinkStatusChange();
+    if (cloudConfig.mode == UPLINK_MODE_MQTT) {
+      updateMqttFailoverState();
+    }
     pollDigitalIO();
     logFreeHeapPeriodic();
     processDoWriteQueue();
