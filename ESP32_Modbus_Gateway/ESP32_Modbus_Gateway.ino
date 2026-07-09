@@ -6413,7 +6413,12 @@ void pollDigitalIO() {
 // servicing, and Digital I/O polling right along with it.
 #define MODEM_PWRKEY_PULSE_MS 1000
 #define MODEM_BOOT_WAIT_MS 10000
-#define CELLULAR_POLL_INTERVAL_MS 15000
+// Also the cadence of the cellular MQTT publish step during failover - kept
+// well above WiFi's typical ~1s poll interval since it costs metered SIM
+// data and a real over-the-air round-trip (higher/less predictable latency
+// than local WiFi) per publish, unlike the cheap local modem-status AT
+// commands (CSQ/CREG/etc.) sharing this same loop.
+#define CELLULAR_POLL_INTERVAL_MS 5000
 
 // PWRKEY pulse per the SIM7600 series' usual convention: briefly pull LOW
 // to trigger power-on, then release. Idle level, pulse polarity, and pulse
