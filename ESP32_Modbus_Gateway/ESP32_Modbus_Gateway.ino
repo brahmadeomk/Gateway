@@ -340,6 +340,7 @@ struct CellularStatus {
   bool networkRegistered;
   int signalQuality;  // AT+CSQ raw value: 0-31 (higher = better), 99 = unknown
   String operatorName;
+  bool dataConnected;  // PDP/data context up (modem.gprsConnect()) - not yet used for any uplink traffic
   unsigned long lastUpdateTime;
 };
 
@@ -504,6 +505,19 @@ struct UplinkConfig {
 };
 
 UplinkConfig uplinkConfig;
+
+// ===================== Cellular Modem Config =====================
+// APN is the only thing that needs to be user-set - everything else
+// (PWRKEY pin, UART pins/baud) is a compile-time hardware constant, not a
+// runtime setting. Blank APN is passed through as-is to gprsConnect() -
+// some SIM7600 firmware/carrier combos can auto-provision from the SIM
+// without an explicit APN; verify against your carrier if the data
+// session never comes up with it left blank.
+struct CellularConfig {
+  String apn;
+};
+
+CellularConfig cellularConfig;
 
 // ===================== Cloud Uplink Config =====================
 // clientId blank means "use the Device Name" (also the AWS Thing name
@@ -1747,6 +1761,28 @@ void loadDeviceConfig() {
   if (deviceConfig.deviceNamePrefix.length() > DEVICE_NAME_PREFIX_MAX_LEN) {
     deviceConfig.deviceNamePrefix = deviceConfig.deviceNamePrefix.substring(0, DEVICE_NAME_PREFIX_MAX_LEN);
   }
+}
+
+// ===================== Cellular Modem Config Save / Load =====================
+bool saveCellularConfig() {
+  nvsWriteFailures = 0;
+  preferences.begin("cellular", false);
+
+  trackNvsWrite(preferences.putString("apn", cellularConfig.apn));
+
+  preferences.end();
+
+  if (nvsWriteFailures > 0) {
+    logKeyEvent("NVS SAVE INCOMPLETE (cellular): " + String(nvsWriteFailures) + " write(s) failed - flash may be full, settings may not persist");
+  }
+
+  return nvsWriteFailures == 0;
+}
+
+void loadCellularConfig() {
+  preferences.begin("cellular", true);
+  cellularConfig.apn = preferences.getString("apn", "");
+  preferences.end();
 }
 
 // ===================== WiFi Uplink =====================
@@ -4054,7 +4090,7 @@ void handleRoot() {
   // uplink data path, so this box is informational, independent of the
   // WiFi/MQTT/TCP status above.
   {
-    bool modemResponding, simReady, networkRegistered;
+    bool modemResponding, simReady, networkRegistered, dataConnected;
     int signalQuality;
     String operatorName;
     unsigned long lastUpdateTime;
@@ -4065,6 +4101,7 @@ void handleRoot() {
     networkRegistered = cellularStatus.networkRegistered;
     signalQuality = cellularStatus.signalQuality;
     operatorName = cellularStatus.operatorName;
+    dataConnected = cellularStatus.dataConnected;
     lastUpdateTime = cellularStatus.lastUpdateTime;
     xSemaphoreGive(cellularMutex);
 
@@ -4083,6 +4120,8 @@ void handleRoot() {
       } else {
         html += "<br><b>Signal:</b> Unknown";
       }
+      html += "<br><b>Data Session:</b> " + String(dataConnected ? "Connected" : "Not Connected");
+      html += " (not yet used for uplink traffic)";
     }
 
     html += "</div>";
@@ -4927,6 +4966,29 @@ function toggleApSsidField() {
 
   flushHtmlChunk(html);
 
+  // CELLULAR MODEM FORM (SIM7600G-H - status monitoring only for now, see
+  // the Dashboard's Cellular Modem box; this APN is the only runtime
+  // setting it needs)
+  html += "<div class='box'>";
+  html += "<h2>Cellular Modem</h2>";
+  html += "<p><small>APN for the SIM7600G-H's data session. Leave blank to let the modem attempt auto-provisioning from the SIM - set explicitly if your carrier requires it and the Dashboard's Data Session never comes up.</small></p>";
+
+  if (server.hasArg("cellularSaveError")) {
+    html += "<div class='error'>Save FAILED - flash may be full. Check the Status Log; APN may not have persisted across reboot.</div>";
+  } else if (server.hasArg("cellularSaved")) {
+    html += "<div class='success'>Cellular Modem Settings Saved Successfully</div>";
+  }
+
+  html += "<form action='/saveCellular' method='POST'>";
+  html += "<table>";
+  html += "<tr><th>APN</th><td><input type='text' name='apn' placeholder='e.g. www or a carrier-specific M2M APN' value='" + htmlEscape(cellularConfig.apn) + "'></td></tr>";
+  html += "<tr><td colspan='2'><button type='submit'>Save Cellular Modem</button></td></tr>";
+  html += "</table>";
+  html += "</form>";
+  html += "</div>";
+
+  flushHtmlChunk(html);
+
   // COMMUNICATION (SERIAL) SETTINGS FORM
   html += "<div class='box'>";
   html += "<h2>RS485 Communication Settings</h2>";
@@ -5451,6 +5513,19 @@ void handleSaveDigitalIO() {
   server.send(303);
 }
 
+// ===================== Save Cellular Modem =====================
+void handleSaveCellular() {
+  cellularConfig.apn = server.arg("apn");
+  cellularConfig.apn.trim();
+
+  bool ok = saveCellularConfig();
+
+  logKeyEvent("CELLULAR MODEM SETTINGS SAVED: apn=" + (cellularConfig.apn.length() > 0 ? cellularConfig.apn : String("(blank/auto)")));
+
+  server.sendHeader("Location", ok ? "/settings?cellularSaved=1" : "/settings?cellularSaveError=1");
+  server.send(303);
+}
+
 // ===================== Save Cloud Uplink =====================
 // Minimal sanity check that content is PEM text, not an accidentally
 // selected binary (DER/.p12) or wrong file - protects the stored certs.
@@ -5835,6 +5910,7 @@ void setup() {
   loadDeviceConfig();
   loadCloudConfig();
   loadCerts();
+  loadCellularConfig();
 
   Serial1.begin(
     commBaudRate,
@@ -5880,6 +5956,7 @@ void setup() {
   server.on("/saveTypes", HTTP_POST, handleSaveTypes);
   server.on("/saveTcpTargets", HTTP_POST, handleSaveTcpTargets);
   server.on("/saveDigitalIO", HTTP_POST, handleSaveDigitalIO);
+  server.on("/saveCellular", HTTP_POST, handleSaveCellular);
   server.on("/reset", HTTP_GET, handleReset);
   server.on("/resetTypes", HTTP_GET, handleResetTypes);
 
@@ -6218,25 +6295,37 @@ void cellularTask(void *parameter) {
     bool registered = false;
     int signal = 99;
     String opName = "";
+    bool dataConnected = false;
 
     if (simReady) {
       registered = modem.isNetworkConnected();
       signal = modem.getSignalQuality();
       if (registered) {
         opName = modem.getOperator();
+
+        // Bring up (or confirm) the PDP/data context. Not yet used for any
+        // actual uplink traffic (see Client* abstraction in a later
+        // stage) - this only proves the data session itself comes up.
+        dataConnected = modem.isGprsConnected();
+        if (!dataConnected) {
+          logMessage("CELLULAR DATA SESSION CONNECTING (APN='" + cellularConfig.apn + "')");
+          dataConnected = modem.gprsConnect(cellularConfig.apn.c_str());
+        }
       }
     }
 
-    bool wasSimReady, wasRegistered;
+    bool wasSimReady, wasRegistered, wasDataConnected;
 
     xSemaphoreTake(cellularMutex, portMAX_DELAY);
     wasSimReady = cellularStatus.simReady;
     wasRegistered = cellularStatus.networkRegistered;
+    wasDataConnected = cellularStatus.dataConnected;
     cellularStatus.modemResponding = responding;
     cellularStatus.simReady = simReady;
     cellularStatus.networkRegistered = registered;
     cellularStatus.signalQuality = signal;
     cellularStatus.operatorName = opName;
+    cellularStatus.dataConnected = dataConnected;
     cellularStatus.lastUpdateTime = millis();
     xSemaphoreGive(cellularMutex);
 
@@ -6245,6 +6334,9 @@ void cellularTask(void *parameter) {
     }
     if (registered != wasRegistered) {
       logKeyEvent(registered ? ("CELLULAR NETWORK REGISTERED: " + opName) : "CELLULAR NETWORK LOST");
+    }
+    if (dataConnected != wasDataConnected) {
+      logKeyEvent(dataConnected ? "CELLULAR DATA SESSION UP" : "CELLULAR DATA SESSION DOWN");
     }
 
     vTaskDelay(pdMS_TO_TICKS(CELLULAR_POLL_INTERVAL_MS));
