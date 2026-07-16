@@ -59,19 +59,25 @@
      format on next boot, reclaiming the old keys via preferences.clear().
    - Write (command) path: a param opts in via writable/min/maxWriteValue
      (holding registers/coils only - see isWritableArea()). Every source
-     (dashboard /writeCommand, AWS IoT Device Shadow delta, raw-TCP command
-     line) funnels through submitWriteCommand(), which validates and
+     (dashboard /writeCommand, MQTT command topic, raw-TCP command line)
+     funnels through submitWriteCommand(), which validates and
      enqueues onto rtuWriteQueue or tcpWriteQueue by transport;
      modbusTask/tcpPollTask drain their own queue once per cycle
      (processRtuWriteQueue()/processTcpWriteQueue()), so a write never
-     crosses onto the other task's transport. Shadow writes get a
-     best-effort "reported" update on success only (queueShadowReport()/
-     drainShadowReportQueue()); raw-TCP writes get a JSON ack either way
-     (success or failure, queueTcpAck()/drainTcpAckQueue()/
-     sendTcpAckLine()) since that peer has no other channel to observe the
-     result on. Both are only ever published/sent from webTask, never
-     directly from modbusTask/tcpPollTask, which must not touch the
-     network/TLS stack.
+     crosses onto the other task's transport. Completed MQTT-sourced
+     writes get a JSON ack either way (success or failure) on the command
+     ack topic (queueMqttAck()/drainMqttAckQueue()/publishMqttAck());
+     raw-TCP writes likewise on the socket (queueTcpAck()/
+     drainTcpAckQueue()/sendTcpAckLine()). Both are only ever
+     published/sent from webTask, never directly from
+     modbusTask/tcpPollTask, which must not touch the network/TLS stack.
+   - MQTT command channel (cloud-agnostic): plain <identity>/commands
+     subscribe + <identity>/commands/ack publish (see mqttCommandTopic()),
+     same JSON command shapes as the raw-TCP channel - deliberately NO AWS
+     Device Shadow (which this replaced): shadow's desired/reported model
+     is AWS-proprietary, and portability to other brokers (Azure IoT Hub,
+     Mosquitto, ...) is a design goal. Only active when cloudConfig.mode
+     == UPLINK_MODE_MQTT and cloudConfig.commandsEnabled.
    - Raw TCP command channel: reuses the existing outbound tcpClient
      connection (the same one sendPayloadTcp() pushes telemetry on) instead
      of a separate listening socket - the master can send back newline-
@@ -90,7 +96,7 @@
      around. Digital Out reuses the Modbus write path's shape:
      submitDoWriteCommand() -> doWriteQueue -> processDoWriteQueue()
      (drained on webTask, not a dedicated task, since digitalWrite() can't
-     block), with the same WRITE_SOURCE_* tags - so Dashboard/AWS Shadow/
+     block), with the same WRITE_SOURCE_* tags - so Dashboard/MQTT/
      raw-TCP can all address a DO channel by name, falling back from
      findParamIndexByName() to findDoChannelIndexByName() wherever a
      command name doesn't match a Modbus param.
@@ -146,9 +152,9 @@
 // Manager). v2.8 is required for setBufferSize() at runtime.
 #include <PubSubClient.h>
 // External library: "ArduinoJson" by Benoit Blanchon, v6+ (Arduino Library
-// Manager). Used only to parse small inbound command payloads (AWS IoT
-// Device Shadow deltas) - all outgoing JSON is still hand-built via
-// jsonEscape()/String concatenation, unchanged.
+// Manager). Used only to parse small inbound command payloads (MQTT
+// command topic, raw-TCP command lines) - all outgoing JSON is still
+// hand-built via jsonEscape()/String concatenation, unchanged.
 #include <ArduinoJson.h>
 // External library: "TinyGSM" by Volodymyr Shymanskyy, v0.11+ (Arduino
 // Library Manager). Drives the SIM7600G-H cellular modem over its UART AT
@@ -412,8 +418,8 @@ struct LogQueueItem {
 };
 
 // ===================== Write Command Queues =====================
-// A write request (from the manual dashboard control, the AWS IoT Device
-// Shadow delta channel, and a future raw-TCP command channel) is validated
+// A write request (from the manual dashboard control, the MQTT command
+// topic, or the raw-TCP command channel) is validated
 // and enqueued by submitWriteCommand(), then routed to one of two queues by
 // the target parameter's transport - RTU writes are drained by modbusTask
 // (Core 1, under serialMutex, interleaved with polling); TCP writes are
@@ -423,15 +429,15 @@ struct LogQueueItem {
 #define WRITE_QUEUE_LEN 16
 
 #define WRITE_SOURCE_DASHBOARD 0
-#define WRITE_SOURCE_SHADOW 1
+#define WRITE_SOURCE_MQTT 1
 #define WRITE_SOURCE_TCP 2
 
 struct WriteCommand {
   int paramIndex;
   float value;  // engineering-unit value to write
   uint8_t source;  // WRITE_SOURCE_* - lets the drain functions know whether
-                   // a completed write needs a shadow "reported" update or
-                   // a raw-TCP command ack
+                   // a completed write needs an MQTT command ack or a
+                   // raw-TCP command ack
 };
 
 QueueHandle_t rtuWriteQueue;
@@ -440,30 +446,29 @@ QueueHandle_t tcpWriteQueue;
 // A write drain function (modbusTask/tcpPollTask) can't publish MQTT itself
 // - that would pull TLS/network work onto the real-time core or block on a
 // socket outside webTask's control. Instead it drops a tiny fixed-size item
-// here (non-blocking) whenever a WRITE_SOURCE_SHADOW command completes
-// successfully; webTask drains it and publishes the shadow "reported"
-// update. Best-effort: if this small queue is ever full, that one ack is
-// just dropped - it only affects cloud shadow sync fidelity, never the
-// actual Modbus write, which has already happened.
-#define SHADOW_REPORT_QUEUE_LEN 8
+// here (non-blocking) whenever a WRITE_SOURCE_MQTT command completes;
+// webTask drains it and publishes the JSON ack on the command ack topic
+// (see mqttCommandAckTopic()). Best-effort: if this small queue is ever
+// full, that one ack is just dropped - it only affects the peer's
+// visibility, never the actual Modbus write, which has already happened.
+#define MQTT_ACK_QUEUE_LEN 8
 // Matches STORED_NAME_LEN (param name field length) - kept as its own
 // constant here since that's defined later, alongside the blob storage
 // structs, and this queue item has nothing to do with blob storage.
-#define SHADOW_REPORT_NAME_LEN 32
+#define MQTT_ACK_NAME_LEN 32
 
-struct ShadowReportItem {
-  char name[SHADOW_REPORT_NAME_LEN];
+struct MqttAckItem {
+  char name[MQTT_ACK_NAME_LEN];
   float value;
+  uint8_t result;  // MB_SUCCESS or an MB_ERR_*/exception code
 };
 
-QueueHandle_t shadowReportQueue;
+QueueHandle_t mqttAckQueue;
 
-// Same idea as shadowReportQueue, but for the raw-TCP command channel (see
-// handleTcpCommandLine()/pollTcpCommands()): unlike shadow (which only acks
-// success, leaving a failure's delta pending for visibility in the AWS
-// console), a raw-TCP peer has no other channel, so every completed
-// WRITE_SOURCE_TCP command gets an ack either way - hence carrying the
-// result code here.
+// Same idea as mqttAckQueue, but for the raw-TCP command channel (see
+// handleTcpCommandLine()/pollTcpCommands()): every completed
+// WRITE_SOURCE_TCP command gets an ack either way - success or failure -
+// hence carrying the result code here.
 #define TCP_ACK_QUEUE_LEN 8
 #define TCP_ACK_NAME_LEN 32
 
@@ -481,7 +486,7 @@ QueueHandle_t tcpAckQueue;
 // digitalWrite() takes microseconds and can't block, so unlike the Modbus
 // writes it doesn't need its own dedicated drain task - processDoWriteQueue()
 // just runs inline on webTask (Core 0). Reuses the same WRITE_SOURCE_*
-// tags, so shadow/tcp acks work identically to the Modbus write path.
+// tags, so mqtt/tcp acks work identically to the Modbus write path.
 #define DO_QUEUE_LEN 16
 
 struct DoWriteCommand {
@@ -596,10 +601,11 @@ struct CloudConfig {
   int port;
   String clientId;
   String topic;
-  // AWS IoT Device Shadow command channel (see getShadowThingName()/
-  // connectMqtt()/mqttCallback()). Reuses clientId as the Thing name -
-  // the UI already documents "Should match the AWS IoT Thing name".
-  bool shadowEnabled;
+  // Cloud-agnostic MQTT command channel (see mqttCommandTopic()/
+  // connectMqtt()/mqttCallback()): plain <identity>/commands subscribe +
+  // <identity>/commands/ack publish - works on any broker (AWS IoT, Azure
+  // IoT Hub via its MQTT bridge, Mosquitto, ...), no AWS Shadow semantics.
+  bool commandsEnabled;
 };
 
 CloudConfig cloudConfig;
@@ -1723,7 +1729,7 @@ bool saveCloudConfig() {
   trackNvsWrite(preferences.putInt("port", cloudConfig.port));
   trackNvsWrite(preferences.putString("cid", cloudConfig.clientId));
   trackNvsWrite(preferences.putString("topic", cloudConfig.topic));
-  trackNvsWrite(preferences.putBool("shadowEn", cloudConfig.shadowEnabled));
+  trackNvsWrite(preferences.putBool("cmdEn", cloudConfig.commandsEnabled));
 
   preferences.end();
 
@@ -1742,7 +1748,10 @@ void loadCloudConfig() {
   cloudConfig.port = preferences.getInt("port", DEFAULT_MQTT_PORT);
   cloudConfig.clientId = preferences.getString("cid", "");
   cloudConfig.topic = preferences.getString("topic", DEFAULT_MQTT_TOPIC);
-  cloudConfig.shadowEnabled = preferences.getBool("shadowEn", false);
+  // Falls back to the old Shadow-channel enable flag so a device upgraded
+  // from the Shadow firmware keeps its command channel on without a
+  // reconfigure - the semantics carried over (inbound MQTT commands).
+  cloudConfig.commandsEnabled = preferences.getBool("cmdEn", preferences.getBool("shadowEn", false));
 
   preferences.end();
 
@@ -3003,7 +3012,7 @@ bool sendPayloadTcp(const String &payload) {
 // a plain `72` vs `72.0`) - it can come back false for integer literals,
 // which silently rejected every whole-number command as "malformed".
 // Checking is<long>() too catches both forms. Shared by both inbound
-// command parsers below (raw-TCP, shadow delta).
+// command parsers below (raw-TCP, MQTT command topic).
 bool isJsonNumber(JsonVariantConst v) {
   return v.is<float>() || v.is<long>();
 }
@@ -3088,11 +3097,10 @@ bool findDigitalIOValueByName(const String &name, float &outValue, bool &outEnab
 // poll; omitted (along with value) if it's never been successfully polled.
 // Falls back to Digital/Analog I/O channels by name if no Modbus param
 // matches, so one query command covers both namespaces.
-void sendTcpQueryResponse(const String &name) {
-  if (!tcpClient->connected()) {
-    return;
-  }
-
+// Builds the response JSON (no trailing newline) - shared by the raw-TCP
+// channel above and the MQTT command channel (handleMqttCommand()), so
+// both reply identically. channelLabel only feeds the rejection log line.
+String buildQueryResponseJson(const String &name, const char *channelLabel) {
   int idx = findParamIndexByName(name);
 
   if (idx >= 0) {
@@ -3114,10 +3122,8 @@ void sendTcpQueryResponse(const String &name) {
     if (lastUpdateTime > 0) {
       line += ",\"ageMs\":" + String(millis() - lastUpdateTime);
     }
-    line += "}\n";
-
-    tcpClient->write((const uint8_t *)line.c_str(), line.length());
-    return;
+    line += "}";
+    return line;
   }
 
   float dioValue;
@@ -3130,21 +3136,27 @@ void sendTcpQueryResponse(const String &name) {
     if (dioLastUpdateMs > 0) {
       line += ",\"ageMs\":" + String(millis() - dioLastUpdateMs);
     }
-    line += "}\n";
+    line += "}";
+    return line;
+  }
 
-    tcpClient->write((const uint8_t *)line.c_str(), line.length());
+  logKeyEvent(String(channelLabel) + " QUERY REJECTED: no parameter named '" + name + "'");
+  return "{\"query\":\"" + jsonEscape(name) + "\",\"status\":\"ERR\",\"reason\":\"unknown parameter\"}";
+}
+
+void sendTcpQueryResponse(const String &name) {
+  if (!tcpClient->connected()) {
     return;
   }
 
-  logKeyEvent("TCP QUERY REJECTED: no parameter named '" + name + "'");
-  String line = "{\"query\":\"" + jsonEscape(name) + "\",\"status\":\"ERR\",\"reason\":\"unknown parameter\"}\n";
+  String line = buildQueryResponseJson(name, "TCP") + "\n";
   tcpClient->write((const uint8_t *)line.c_str(), line.length());
 }
 
 // Parses one inbound command line - either a read {"query":"Name"} (answered
 // immediately by sendTcpQueryResponse()) or a write
 // {"param":"Name","value":N} queued via the same validated
-// submitWriteCommand() path as the dashboard/shadow channels. Immediate
+// submitWriteCommand() path as the dashboard/MQTT channels. Immediate
 // write rejections (parse error, unknown param, submitWriteCommand()
 // validation failure) are acked right away; a successfully queued write's
 // real result is acked later, once modbusTask/tcpPollTask actually
@@ -3223,92 +3235,129 @@ void pollTcpCommands() {
   }
 }
 
-// ===================== AWS IoT Device Shadow (command channel) =====================
-// Reuses the MQTT client ID as the Thing name - the Cloud settings page
-// already documents "Should match the AWS IoT Thing name / policy", so no
-// separate Thing Name field is needed. Only active when
-// cloudConfig.shadowEnabled is set - see connectMqtt()/mqttCallback().
-#define SHADOW_DELTA_MAX_LEN 512
+// ===================== MQTT Command Channel (cloud-agnostic) =====================
+// Plain MQTT topics with no cloud-specific semantics - works against any
+// broker (AWS IoT Core, Azure IoT Hub, Mosquitto, EMQX, ...), unlike the
+// AWS Device Shadow channel this replaced. One JSON command per message on
+// <identity>/commands, same command shapes as the raw-TCP channel:
+//   write: {"param":"Name","value":42}
+//   read:  {"query":"Name"}
+// Acks and query responses are published on <identity>/commands/ack, in
+// the same JSON shapes the raw-TCP channel sends, so a master can share
+// its parsing code between both transports. Identity is the MQTT Client
+// ID (or Device Name when no client ID is configured) - the same identity
+// the connection itself uses. Only active when
+// cloudConfig.commandsEnabled is set - see connectMqtt()/mqttCallback().
+#define MQTT_CMD_MAX_LEN 512
 
-String getShadowThingName() {
+String mqttCommandIdentity() {
   if (cloudConfig.clientId.length() > 0) return cloudConfig.clientId;
   return getDeviceName();
 }
 
-String shadowDeltaTopic() {
-  return "$aws/things/" + getShadowThingName() + "/shadow/update/delta";
+String mqttCommandTopic() {
+  return mqttCommandIdentity() + "/commands";
 }
 
-String shadowUpdateTopic() {
-  return "$aws/things/" + getShadowThingName() + "/shadow/update";
+String mqttCommandAckTopic() {
+  return mqttCommandIdentity() + "/commands/ack";
 }
 
 // PubSubClient's buffer holds one full message (topic+payload) in either
 // direction and never auto-grows mid-message - it must already be large
-// enough for the biggest shadow delta/report before mqttClient.loop() can
-// receive one. sendPayloadMqtt() separately grows the buffer to fit each
-// outgoing telemetry publish; this is just the floor for shadow traffic,
-// applied right after connect so it covers messages that arrive before the
-// first telemetry publish.
-uint16_t shadowMqttBufferFloor() {
-  if (!cloudConfig.shadowEnabled) return 0;
-  uint16_t topicLen = (uint16_t)max(shadowDeltaTopic().length(), shadowUpdateTopic().length());
-  return topicLen + SHADOW_DELTA_MAX_LEN + 64;
+// enough for the biggest inbound command/outbound ack before
+// mqttClient.loop() can receive one. sendPayloadMqtt() separately grows
+// the buffer to fit each outgoing telemetry publish; this is just the
+// floor for command traffic, applied right after connect so it covers
+// messages that arrive before the first telemetry publish.
+uint16_t commandMqttBufferFloor() {
+  if (!cloudConfig.commandsEnabled) return 0;
+  uint16_t topicLen = (uint16_t)max(mqttCommandTopic().length(), mqttCommandAckTopic().length());
+  return topicLen + MQTT_CMD_MAX_LEN + 64;
 }
 
-// Parses an AWS IoT Device Shadow delta payload
-// ({"state":{"paramName":value,...},...}) and queues a write for each key
-// that matches an existing parameter by name. Unrecognized/non-numeric
-// keys are logged and skipped rather than aborting the rest of the delta.
-void handleShadowDelta(byte *payload, unsigned int length) {
-  if (length == 0 || length > SHADOW_DELTA_MAX_LEN) {
-    logKeyEvent("SHADOW DELTA IGNORED: payload size " + String(length) + " out of bounds");
+// Publishes one JSON ack on the command ack topic - same shape as the
+// raw-TCP channel's sendTcpAckLine() (minus the newline framing, which
+// MQTT's own message boundaries make redundant).
+void publishMqttAck(const String &name, float value, bool ok, uint8_t code, const String &reason) {
+  if (!mqttClient.connected()) {
     return;
   }
 
-  DynamicJsonDocument doc(length + 256);
+  String line = "{\"ack\":\"" + jsonEscape(name) + "\",\"value\":" + String(value, 3) + ",\"ok\":" + (ok ? "true" : "false") + ",\"code\":" + String(code);
+  if (reason.length() > 0) {
+    line += ",\"reason\":\"" + jsonEscape(reason) + "\"";
+  }
+  line += "}";
+
+  if (!mqttClient.publish(mqttCommandAckTopic().c_str(), line.c_str())) {
+    logKeyEvent("MQTT ACK PUBLISH FAILED: " + name);
+  }
+}
+
+// Parses one inbound command message - mirrors handleTcpCommandLine()
+// exactly, just with MQTT publishes instead of socket writes for the
+// replies. Immediate rejections (parse error, unknown param, validation
+// failure) are acked right away; a successfully queued write's real
+// result is acked later via queueMqttAck()/drainMqttAckQueue().
+//
+// Safe to publish from inside the PubSubClient callback here: the inbound
+// payload is fully copied into the JsonDocument before any publish call
+// could reuse the client's shared rx/tx buffer.
+void handleMqttCommand(byte *payload, unsigned int length) {
+  if (length == 0 || length > MQTT_CMD_MAX_LEN) {
+    logKeyEvent("MQTT CMD IGNORED: payload size " + String(length) + " out of bounds");
+    return;
+  }
+
+  DynamicJsonDocument doc(length + 128);
   DeserializationError err = deserializeJson(doc, payload, length);
   if (err) {
-    logKeyEvent("SHADOW DELTA PARSE ERROR: " + String(err.c_str()));
+    logKeyEvent("MQTT CMD PARSE ERROR: " + String(err.c_str()));
     return;
   }
 
-  JsonObject state = doc["state"];
-  if (state.isNull()) {
+  if (doc["query"].is<const char *>()) {
+    String response = buildQueryResponseJson(doc["query"].as<String>(), "MQTT");
+    mqttClient.publish(mqttCommandAckTopic().c_str(), response.c_str());
     return;
   }
 
-  for (JsonPair kv : state) {
-    String paramName = String(kv.key().c_str());
-
-    if (!isJsonNumber(kv.value())) {
-      logKeyEvent("SHADOW DELTA REJECTED: " + paramName + " is not numeric");
-      continue;
-    }
-
-    float value = kv.value().as<float>();
-
-    int idx = findParamIndexByName(paramName);
-    if (idx >= 0) {
-      submitWriteCommand(idx, value, WRITE_SOURCE_SHADOW);
-      continue;
-    }
-
-    int doIdx = findDoChannelIndexByName(paramName);
-    if (doIdx >= 0) {
-      submitDoWriteCommand(doIdx, value != 0, WRITE_SOURCE_SHADOW);
-      continue;
-    }
-
-    logKeyEvent("SHADOW DELTA REJECTED: no parameter named '" + paramName + "'");
+  if (!doc["param"].is<const char *>() || !isJsonNumber(doc["value"])) {
+    logKeyEvent("MQTT CMD REJECTED: malformed command (missing param/value, or query)");
+    return;
   }
+
+  String paramName = doc["param"].as<String>();
+  float value = doc["value"].as<float>();
+
+  int idx = findParamIndexByName(paramName);
+  if (idx >= 0) {
+    if (!submitWriteCommand(idx, value, WRITE_SOURCE_MQTT)) {
+      // submitWriteCommand() already logged the specific reason.
+      publishMqttAck(paramName, value, false, 0xFF, "rejected - see Status Log");
+    }
+    // else: queued OK - the real ack comes later via mqttAckQueue.
+    return;
+  }
+
+  int doIdx = findDoChannelIndexByName(paramName);
+  if (doIdx >= 0) {
+    if (!submitDoWriteCommand(doIdx, value != 0, WRITE_SOURCE_MQTT)) {
+      publishMqttAck(paramName, value, false, 0xFF, "rejected - see Status Log");
+    }
+    return;
+  }
+
+  logKeyEvent("MQTT CMD REJECTED: no parameter named '" + paramName + "'");
+  publishMqttAck(paramName, value, false, 0xFF, "unknown parameter");
 }
 
 // PubSubClient callback - runs inside mqttClient.loop() on webTask (Core 0).
-// Only the shadow delta topic is ever subscribed today, so no topic
-// dispatch table is needed yet.
+// Only the command topic is ever subscribed today, so no topic dispatch
+// table is needed yet.
 void mqttCallback(char *topic, byte *payload, unsigned int length) {
-  handleShadowDelta(payload, length);
+  handleMqttCommand(payload, length);
 }
 
 // ===================== MQTT / AWS IoT Uplink =====================
@@ -3381,16 +3430,16 @@ bool connectMqtt() {
 
   logMessage("MQTT OK");
 
-  if (cloudConfig.shadowEnabled) {
-    // Must be sized before subscribing - a delta could arrive on the very
+  if (cloudConfig.commandsEnabled) {
+    // Must be sized before subscribing - a command could arrive on the very
     // next mqttClient.loop() call, and the buffer never auto-grows mid-message.
-    mqttClient.setBufferSize(shadowMqttBufferFloor());
+    mqttClient.setBufferSize(commandMqttBufferFloor());
 
-    String deltaTopic = shadowDeltaTopic();
-    if (mqttClient.subscribe(deltaTopic.c_str())) {
-      logKeyEvent("SHADOW SUBSCRIBED: " + deltaTopic);
+    String cmdTopic = mqttCommandTopic();
+    if (mqttClient.subscribe(cmdTopic.c_str())) {
+      logKeyEvent("MQTT CMD SUBSCRIBED: " + cmdTopic);
     } else {
-      logKeyEvent("SHADOW SUBSCRIBE FAILED: " + deltaTopic);
+      logKeyEvent("MQTT CMD SUBSCRIBE FAILED: " + cmdTopic);
     }
   }
 
@@ -3420,11 +3469,11 @@ bool sendPayloadMqtt(const String &payload) {
 
   // PubSubClient's default packet buffer (256 bytes) is far too small for
   // this payload - grow it to fit before every publish (no-op when already
-  // large enough). Never shrink below the shadow floor - the client stays
-  // subscribed to the delta topic across publishes, and an inbound delta
-  // must still fit.
+  // large enough). Never shrink below the command floor - the client stays
+  // subscribed to the command topic across publishes, and an inbound
+  // command must still fit.
   uint16_t needed = payload.length() + cloudConfig.topic.length() + 16;
-  needed = max(needed, shadowMqttBufferFloor());
+  needed = max(needed, commandMqttBufferFloor());
   if (!mqttClient.setBufferSize(needed)) {
     logMessage("MQTT BUFFER ALLOC FAILED (" + String(needed) + " bytes)");
     return false;
@@ -3575,7 +3624,7 @@ void logModbusStatusChange(int index) {
 }
 
 // Case-sensitive lookup by the user-assigned param name, for command
-// channels (shadow, raw-TCP) that address a parameter by name rather than
+// channels (MQTT, raw-TCP) that address a parameter by name rather than
 // by table index. Returns -1 if no enabled or disabled row matches.
 int findParamIndexByName(const String &name) {
   int found = -1;
@@ -3593,7 +3642,7 @@ int findParamIndexByName(const String &name) {
 }
 
 // Same idea, for Digital Out channels - checked as a fallback wherever a
-// command name doesn't match a Modbus param (see handleShadowDelta(),
+// command name doesn't match a Modbus param (see handleMqttCommand(),
 // handleTcpCommandLine()), so the two namespaces share one command surface.
 int findDoChannelIndexByName(const String &name) {
   int found = -1;
@@ -3613,7 +3662,7 @@ int findDoChannelIndexByName(const String &name) {
 // Human-readable tag for key-log lines - keeps the WRITE_SOURCE_* routing
 // value as the single source of truth instead of passing a parallel string.
 String writeSourceLabel(uint8_t source) {
-  if (source == WRITE_SOURCE_SHADOW) return "shadow";
+  if (source == WRITE_SOURCE_MQTT) return "mqtt-cmd";
   if (source == WRITE_SOURCE_TCP) return "tcp-cmd";
   return "dashboard";
 }
@@ -3671,19 +3720,20 @@ bool submitWriteCommand(int paramIndex, float value, uint8_t source) {
   return true;
 }
 
-// Non-blocking best-effort handoff to webTask - see the ShadowReportItem
-// comment near shadowReportQueue. Called by both drain functions below
-// right after a successful WRITE_SOURCE_SHADOW write.
-void queueShadowReport(const String &name, float value) {
-  ShadowReportItem item;
-  name.toCharArray(item.name, SHADOW_REPORT_NAME_LEN);
+// Non-blocking best-effort handoff to webTask - see the MqttAckItem
+// comment near mqttAckQueue. Called by the drain functions below after a
+// completed WRITE_SOURCE_MQTT write, success or failure - the MQTT peer
+// gets an ack either way, same as the raw-TCP channel.
+void queueMqttAck(const String &name, float value, uint8_t result) {
+  MqttAckItem item;
+  name.toCharArray(item.name, MQTT_ACK_NAME_LEN);
   item.value = value;
-  xQueueSend(shadowReportQueue, &item, 0);
+  item.result = result;
+  xQueueSend(mqttAckQueue, &item, 0);
 }
 
 // Same non-blocking best-effort handoff, for a completed WRITE_SOURCE_TCP
-// write - called by both drain functions below regardless of the result,
-// since (unlike shadow) the raw-TCP peer needs an ack either way.
+// write - called by both drain functions below regardless of the result.
 void queueTcpAck(const String &name, float value, uint8_t result) {
   TcpAckItem item;
   name.toCharArray(item.name, TCP_ACK_NAME_LEN);
@@ -3744,8 +3794,8 @@ void processRtuWriteQueue() {
 
     logKeyEvent("WRITE " + String(result == MB_SUCCESS ? "OK" : ("FAILED code " + String(result))) + ": " + pname + " = " + String(cmd.value, 3));
 
-    if (cmd.source == WRITE_SOURCE_SHADOW && result == MB_SUCCESS) {
-      queueShadowReport(pname, cmd.value);
+    if (cmd.source == WRITE_SOURCE_MQTT) {
+      queueMqttAck(pname, cmd.value, result);
     } else if (cmd.source == WRITE_SOURCE_TCP) {
       queueTcpAck(pname, cmd.value, result);
     }
@@ -3792,8 +3842,8 @@ void processTcpWriteQueue() {
 
     logKeyEvent("WRITE " + String(result == MB_SUCCESS ? "OK" : ("FAILED code " + String(result))) + ": " + pname + " = " + String(cmd.value, 3));
 
-    if (cmd.source == WRITE_SOURCE_SHADOW && result == MB_SUCCESS) {
-      queueShadowReport(pname, cmd.value);
+    if (cmd.source == WRITE_SOURCE_MQTT) {
+      queueMqttAck(pname, cmd.value, result);
     } else if (cmd.source == WRITE_SOURCE_TCP) {
       queueTcpAck(pname, cmd.value, result);
     }
@@ -3841,7 +3891,7 @@ bool submitDoWriteCommand(int channelIndex, bool value, uint8_t source) {
 // Drains doWriteQueue - called every webTask cycle (see webTask()). A
 // digitalWrite() can't fail the way a Modbus transaction can, so unlike
 // processRtuWriteQueue()/processTcpWriteQueue() there's no result code:
-// shadow/tcp acks always report success once a queued command reaches here.
+// mqtt/tcp acks always report success once a queued command reaches here.
 void processDoWriteQueue() {
   DoWriteCommand cmd;
 
@@ -3861,8 +3911,8 @@ void processDoWriteQueue() {
 
     logKeyEvent("DO WRITE OK: " + cname + " = " + String(cmd.value ? "ON" : "OFF"));
 
-    if (cmd.source == WRITE_SOURCE_SHADOW) {
-      queueShadowReport(cname, cmd.value ? 1 : 0);
+    if (cmd.source == WRITE_SOURCE_MQTT) {
+      queueMqttAck(cname, cmd.value ? 1 : 0, MB_SUCCESS);
     } else if (cmd.source == WRITE_SOURCE_TCP) {
       queueTcpAck(cname, cmd.value ? 1 : 0, MB_SUCCESS);
     }
@@ -4989,7 +5039,7 @@ function toggleApSsidField() {
   html += ">Raw TCP (Master IP/Port above)</option>";
   html += "<option value='mqtt'";
   if (cloudConfig.mode == UPLINK_MODE_MQTT) html += " selected";
-  html += ">AWS IoT MQTT over TLS</option>";
+  html += ">MQTT over TLS (AWS IoT / any broker)</option>";
   html += "</select></td></tr>";
 
   html += "<tr><th>MQTT Endpoint</th><td><input type='text' name='mqttEndpoint' placeholder='xxxx-ats.iot.region.amazonaws.com' value='" + htmlEscape(cloudConfig.endpoint) + "'></td></tr>";
@@ -4998,9 +5048,9 @@ function toggleApSsidField() {
           "<br><small>Should match the AWS IoT Thing name / policy.</small></td></tr>";
   html += "<tr><th>Publish Topic</th><td><input type='text' name='mqttTopic' value='" + htmlEscape(cloudConfig.topic) + "'></td></tr>";
 
-  html += "<tr><th>Device Shadow Commands</th><td><input type='checkbox' name='shadowEnabled'";
-  if (cloudConfig.shadowEnabled) html += " checked";
-  html += "> Enable (subscribes to <code>$aws/things/&lt;Client ID&gt;/shadow/update/delta</code> - writes come from the shadow's <b>desired</b> state, keyed by parameter name)</td></tr>";
+  html += "<tr><th>MQTT Command Topic</th><td><input type='checkbox' name='cmdEnabled'";
+  if (cloudConfig.commandsEnabled) html += " checked";
+  html += "> Enable (subscribes to <code>" + htmlEscape(mqttCommandTopic()) + "</code> - write: <code>{\"param\":\"Name\",\"value\":42}</code>, read: <code>{\"query\":\"Name\"}</code>; acks/responses on <code>" + htmlEscape(mqttCommandAckTopic()) + "</code>. Plain MQTT topics - works with any broker, no AWS-specific features.)</td></tr>";
 
   // Certs: never echoed back - a blank/empty field keeps the stored value,
   // same pattern as the WiFi password above. Each can be provided either
@@ -5075,7 +5125,7 @@ function toggleApSsidField() {
   // DIGITAL I/O FORM (local GPIO - independent of the Modbus buses above)
   html += "<div class='box'>";
   html += "<h2>Digital I/O</h2>";
-  html += "<p><small>Local GPIO channels, read/written directly - not Modbus. Digital In reads inverted (see firmware notes: HIGH/idle = false, pulled LOW = true) to match a typical opto-isolator input module; Digital Out writes go through the same write-queue/command-channel path as writable Modbus parameters (Dashboard, AWS Shadow, raw TCP), keyed by name.</small></p>";
+  html += "<p><small>Local GPIO channels, read/written directly - not Modbus. Digital In reads inverted (see firmware notes: HIGH/idle = false, pulled LOW = true) to match a typical opto-isolator input module; Digital Out writes go through the same write-queue/command-channel path as writable Modbus parameters (Dashboard, MQTT command topic, raw TCP), keyed by name.</small></p>";
 
   if (server.hasArg("digioSaveError")) {
     html += "<div class='error'>Save FAILED - flash may be full. Check the Status Log; Digital I/O settings may not have persisted across reboot.</div>";
@@ -5774,7 +5824,7 @@ void handleSaveCloud() {
     cloudConfig.topic = DEFAULT_MQTT_TOPIC;
   }
 
-  cloudConfig.shadowEnabled = server.hasArg("shadowEnabled");
+  cloudConfig.commandsEnabled = server.hasArg("cmdEnabled");
 
   bool ok = saveCloudConfig();
 
@@ -5964,8 +6014,8 @@ void handleKeyLog() {
 }
 
 // ===================== Manual Write Command Endpoint =====================
-// Dashboard-driven write, for manually testing the write path before the
-// automatic command channels (Device Shadow / raw TCP) exist.
+// Dashboard-driven write - same validated path as the automatic command
+// channels (MQTT command topic / raw TCP).
 void handleWriteCommand() {
   int paramIndex = server.arg("param").toInt();
   float value = server.arg("value").toFloat();
@@ -6018,7 +6068,7 @@ void setup() {
   logQueue = xQueueCreate(LOG_QUEUE_LEN, sizeof(LogQueueItem));
   rtuWriteQueue = xQueueCreate(WRITE_QUEUE_LEN, sizeof(WriteCommand));
   tcpWriteQueue = xQueueCreate(WRITE_QUEUE_LEN, sizeof(WriteCommand));
-  shadowReportQueue = xQueueCreate(SHADOW_REPORT_QUEUE_LEN, sizeof(ShadowReportItem));
+  mqttAckQueue = xQueueCreate(MQTT_ACK_QUEUE_LEN, sizeof(MqttAckItem));
   tcpAckQueue = xQueueCreate(TCP_ACK_QUEUE_LEN, sizeof(TcpAckItem));
   doWriteQueue = xQueueCreate(DO_QUEUE_LEN, sizeof(DoWriteCommand));
 
@@ -6322,25 +6372,18 @@ void logTask(void *parameter) {
   }
 }
 
-// Publishes a shadow "reported" update for each completed shadow-sourced
-// write - see the shadowReportQueue comment near its declaration. Only
-// webTask touches mqttClient.publish(), so this is the only place that
-// drains this queue.
-void drainShadowReportQueue() {
-  ShadowReportItem item;
+// Publishes a completion ack for each finished WRITE_SOURCE_MQTT command -
+// see the MqttAckItem comment near mqttAckQueue. Only webTask touches
+// mqttClient.publish(), so this is the only place that drains this queue.
+void drainMqttAckQueue() {
+  MqttAckItem item;
 
-  while (xQueueReceive(shadowReportQueue, &item, 0) == pdTRUE) {
-    if (!cloudConfig.shadowEnabled || !mqttClient.connected()) {
-      continue;  // shadow turned off / uplink dropped since this was queued
+  while (xQueueReceive(mqttAckQueue, &item, 0) == pdTRUE) {
+    if (!cloudConfig.commandsEnabled || !mqttClient.connected()) {
+      continue;  // commands turned off / uplink dropped since this was queued
     }
 
-    String payload = "{\"state\":{\"reported\":{\"" + jsonEscape(String(item.name)) + "\":" + String(item.value, 3) + "}}}";
-
-    if (mqttClient.publish(shadowUpdateTopic().c_str(), payload.c_str())) {
-      logMessage("SHADOW REPORTED: " + String(item.name) + " = " + String(item.value, 3));
-    } else {
-      logKeyEvent("SHADOW REPORT PUBLISH FAILED: " + String(item.name));
-    }
+    publishMqttAck(String(item.name), item.value, item.result == MB_SUCCESS, item.result, "");
   }
 }
 
@@ -6929,7 +6972,7 @@ void webTask(void *parameter) {
       // Services MQTT keepalive pings and inbound packets between publishes.
       if (mqttClient.connected()) {
         mqttClient.loop();
-        drainShadowReportQueue();
+        drainMqttAckQueue();
       }
       checkMqttUplinkStatusChange();
     } else {

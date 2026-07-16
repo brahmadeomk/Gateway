@@ -13,8 +13,9 @@ forwards it to a master system over one of two uplinks:
 
 - **Raw TCP** — a bidirectional newline-JSON connection to a master/SCADA
   system on your local network.
-- **AWS IoT MQTT over TLS** — publishes telemetry to AWS IoT Core, with
-  optional two-way commands via AWS IoT Device Shadow.
+- **MQTT over TLS** — publishes telemetry to any MQTT broker (AWS IoT
+  Core, Azure IoT Hub, Mosquitto, …), with an optional two-way command
+  topic using plain, cloud-agnostic MQTT (no AWS-specific features).
 
 It also has:
 - 4 Digital Inputs, 4 Digital Outputs, and 4 Analog Inputs (local GPIO,
@@ -114,7 +115,7 @@ One row per Modbus parameter, up to 100 rows. Columns:
 
 | Column | Meaning |
 |---|---|
-| Name | Display name, also the key used for writes/queries/Shadow |
+| Name | Display name, also the key used for writes/queries over MQTT/TCP |
 | Transport | **RTU (RS485)** or **TCP (Network)** — see §5.4 |
 | Register Area | Holding Register, Input Register, Coil, or Discrete Input |
 | Data Type | Scaling/format — see §5.2 (Data Types) |
@@ -153,13 +154,14 @@ add up to 20 custom types, or **Reset Data Types** to restore the defaults.
   public NTP (`pool.ntp.org`, then `time.nist.gov`).
 
 ### 5.5 Cloud Uplink
-- **Uplink Mode** — **Raw TCP** or **AWS IoT MQTT over TLS** (§6).
+- **Uplink Mode** — **Raw TCP** or **MQTT over TLS (AWS IoT / any broker)** (§6).
 - MQTT fields (only used in MQTT mode): **Endpoint**, **Port**,
   **Client ID** (blank = Device Name), **Publish Topic**.
-- **Device Shadow Commands** — enables the two-way AWS IoT Shadow command
-  channel (§7.2).
+- **MQTT Command Topic** — enables the two-way MQTT command channel
+  (§7.2). The exact subscribe/ack topic names are shown next to the
+  checkbox.
 - **Root CA / Device Certificate / Private Key** — paste PEM text or
-  upload the files from AWS IoT. Fields are never echoed back for
+  upload the files from your broker/CA. Fields are never echoed back for
   security; leave blank to keep the currently-stored value.
 
 ### 5.6 Modbus TCP Targets
@@ -201,12 +203,13 @@ sends newline-terminated JSON telemetry every poll cycle:
 The same connection is bidirectional — your master can send commands back
 down the same socket (see §7.3).
 
-### 6.2 AWS IoT MQTT over TLS
-The gateway connects to your AWS IoT endpoint using mutual TLS (device
+### 6.2 MQTT over TLS
+The gateway connects to your MQTT endpoint using mutual TLS (device
 cert + private key + Root CA, configured in Settings) and publishes the
 same telemetry JSON shape to your configured topic on every poll cycle.
-If **Device Shadow Commands** is enabled, it also subscribes to
-`$aws/things/<Client ID>/shadow/update/delta` for inbound writes (§7.2).
+Works with AWS IoT Core or any other broker that accepts
+certificate-based MQTT/TLS. If **MQTT Command Topic** is enabled, it also
+subscribes to `<Client ID>/commands` for inbound writes/reads (§7.2).
 
 ---
 
@@ -221,15 +224,17 @@ Min/Max, then queued and executed on the next Modbus cycle):
 Type a value into the Write column (Modbus table) or use the toggle
 control (Digital I/O table) and it's queued immediately.
 
-### 7.2 AWS IoT Device Shadow (MQTT mode only)
-Publish a delta with the parameter name as the key:
-```json
-{"state":{"desired":{"SetpointTemp":42}}}
-```
-The device reads the shadow's `delta` (what changed), executes the write,
-and reports the new state back to `.../shadow/update`. Non-numeric or
-unrecognized keys are logged and skipped, not fatal to the rest of the
-delta.
+### 7.2 MQTT command topic (MQTT mode only)
+Publish one JSON command per message to `<Client ID>/commands` — the same
+command shapes as the raw TCP channel:
+- **Write**: `{"param":"SetpointTemp","value":42}`
+- **On-demand read**: `{"query":"SetpointTemp"}`
+
+The device replies on `<Client ID>/commands/ack` with the same ack/query
+response JSON shapes as the raw TCP channel (§7.3), so a master can share
+its parsing code between both transports. These are plain MQTT topics —
+no AWS-specific features — so the channel works unchanged against AWS IoT
+Core, Azure IoT Hub, Mosquitto, or any other broker.
 
 ### 7.3 Raw TCP command channel
 Over the same bidirectional Raw TCP connection (§6.1), send a
@@ -318,8 +323,9 @@ PROVISIONING START/OK`, `CELLULAR SIM READY/NOT READY`,
 `WRITE QUEUED (<source>): <name> = <value>`, `WRITE OK` / `WRITE FAILED
 code <n>`, `WRITE REJECTED (<source>): <reason>` (not writable, out of
 range, invalid index), `WRITE QUEUE FULL`. Same pattern with `DO WRITE
-...` for Digital Out. `SHADOW DELTA REJECTED/PARSE ERROR`, `TCP CMD
-REJECTED/PARSE ERROR`, `TCP QUERY REJECTED`.
+...` for Digital Out. `MQTT CMD SUBSCRIBED/REJECTED/PARSE ERROR`,
+`MQTT ACK PUBLISH FAILED`, `TCP CMD REJECTED/PARSE ERROR`,
+`TCP QUERY REJECTED` / `MQTT QUERY REJECTED`.
 
 **Store & Forward**
 `UPLINK DOWN - buffering data (N payloads, M bytes queued)`,
