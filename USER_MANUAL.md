@@ -180,6 +180,11 @@ Configure the 4 DI / 4 DO / 4 AI local channels:
 - **APN** — required by some carriers for the SIM7600G-H's data session;
   leave blank to let the modem auto-provision from the SIM. If the
   Dashboard's Data Session never comes up, set this explicitly.
+- **Publish Interval (s)** — how often telemetry is published while the
+  MQTT uplink is failed over to cellular (default 5s, range 5–3600s).
+  Raise it to reduce SIM data usage. It does not affect WiFi publishing
+  (which follows the Modbus poll interval) or how quickly inbound
+  commands are handled during failover.
 
 ### 5.9 RS485 Communication Settings
 - **Baud Rate**, **Parity** (None/Even/Odd), **Stop Bits** (1/2).
@@ -280,8 +285,9 @@ private LAN IP that cellular data can't route to.
   including a countdown while waiting to fail over or fail back, and
   flags an unstable/flapping WiFi connection ("WiFi still down" repeating
   instead of climbing).
-- Cellular telemetry publishes on its own 5-second cycle, independent of
-  the Modbus poll interval.
+- Cellular telemetry publishes on its own configurable interval (default
+  5s — Settings → Cellular Modem → Publish Interval), independent of the
+  Modbus poll interval.
 
 ---
 

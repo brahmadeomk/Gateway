@@ -590,14 +590,22 @@ struct UplinkConfig {
 UplinkConfig uplinkConfig;
 
 // ===================== Cellular Modem Config =====================
-// APN is the only thing that needs to be user-set - everything else
-// (PWRKEY pin, UART pins/baud) is a compile-time hardware constant, not a
-// runtime setting. Blank APN is passed through as-is to gprsConnect() -
-// some SIM7600 firmware/carrier combos can auto-provision from the SIM
-// without an explicit APN; verify against your carrier if the data
-// session never comes up with it left blank.
+// The hardware side (PWRKEY pin, UART pins/baud) stays compile-time
+// constant; the runtime settings live here. Blank APN is passed through
+// as-is to gprsConnect() - some SIM7600 firmware/carrier combos can
+// auto-provision from the SIM without an explicit APN; verify against
+// your carrier if the data session never comes up with it left blank.
+// publishIntervalMs paces only the telemetry publish during failover -
+// the cellularTask loop itself (status polling, URC pump, ack drains)
+// stays on its fixed CELLULAR_POLL_INTERVAL_MS cadence regardless, so a
+// long publish interval never makes inbound commands sluggish.
+#define CELLULAR_PUBLISH_INTERVAL_MIN_MS 5000UL
+#define CELLULAR_PUBLISH_INTERVAL_MAX_MS 3600000UL
+#define CELLULAR_PUBLISH_INTERVAL_DEFAULT_MS 5000UL
+
 struct CellularConfig {
   String apn;
+  uint32_t publishIntervalMs;
 };
 
 CellularConfig cellularConfig;
@@ -1856,6 +1864,7 @@ bool saveCellularConfig() {
   preferences.begin("cellular", false);
 
   trackNvsWrite(preferences.putString("apn", cellularConfig.apn));
+  trackNvsWrite(preferences.putUInt("pubint", cellularConfig.publishIntervalMs));
 
   preferences.end();
 
@@ -1869,7 +1878,13 @@ bool saveCellularConfig() {
 void loadCellularConfig() {
   preferences.begin("cellular", true);
   cellularConfig.apn = preferences.getString("apn", "");
+  cellularConfig.publishIntervalMs = preferences.getUInt("pubint", CELLULAR_PUBLISH_INTERVAL_DEFAULT_MS);
   preferences.end();
+
+  if (cellularConfig.publishIntervalMs < CELLULAR_PUBLISH_INTERVAL_MIN_MS
+      || cellularConfig.publishIntervalMs > CELLULAR_PUBLISH_INTERVAL_MAX_MS) {
+    cellularConfig.publishIntervalMs = CELLULAR_PUBLISH_INTERVAL_DEFAULT_MS;
+  }
 }
 
 // ===================== WiFi Uplink =====================
@@ -5247,9 +5262,7 @@ function toggleApSsidField() {
 
   flushHtmlChunk(html);
 
-  // CELLULAR MODEM FORM (SIM7600G-H - status monitoring only for now, see
-  // the Dashboard's Cellular Modem box; this APN is the only runtime
-  // setting it needs)
+  // CELLULAR MODEM FORM (SIM7600G-H)
   html += "<div class='box'>";
   html += "<h2>Cellular Modem</h2>";
   html += "<p><small>APN for the SIM7600G-H's data session. Leave blank to let the modem attempt auto-provisioning from the SIM - set explicitly if your carrier requires it and the Dashboard's Data Session never comes up.</small></p>";
@@ -5263,6 +5276,8 @@ function toggleApSsidField() {
   html += "<form action='/saveCellular' method='POST'>";
   html += "<table>";
   html += "<tr><th>APN</th><td><input type='text' name='apn' placeholder='e.g. www or a carrier-specific M2M APN' value='" + htmlEscape(cellularConfig.apn) + "'></td></tr>";
+  html += "<tr><th>Publish Interval (s)</th><td><input type='number' name='pubIntervalS' min='" + String(CELLULAR_PUBLISH_INTERVAL_MIN_MS / 1000) + "' max='" + String(CELLULAR_PUBLISH_INTERVAL_MAX_MS / 1000) + "' value='" + String(cellularConfig.publishIntervalMs / 1000) + "'>"
+          "<br><small>How often telemetry is published while the MQTT uplink is failed over to cellular. Higher = less SIM data used. Does not affect WiFi publishing (which follows the Modbus poll interval) or inbound command responsiveness.</small></td></tr>";
   html += "<tr><td colspan='2'><button type='submit'>Save Cellular Modem</button></td></tr>";
   html += "</table>";
   html += "</form>";
@@ -5799,9 +5814,18 @@ void handleSaveCellular() {
   cellularConfig.apn = server.arg("apn");
   cellularConfig.apn.trim();
 
+  if (server.hasArg("pubIntervalS")) {
+    long secs = server.arg("pubIntervalS").toInt();
+    uint32_t ms = (secs > 0) ? (uint32_t)secs * 1000UL : CELLULAR_PUBLISH_INTERVAL_DEFAULT_MS;
+    if (ms < CELLULAR_PUBLISH_INTERVAL_MIN_MS) ms = CELLULAR_PUBLISH_INTERVAL_MIN_MS;
+    if (ms > CELLULAR_PUBLISH_INTERVAL_MAX_MS) ms = CELLULAR_PUBLISH_INTERVAL_MAX_MS;
+    cellularConfig.publishIntervalMs = ms;
+  }
+
   bool ok = saveCellularConfig();
 
-  logKeyEvent("CELLULAR MODEM SETTINGS SAVED: apn=" + (cellularConfig.apn.length() > 0 ? cellularConfig.apn : String("(blank/auto)")));
+  logKeyEvent("CELLULAR MODEM SETTINGS SAVED: apn=" + (cellularConfig.apn.length() > 0 ? cellularConfig.apn : String("(blank/auto)"))
+              + ", publish every " + String(cellularConfig.publishIntervalMs / 1000) + "s");
 
   server.sendHeader("Location", ok ? "/settings?cellularSaved=1" : "/settings?cellularSaveError=1");
   server.send(303);
@@ -6552,11 +6576,9 @@ void pollDigitalIO() {
 // servicing, and Digital I/O polling right along with it.
 #define MODEM_PWRKEY_PULSE_MS 1000
 #define MODEM_BOOT_WAIT_MS 10000
-// Also the cadence of the cellular MQTT publish step during failover - kept
-// well above WiFi's typical ~1s poll interval since it costs metered SIM
-// data and a real over-the-air round-trip (higher/less predictable latency
-// than local WiFi) per publish, unlike the cheap local modem-status AT
-// commands (CSQ/CREG/etc.) sharing this same loop.
+// Cadence of the status-poll/housekeeping loop only - the telemetry
+// publish during failover is paced separately by the user-configurable
+// cellularConfig.publishIntervalMs (Settings -> Cellular Modem).
 #define CELLULAR_POLL_INTERVAL_MS 5000
 
 // PWRKEY pulse per the SIM7600 series' usual convention: briefly pull LOW
@@ -7174,6 +7196,9 @@ void cellularTask(void *parameter) {
   // since CMQTTCONNECT uses clean_session=1 (the broker forgets the
   // subscription on disconnect, so every new CONNECT must re-subscribe).
   bool mqttSubscribed = false;
+  // 0 = "never published this session" - the first publish after a
+  // session comes up always goes out immediately, regardless of interval.
+  unsigned long lastPublishTime = 0;
 
   for (;;) {
     if (!everInitialized) {
@@ -7289,7 +7314,9 @@ void cellularTask(void *parameter) {
     if (certsProvisioned && shouldBeConnected) {
       if (!mqttConnected) {
         mqttSubscribed = false;
-        advanceCellularMqttSession(mqttStarted, mqttClientAcquired, mqttSslBound, mqttConnected);
+        if (advanceCellularMqttSession(mqttStarted, mqttClientAcquired, mqttSslBound, mqttConnected)) {
+          lastPublishTime = 0;  // fresh session - publish immediately below/next cycle
+        }
       } else {
         // Subscribe before the first publish of the session, so a command
         // sent in reaction to the first telemetry can't slip through the gap.
@@ -7297,13 +7324,19 @@ void cellularTask(void *parameter) {
           mqttSubscribed = subscribeCellularMqttCommands();
         }
 
-        String pubResult;
-        if (!publishCellularMqttTelemetry(&pubResult)) {
-          logKeyEvent("CELLULAR MQTT PUBLISH FAILED - will retry connect: " + pubResult);
-          mqttConnected = false;  // re-attempt CONNECT next cycle; STARTED/ACCQ/SSLCFG stay done
-          mqttSubscribed = false;
-        } else {
-          logMessage("CELLULAR MQTT TELEMETRY PUBLISHED");
+        // Telemetry is paced by the user-set publish interval (Settings ->
+        // Cellular Modem), independent of this loop's own cadence - the
+        // loop keeps running every cycle for status/URCs/acks regardless.
+        if (lastPublishTime == 0 || millis() - lastPublishTime >= cellularConfig.publishIntervalMs) {
+          String pubResult;
+          if (!publishCellularMqttTelemetry(&pubResult)) {
+            logKeyEvent("CELLULAR MQTT PUBLISH FAILED - will retry connect: " + pubResult);
+            mqttConnected = false;  // re-attempt CONNECT next cycle; STARTED/ACCQ/SSLCFG stay done
+            mqttSubscribed = false;
+          } else {
+            lastPublishTime = millis();
+            logMessage("CELLULAR MQTT TELEMETRY PUBLISHED");
+          }
         }
       }
     } else if (mqttConnected && !shouldBeConnected) {
