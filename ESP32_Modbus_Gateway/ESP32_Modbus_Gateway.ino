@@ -181,7 +181,10 @@
 // deviceConfig.apSsid (or the computed device name if apMatchesDeviceName
 // is set), both user-settable on the Settings page. See getEffectiveApSsid().
 #define DEFAULT_AP_SSID "ESP32ModbusGateWay"
-const char* AP_PASSWORD = "12345678";
+// Default only - the actual AP password is user-settable (deviceConfig.
+// apPassword, Settings -> Device Identity). WPA2 requires >= 8 chars.
+#define DEFAULT_AP_PASSWORD "12345678"
+#define AP_PASSWORD_MIN_LEN 8
 // Max length of the user-provided device-name prefix (see getDeviceName()).
 #define DEVICE_NAME_PREFIX_MAX_LEN 5
 
@@ -653,9 +656,43 @@ struct DeviceConfig {
   String apSsid;
   String deviceNamePrefix;
   bool apMatchesDeviceName;
+  String apPassword;  // WPA2 key for the device's own AP - min 8 chars
 };
 
 DeviceConfig deviceConfig;
+
+// ===================== Web UI Auth =====================
+// Session-cookie login protecting every page and state-changing endpoint.
+// Credentials are stored as a salted SHA-256 hash in NVS ("auth"
+// namespace); an empty stored hash means "still on the factory default
+// login" (WEB_AUTH_DEFAULT_USER/PASS), which the UI nags about until
+// changed. Recovery when locked out: physical USB access + the serial
+// command "factory-reset-auth" (see checkSerialRecovery()) resets ONLY
+// the credentials (web login + AP password), never the rest of the
+// configuration. Note the web UI is plain HTTP: credentials transit
+// unencrypted on the local network/AP - standard posture for a LAN-only
+// device UI; the cloud uplink's TLS is unaffected.
+#define WEB_AUTH_DEFAULT_USER "admin"
+#define WEB_AUTH_DEFAULT_PASS "admin"
+#define WEB_PASSWORD_MIN_LEN 4
+#define WEB_SESSION_TIMEOUT_MS (30UL * 60UL * 1000UL)  // idle timeout, sliding
+#define WEB_LOGIN_MAX_FAILS 5
+#define WEB_LOGIN_LOCKOUT_MS 60000UL
+
+struct AuthConfig {
+  String user;
+  String salt;      // random hex, regenerated on every password change
+  String passHash;  // sha256Hex(salt + password); empty = factory default
+};
+
+AuthConfig authConfig;
+
+// Single active browser session (this is a single-admin device) - a new
+// login replaces any previous session. webTask-only, so no locking.
+String webSessionToken = "";
+unsigned long webSessionLastActivity = 0;
+int webLoginFailCount = 0;
+unsigned long webLoginLockStart = 0;
 
 // ===================== Communication Settings =====================
 uint32_t commBaudRate = 9600;
@@ -1830,6 +1867,7 @@ bool saveDeviceConfig() {
   trackNvsWrite(preferences.putString("apssid", deviceConfig.apSsid));
   trackNvsWrite(preferences.putString("prefix", deviceConfig.deviceNamePrefix));
   trackNvsWrite(preferences.putBool("apmatch", deviceConfig.apMatchesDeviceName));
+  trackNvsWrite(preferences.putString("appass", deviceConfig.apPassword));
 
   preferences.end();
 
@@ -1846,11 +1884,18 @@ void loadDeviceConfig() {
   deviceConfig.apSsid = preferences.getString("apssid", DEFAULT_AP_SSID);
   deviceConfig.deviceNamePrefix = preferences.getString("prefix", "");
   deviceConfig.apMatchesDeviceName = preferences.getBool("apmatch", false);
+  deviceConfig.apPassword = preferences.getString("appass", DEFAULT_AP_PASSWORD);
 
   preferences.end();
 
   if (deviceConfig.apSsid.length() == 0) {
     deviceConfig.apSsid = DEFAULT_AP_SSID;
+  }
+
+  // Below the WPA2 minimum the softAP call would fail and the AP would
+  // come up open - never allow that.
+  if (deviceConfig.apPassword.length() < AP_PASSWORD_MIN_LEN) {
+    deviceConfig.apPassword = DEFAULT_AP_PASSWORD;
   }
 
   if (deviceConfig.deviceNamePrefix.length() > DEVICE_NAME_PREFIX_MAX_LEN) {
@@ -1885,6 +1930,216 @@ void loadCellularConfig() {
       || cellularConfig.publishIntervalMs > CELLULAR_PUBLISH_INTERVAL_MAX_MS) {
     cellularConfig.publishIntervalMs = CELLULAR_PUBLISH_INTERVAL_DEFAULT_MS;
   }
+}
+
+// ===================== SHA-256 (self-contained) =====================
+// Standard FIPS 180-4, used only to hash web credentials. Deliberately
+// NOT mbedTLS: its function names changed incompatibly between the ESP32
+// core versions in circulation (2.x wants mbedtls_sha256_starts_ret, 3.x
+// wants mbedtls_sha256_starts), so a self-contained ~60-line
+// implementation is the portable choice for something this small.
+struct Sha256Ctx {
+  uint32_t state[8];
+  uint64_t bitlen;
+  uint8_t data[64];
+  uint32_t datalen;
+};
+
+static const uint32_t SHA256_K[64] = {
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+#define ROTR32(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+
+void sha256Transform(Sha256Ctx *ctx, const uint8_t data[]) {
+  uint32_t m[64];
+
+  for (int i = 0; i < 16; i++) {
+    m[i] = ((uint32_t)data[i * 4] << 24) | ((uint32_t)data[i * 4 + 1] << 16) | ((uint32_t)data[i * 4 + 2] << 8) | ((uint32_t)data[i * 4 + 3]);
+  }
+  for (int i = 16; i < 64; i++) {
+    uint32_t s0 = ROTR32(m[i - 15], 7) ^ ROTR32(m[i - 15], 18) ^ (m[i - 15] >> 3);
+    uint32_t s1 = ROTR32(m[i - 2], 17) ^ ROTR32(m[i - 2], 19) ^ (m[i - 2] >> 10);
+    m[i] = m[i - 16] + s0 + m[i - 7] + s1;
+  }
+
+  uint32_t a = ctx->state[0], b = ctx->state[1], c = ctx->state[2], d = ctx->state[3];
+  uint32_t e = ctx->state[4], f = ctx->state[5], g = ctx->state[6], h = ctx->state[7];
+
+  for (int i = 0; i < 64; i++) {
+    uint32_t S1 = ROTR32(e, 6) ^ ROTR32(e, 11) ^ ROTR32(e, 25);
+    uint32_t ch = (e & f) ^ ((~e) & g);
+    uint32_t t1 = h + S1 + ch + SHA256_K[i] + m[i];
+    uint32_t S0 = ROTR32(a, 2) ^ ROTR32(a, 13) ^ ROTR32(a, 22);
+    uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+    uint32_t t2 = S0 + maj;
+    h = g; g = f; f = e; e = d + t1;
+    d = c; c = b; b = a; a = t1 + t2;
+  }
+
+  ctx->state[0] += a; ctx->state[1] += b; ctx->state[2] += c; ctx->state[3] += d;
+  ctx->state[4] += e; ctx->state[5] += f; ctx->state[6] += g; ctx->state[7] += h;
+}
+
+String sha256Hex(const String &input) {
+  Sha256Ctx ctx;
+  ctx.state[0] = 0x6a09e667; ctx.state[1] = 0xbb67ae85; ctx.state[2] = 0x3c6ef372; ctx.state[3] = 0xa54ff53a;
+  ctx.state[4] = 0x510e527f; ctx.state[5] = 0x9b05688c; ctx.state[6] = 0x1f83d9ab; ctx.state[7] = 0x5be0cd19;
+  ctx.bitlen = 0;
+  ctx.datalen = 0;
+
+  for (unsigned int i = 0; i < input.length(); i++) {
+    ctx.data[ctx.datalen++] = (uint8_t)input[i];
+    if (ctx.datalen == 64) {
+      sha256Transform(&ctx, ctx.data);
+      ctx.bitlen += 512;
+      ctx.datalen = 0;
+    }
+  }
+
+  // Padding
+  uint32_t i = ctx.datalen;
+  ctx.bitlen += (uint64_t)ctx.datalen * 8;
+  ctx.data[i++] = 0x80;
+  if (i > 56) {
+    while (i < 64) ctx.data[i++] = 0x00;
+    sha256Transform(&ctx, ctx.data);
+    i = 0;
+  }
+  while (i < 56) ctx.data[i++] = 0x00;
+  for (int j = 7; j >= 0; j--) {
+    ctx.data[i++] = (uint8_t)(ctx.bitlen >> (j * 8));
+  }
+  sha256Transform(&ctx, ctx.data);
+
+  String out = "";
+  out.reserve(64);
+  for (int w = 0; w < 8; w++) {
+    for (int shift = 28; shift >= 0; shift -= 4) {
+      uint8_t nibble = (ctx.state[w] >> shift) & 0xF;
+      out += (char)(nibble < 10 ? ('0' + nibble) : ('a' + nibble - 10));
+    }
+  }
+  return out;
+}
+
+// ===================== Web Auth Config Save / Load / Checks =====================
+String makeRandomHex(int nBytes) {
+  String out = "";
+  out.reserve(nBytes * 2);
+  for (int i = 0; i < nBytes; i++) {
+    uint8_t b = (uint8_t)(esp_random() & 0xFF);
+    const char *hex = "0123456789abcdef";
+    out += hex[b >> 4];
+    out += hex[b & 0xF];
+  }
+  return out;
+}
+
+bool saveAuthConfig() {
+  nvsWriteFailures = 0;
+  preferences.begin("auth", false);
+
+  trackNvsWrite(preferences.putString("user", authConfig.user));
+  trackNvsWrite(preferences.putString("salt", authConfig.salt));
+  trackNvsWrite(preferences.putString("hash", authConfig.passHash));
+
+  preferences.end();
+
+  if (nvsWriteFailures > 0) {
+    logKeyEvent("NVS SAVE INCOMPLETE (auth): " + String(nvsWriteFailures) + " write(s) failed - flash may be full, login change may not persist");
+  }
+
+  return nvsWriteFailures == 0;
+}
+
+void loadAuthConfig() {
+  preferences.begin("auth", true);
+  authConfig.user = preferences.getString("user", WEB_AUTH_DEFAULT_USER);
+  authConfig.salt = preferences.getString("salt", "");
+  authConfig.passHash = preferences.getString("hash", "");
+  preferences.end();
+
+  if (authConfig.user.length() == 0) {
+    authConfig.user = WEB_AUTH_DEFAULT_USER;
+  }
+}
+
+// True while no custom password has ever been saved - the UI nags until
+// this goes false.
+bool webAuthUsingDefaults() {
+  return authConfig.passHash.length() == 0;
+}
+
+bool checkWebCredentials(const String &user, const String &pass) {
+  if (user != authConfig.user) {
+    return false;
+  }
+  if (webAuthUsingDefaults()) {
+    return pass == WEB_AUTH_DEFAULT_PASS;
+  }
+  return sha256Hex(authConfig.salt + pass) == authConfig.passHash;
+}
+
+// Validates the request's session cookie. Sliding idle timeout: any
+// authenticated request pushes the expiry out again.
+bool isAuthedRequest() {
+  if (webSessionToken.length() == 0) {
+    return false;
+  }
+
+  if (millis() - webSessionLastActivity > WEB_SESSION_TIMEOUT_MS) {
+    webSessionToken = "";
+    return false;
+  }
+
+  String cookie = server.header("Cookie");
+  int idx = cookie.indexOf("GWSESSION=");
+  if (idx < 0) {
+    return false;
+  }
+
+  int valStart = idx + 10;
+  int valEnd = cookie.indexOf(';', valStart);
+  String token = (valEnd < 0) ? cookie.substring(valStart) : cookie.substring(valStart, valEnd);
+  token.trim();
+
+  if (token != webSessionToken) {
+    return false;
+  }
+
+  webSessionLastActivity = millis();
+  return true;
+}
+
+// Gate at the top of every protected handler. Returns false (after
+// redirecting to /login) when the request isn't authenticated.
+bool requireAuth() {
+  if (isAuthedRequest()) {
+    return true;
+  }
+
+  server.sendHeader("Location", "/login");
+  server.send(302);
+  return false;
+}
+
+bool webLoginLockedOut() {
+  if (webLoginFailCount < WEB_LOGIN_MAX_FAILS) {
+    return false;
+  }
+  if (millis() - webLoginLockStart >= WEB_LOGIN_LOCKOUT_MS) {
+    webLoginFailCount = 0;  // lockout served - clean slate
+    return false;
+  }
+  return true;
 }
 
 // ===================== WiFi Uplink =====================
@@ -4294,6 +4549,8 @@ void pollTcpTargets() {
 
 // ===================== Landing Page: Dashboard =====================
 void handleRoot() {
+  if (!requireAuth()) return;
+
 
   String html = R"rawliteral(
 <!DOCTYPE html>
@@ -4320,7 +4577,14 @@ void handleRoot() {
 <h2>ESP32 Modbus Gateway</h2>
 
 <button class="nav" type="button" onclick="location.href='/settings'">Settings</button>
+<button class="danger" type="button" onclick="location.href='/logout'">Log Out</button>
+)rawliteral";
 
+  if (webAuthUsingDefaults()) {
+    html += "<div style='background:#f8d7da;color:#721c24;padding:10px;margin:10px 0'>Default web login in use - change it under Settings &rarr; Security.</div>";
+  }
+
+  html += R"rawliteral(
 <div class='box'>
 <b>WiFi Status:</b> )rawliteral";
 
@@ -4677,6 +4941,8 @@ void flushHtmlChunk(String &html) {
 
 // ===================== Settings Page =====================
 void handleSettings() {
+  if (!requireAuth()) return;
+
   // Chunked response (see flushHtmlChunk()) instead of one server.send() at
   // the end - required so the page can never need one giant contiguous
   // buffer, no matter how many param/type/TCP-target rows are configured.
@@ -4714,6 +4980,7 @@ void handleSettings() {
 <button class="nav" type="button" onclick="location.href='/'">Dashboard</button>
 <button class="nav" type="button" onclick="location.href='/types'">Manage Data Types</button>
 <button class="danger" type="button" onclick="confirmResetModbus()">Reset Modbus</button>
+<button class="danger" type="button" onclick="location.href='/logout'">Log Out</button>
 
 )rawliteral";
 
@@ -5019,6 +5286,8 @@ function confirmResetModbus() {
 
   if (server.hasArg("deviceSaveError")) {
     html += "<div class='error'>Save FAILED - flash may be full. Check the Status Log; device settings may not have persisted across reboot.</div>";
+  } else if (server.hasArg("apPassShort")) {
+    html += "<div class='error'>AP password NOT changed - it must be at least " + String(AP_PASSWORD_MIN_LEN) + " characters (WPA2 requirement). Other device settings were not saved either - resubmit.</div>";
   } else if (server.hasArg("deviceSaved")) {
     html += "<div class='success'>Device Settings Saved Successfully</div>";
   }
@@ -5073,11 +5342,48 @@ function toggleApSsidField() {
     html += "> Match AP Name with Device Name</label>";
     html += "</td></tr>";
 
+    html += "<tr><th>AP Password</th><td>";
+    html += "<input type='password' name='apPassword' placeholder='Leave blank to keep unchanged (min " + String(AP_PASSWORD_MIN_LEN) + " chars)'>";
+    html += "<br><small>WPA2 key for this device's own WiFi hotspot. If you forget it (and can't reach the device over your site network), recover via USB serial: send <b>factory-reset-auth</b> to restore the default without losing settings.</small>";
+    html += "</td></tr>";
+
     html += "<tr><td colspan='2'><button type='submit'>Save Device Settings</button></td></tr>";
     html += "</table>";
     html += "</form>";
   }
 
+  html += "</div>";
+
+  flushHtmlChunk(html);
+
+  // SECURITY (WEB LOGIN) FORM
+  html += "<div class='box'>";
+  html += "<h2>Security</h2>";
+
+  if (server.hasArg("securitySaveError")) {
+    html += "<div class='error'>Save FAILED - flash may be full. Check the Status Log; login change may not have persisted.</div>";
+  } else if (server.hasArg("securityMismatch")) {
+    html += "<div class='error'>Passwords did not match - nothing was changed.</div>";
+  } else if (server.hasArg("securityShort")) {
+    html += "<div class='error'>Password too short (minimum " + String(WEB_PASSWORD_MIN_LEN) + " characters) - nothing was changed.</div>";
+  } else if (server.hasArg("securitySaved")) {
+    html += "<div class='success'>Security Settings Saved Successfully</div>";
+  }
+
+  if (webAuthUsingDefaults()) {
+    html += "<div class='error'>Default web login (" + String(WEB_AUTH_DEFAULT_USER) + "/" + String(WEB_AUTH_DEFAULT_PASS) + ") is in use - set your own password below.</div>";
+  }
+
+  html += "<form action='/saveSecurity' method='POST'>";
+  html += "<table>";
+  html += "<tr><th>Web Username</th><td><input type='text' name='webUser' value='" + htmlEscape(authConfig.user) + "'></td></tr>";
+  html += "<tr><th>New Web Password</th><td><input type='password' name='webPass' placeholder='Leave blank to keep unchanged (min " + String(WEB_PASSWORD_MIN_LEN) + " chars)'></td></tr>";
+  html += "<tr><th>Confirm Password</th><td><input type='password' name='webPass2' placeholder='Repeat new password'></td></tr>";
+  html += "<tr><td colspan='2'><button type='submit'>Save Security</button>";
+  html += "<br><small>Login sessions time out after " + String(WEB_SESSION_TIMEOUT_MS / 60000) + " minutes idle; " + String(WEB_LOGIN_MAX_FAILS) + " failed logins lock the login page for " + String(WEB_LOGIN_LOCKOUT_MS / 1000) + "s. Forgot the password? USB serial command <b>factory-reset-auth</b> restores the default login and AP password without touching any other settings.</small>";
+  html += "</td></tr>";
+  html += "</table>";
+  html += "</form>";
   html += "</div>";
 
   flushHtmlChunk(html);
@@ -5341,6 +5647,8 @@ function toggleApSsidField() {
 
 // ===================== Types Page =====================
 void handleTypes() {
+  if (!requireAuth()) return;
+
   String html = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -5466,6 +5774,8 @@ function confirmResetTypes() {
 
 // ===================== Save Modbus Settings =====================
 void handleSave() {
+  if (!requireAuth()) return;
+
   int rows = server.arg("rowCount").toInt();
 
   if (rows < 0) rows = 0;
@@ -5555,6 +5865,8 @@ void handleSave() {
 
 // ===================== Save Communication =====================
 void handleSaveCommunication() {
+  if (!requireAuth()) return;
+
   if (server.hasArg("baud")) {
     commBaudRate = server.arg("baud").toInt();
   }
@@ -5625,6 +5937,8 @@ void handleSaveCommunication() {
 
 // ===================== Save TCP Uplink =====================
 void handleSaveUplink() {
+  if (!requireAuth()) return;
+
   logMessage("========== WEB SAVE TCP REQUEST ==========");
 
   if (server.hasArg("ssid")) {
@@ -5676,6 +5990,8 @@ void handleSaveUplink() {
 
 // ===================== Save Device / AP Identity =====================
 void handleSaveDevice() {
+  if (!requireAuth()) return;
+
   // Only present in the POST when the AP name field isn't disabled by the
   // "match" checkbox client-side, so a checked box naturally leaves the
   // stored apSsid untouched for whenever the user unchecks it later.
@@ -5697,12 +6013,27 @@ void handleSaveDevice() {
 
   deviceConfig.apMatchesDeviceName = server.hasArg("apMatchDevice");
 
+  // Blank = keep the current AP password; anything shorter than the WPA2
+  // minimum is rejected outright (a too-short key would make softAP fail
+  // and bring the AP up open).
+  bool apPassChanged = false;
+  if (server.hasArg("apPassword") && server.arg("apPassword").length() > 0) {
+    String newApPass = server.arg("apPassword");
+    if (newApPass.length() < AP_PASSWORD_MIN_LEN) {
+      server.sendHeader("Location", "/settings?apPassShort=1");
+      server.send(303);
+      return;
+    }
+    deviceConfig.apPassword = newApPass;
+    apPassChanged = true;
+  }
+
   bool ok = saveDeviceConfig();
 
   String apSsidToUse = getEffectiveApSsid();
-  WiFi.softAP(apSsidToUse.c_str(), AP_PASSWORD);
+  WiFi.softAP(apSsidToUse.c_str(), deviceConfig.apPassword.c_str());
 
-  logKeyEvent("DEVICE SETTINGS SAVED: AP=" + apSsidToUse + " deviceName=" + getDeviceName());
+  logKeyEvent("DEVICE SETTINGS SAVED: AP=" + apSsidToUse + " deviceName=" + getDeviceName() + (apPassChanged ? " (AP password changed)" : ""));
 
   server.sendHeader("Location", ok ? "/settings?deviceSaved=1" : "/settings?deviceSaveError=1");
   server.send(303);
@@ -5710,6 +6041,8 @@ void handleSaveDevice() {
 
 // ===================== Save Modbus TCP Targets =====================
 void handleSaveTcpTargets() {
+  if (!requireAuth()) return;
+
   int newCount = 0;
 
   for (int i = 0; i < MAX_TCP_TARGETS; i++) {
@@ -5766,6 +6099,8 @@ void handleSaveTcpTargets() {
 
 // ===================== Save Digital I/O =====================
 void handleSaveDigitalIO() {
+  if (!requireAuth()) return;
+
   xSemaphoreTake(dataMutex, portMAX_DELAY);
 
   for (int i = 0; i < DI_CHANNEL_COUNT; i++) {
@@ -5811,6 +6146,8 @@ void handleSaveDigitalIO() {
 
 // ===================== Save Cellular Modem =====================
 void handleSaveCellular() {
+  if (!requireAuth()) return;
+
   cellularConfig.apn = server.arg("apn");
   cellularConfig.apn.trim();
 
@@ -5831,6 +6168,134 @@ void handleSaveCellular() {
   server.send(303);
 }
 
+// ===================== Web Login / Logout / Security =====================
+void handleLoginPage() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<title>Login - ESP32 Modbus Gateway</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body { font-family: Arial; background:#f5f7fa; margin:15px; }
+h2 { color:#00a5df; }
+.box { background:white; max-width:360px; margin:60px auto; padding:20px; box-shadow:0 1px 4px rgba(0,0,0,0.2); }
+input { width:95%; padding:8px; margin:6px 0; }
+button { width:100%; padding:10px; background:#0099cc; color:white; border:none; border-radius:4px; cursor:pointer; margin-top:8px; }
+.error { background:#f8d7da; color:#721c24; padding:10px; margin-bottom:10px; }
+.note { color:#666; font-size:12px; margin-top:10px; }
+</style>
+</head>
+<body>
+<div class="box">
+<h2>ESP32 Modbus Gateway</h2>
+)rawliteral";
+
+  if (server.hasArg("locked")) {
+    html += "<div class='error'>Too many failed attempts - locked for " + String(WEB_LOGIN_LOCKOUT_MS / 1000) + " seconds.</div>";
+  } else if (server.hasArg("err")) {
+    html += "<div class='error'>Invalid username or password.</div>";
+  }
+
+  html += R"rawliteral(
+<form action="/login" method="POST">
+<input type="text" name="user" placeholder="Username" autofocus>
+<input type="password" name="pass" placeholder="Password">
+<button type="submit">Log In</button>
+</form>
+<p class="note">Locked out? Connect USB, open the serial monitor (115200), and send <b>factory-reset-auth</b> to restore the default login without losing settings.</p>
+</div>
+</body>
+</html>
+)rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+void handleLoginPost() {
+  if (webLoginLockedOut()) {
+    server.sendHeader("Location", "/login?locked=1");
+    server.send(303);
+    return;
+  }
+
+  String user = server.arg("user");
+  String pass = server.arg("pass");
+
+  if (checkWebCredentials(user, pass)) {
+    webSessionToken = makeRandomHex(16);
+    webSessionLastActivity = millis();
+    webLoginFailCount = 0;
+
+    logKeyEvent("WEB LOGIN OK: " + user);
+
+    // HttpOnly: not readable from page JS - limits what an injected
+    // script could steal. (No Secure flag - the UI is plain HTTP.)
+    server.sendHeader("Set-Cookie", "GWSESSION=" + webSessionToken + "; Path=/; HttpOnly");
+    server.sendHeader("Location", "/");
+    server.send(303);
+    return;
+  }
+
+  webLoginFailCount++;
+  if (webLoginFailCount >= WEB_LOGIN_MAX_FAILS) {
+    webLoginLockStart = millis();
+    logKeyEvent("WEB LOGIN LOCKED OUT (" + String(WEB_LOGIN_LOCKOUT_MS / 1000) + "s after " + String(webLoginFailCount) + " failures)");
+    server.sendHeader("Location", "/login?locked=1");
+  } else {
+    logKeyEvent("WEB LOGIN FAILED (attempt " + String(webLoginFailCount) + "/" + String(WEB_LOGIN_MAX_FAILS) + ")");
+    server.sendHeader("Location", "/login?err=1");
+  }
+  server.send(303);
+}
+
+void handleLogout() {
+  webSessionToken = "";
+  server.sendHeader("Set-Cookie", "GWSESSION=deleted; Path=/; Max-Age=0");
+  server.sendHeader("Location", "/login");
+  server.send(303);
+}
+
+void handleSaveSecurity() {
+  if (!requireAuth()) return;
+
+  String user = server.arg("webUser");
+  String pass1 = server.arg("webPass");
+  String pass2 = server.arg("webPass2");
+  user.trim();
+
+  if (pass1 != pass2) {
+    server.sendHeader("Location", "/settings?securityMismatch=1");
+    server.send(303);
+    return;
+  }
+
+  if (user.length() > 0) {
+    authConfig.user = user;
+  }
+
+  if (pass1.length() > 0) {
+    if (pass1.length() < WEB_PASSWORD_MIN_LEN) {
+      server.sendHeader("Location", "/settings?securityShort=1");
+      server.send(303);
+      return;
+    }
+    authConfig.salt = makeRandomHex(8);
+    authConfig.passHash = sha256Hex(authConfig.salt + pass1);
+  }
+  // Blank password fields = keep the current password (but a username
+  // change alone still saves).
+
+  bool ok = saveAuthConfig();
+
+  logKeyEvent("SECURITY SETTINGS SAVED: web user=" + authConfig.user + (pass1.length() > 0 ? " (password changed)" : " (password unchanged)"));
+
+  // Existing session stays valid - the admin who just changed the
+  // password shouldn't be logged out mid-visit.
+  server.sendHeader("Location", ok ? "/settings?securitySaved=1" : "/settings?securitySaveError=1");
+  server.send(303);
+}
+
 // ===================== Save Cloud Uplink =====================
 // Minimal sanity check that content is PEM text, not an accidentally
 // selected binary (DER/.p12) or wrong file - protects the stored certs.
@@ -5842,6 +6307,13 @@ bool looksLikePem(const String &content) {
 // chunks into the matching accumulator; handleSaveCloud() consumes them
 // once the whole request is parsed.
 void handleCertUpload() {
+  // Silent check (no redirect - can't reply mid-upload): an unauthed
+  // upload just never accumulates, and handleSaveCloud's own
+  // requireAuth() sends the redirect once parsing finishes.
+  if (!isAuthedRequest()) {
+    return;
+  }
+
   HTTPUpload &upload = server.upload();
 
   String *target = nullptr;
@@ -5893,6 +6365,8 @@ bool applyCertUpdate(String &stored, String &uploaded, const char *pasteArg, con
 }
 
 void handleSaveCloud() {
+  if (!requireAuth()) return;
+
   if (server.hasArg("uplinkMode")) {
     cloudConfig.mode = (server.arg("uplinkMode") == "mqtt") ? UPLINK_MODE_MQTT : UPLINK_MODE_TCP;
   }
@@ -5959,6 +6433,8 @@ void handleSaveCloud() {
 
 // ===================== Save Types =====================
 void handleSaveTypes() {
+  if (!requireAuth()) return;
+
   int rows = server.arg("typeRowCount").toInt();
 
   if (rows < 0) rows = 0;
@@ -5998,6 +6474,8 @@ void handleSaveTypes() {
 
 // ===================== JSON Data Endpoint =====================
 void handleData() {
+  if (!requireAuth()) return;
+
   String json = "{";
   json.reserve(96 + paramCount * 160);  // avoid repeated reallocation while appending below
   json += "\"device\":\"ESP32 Modbus RTU Gateway\",";
@@ -6090,6 +6568,8 @@ void handleData() {
 
 // ===================== Key Event Log Endpoint =====================
 void handleKeyLog() {
+  if (!requireAuth()) return;
+
   String json = "[";
 
   xSemaphoreTake(logMutex, portMAX_DELAY);
@@ -6117,6 +6597,8 @@ void handleKeyLog() {
 // Dashboard-driven write - same validated path as the automatic command
 // channels (MQTT command topic / raw TCP).
 void handleWriteCommand() {
+  if (!requireAuth()) return;
+
   int paramIndex = server.arg("param").toInt();
   float value = server.arg("value").toFloat();
 
@@ -6128,6 +6610,8 @@ void handleWriteCommand() {
 // Dashboard-driven Digital Out write - same role as handleWriteCommand()
 // above, for the local I/O channels instead of Modbus params.
 void handleWriteDigitalOut() {
+  if (!requireAuth()) return;
+
   int channel = server.arg("channel").toInt();
   bool value = server.arg("value").toInt() != 0;
 
@@ -6138,6 +6622,8 @@ void handleWriteDigitalOut() {
 
 // ===================== Reset =====================
 void handleReset() {
+  if (!requireAuth()) return;
+
   loadDefaultSettings();
   saveSettings();
 
@@ -6148,6 +6634,8 @@ void handleReset() {
 }
 
 void handleResetTypes() {
+  if (!requireAuth()) return;
+
   loadDefaultTypes();
   saveTypes();
 
@@ -6214,6 +6702,7 @@ void setup() {
   loadCommunicationSettings();
   loadUplinkConfig();
   loadDeviceConfig();
+  loadAuthConfig();
   loadCloudConfig();
   loadCerts();
   loadCellularConfig();
@@ -6232,7 +6721,7 @@ void setup() {
   WiFi.mode(WIFI_AP_STA);
 
   String apSsidToUse = getEffectiveApSsid();
-  WiFi.softAP(apSsidToUse.c_str(), AP_PASSWORD);
+  WiFi.softAP(apSsidToUse.c_str(), deviceConfig.apPassword.c_str());
 
   connectUplinkWiFi();
 
@@ -6265,6 +6754,16 @@ void setup() {
   server.on("/saveCellular", HTTP_POST, handleSaveCellular);
   server.on("/reset", HTTP_GET, handleReset);
   server.on("/resetTypes", HTTP_GET, handleResetTypes);
+  server.on("/login", HTTP_GET, handleLoginPage);
+  server.on("/login", HTTP_POST, handleLoginPost);
+  server.on("/logout", HTTP_GET, handleLogout);
+  server.on("/saveSecurity", HTTP_POST, handleSaveSecurity);
+
+  // WebServer only exposes headers it was told to collect BEFORE begin() -
+  // without this, server.header("Cookie") is always empty and every
+  // session check fails.
+  const char *collectHeaderKeys[] = { "Cookie" };
+  server.collectHeaders(collectHeaderKeys, 1);
 
   server.begin();
 
@@ -7425,6 +7924,43 @@ void webTask(void *parameter) {
 
 // ===================== Main Loop (Core 1, unused) =====================
 // Intentionally empty: all real work has moved to webTask/modbusTask.
+// Credential recovery over USB serial: type "factory-reset-auth" in the
+// serial monitor (115200) to restore the default web login and AP
+// password WITHOUT touching any other configuration (Modbus params,
+// certs, cloud config all survive). Requiring physical USB access gives
+// up nothing security-wise - anyone with the cable could re-flash the
+// whole board anyway; this just makes recovery surgical instead of a
+// destructive full-flash erase.
+void checkSerialRecovery() {
+  static String serialCmdBuf = "";
+
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+
+    if (c == '\n' || c == '\r') {
+      serialCmdBuf.trim();
+      if (serialCmdBuf == "factory-reset-auth") {
+        preferences.begin("auth", false);
+        preferences.clear();
+        preferences.end();
+
+        deviceConfig.apPassword = DEFAULT_AP_PASSWORD;
+        saveDeviceConfig();
+
+        Serial.println("AUTH RESET OK: web login back to " WEB_AUTH_DEFAULT_USER "/" WEB_AUTH_DEFAULT_PASS ", AP password back to " DEFAULT_AP_PASSWORD " - rebooting");
+        delay(500);
+        ESP.restart();
+      } else if (serialCmdBuf.length() > 0) {
+        Serial.println("Unknown command. Available: factory-reset-auth (restores default web login + AP password, keeps all other settings)");
+      }
+      serialCmdBuf = "";
+    } else if (serialCmdBuf.length() < 64) {
+      serialCmdBuf += c;
+    }
+  }
+}
+
 void loop() {
+  checkSerialRecovery();
   delay(1000);
 }

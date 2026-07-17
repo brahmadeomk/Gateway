@@ -53,8 +53,11 @@ never been connected to a router.
 2. On your phone/laptop, connect to the WiFi network:
    - **SSID**: `ESP32ModbusGateWay` by default (or the device's configured name — see
      Device Identity in §5)
-   - **Password**: `12345678`
-3. Open a browser to **`http://192.168.4.1`**. This is the Dashboard.
+   - **Password**: `12345678` by default (changeable — see §11)
+3. Open a browser to **`http://192.168.4.1`** and log in:
+   - **Username**: `admin` / **Password**: `admin` (defaults)
+   - A red banner reminds you to change this until you do — set your own
+     under **Settings → Security** (see §11).
 4. Click **Settings** to configure Modbus parameters, WiFi, cloud uplink, etc.
 5. To join your site WiFi (so the gateway also gets internet/LAN access),
    set the WiFi SSID/Password under **WiFi & TCP Configuration** in Settings
@@ -145,6 +148,16 @@ add up to 20 custom types, or **Reset Data Types** to restore the defaults.
 - **AP Name (SSID)** — the device's own WiFi hotspot name. Check
   **Match AP Name with Device Name** to keep it automatically in sync with
   Device Name instead of setting it independently.
+- **AP Password** — WPA2 key for the device's own hotspot (min 8 chars;
+  blank keeps the current one). Default `12345678` — change it. Forgot it?
+  See §11 (recovery).
+
+### 5.3a Security
+- **Web Username / New Web Password** — the login for this web UI
+  (defaults `admin`/`admin`; a red banner nags until the password is
+  changed). Blank password fields keep the current password.
+- Sessions time out after 30 minutes idle; 5 failed logins lock the login
+  page for 60 seconds. See §11 for the full security model and recovery.
 
 ### 5.4 WiFi & TCP Configuration
 - **WiFi SSID / Password** — your site network, for the gateway to join
@@ -351,12 +364,46 @@ range, invalid index), `WRITE QUEUE FULL`. Same pattern with `DO WRITE
 (<section>): N write(s) failed - flash may be full` if a save partially
 failed.
 
+**Security**
+`WEB LOGIN OK: <user>`, `WEB LOGIN FAILED (attempt N/5)`,
+`WEB LOGIN LOCKED OUT (60s after N failures)`,
+`SECURITY SETTINGS SAVED: web user=<user> (password changed/unchanged)`.
+
 **Diagnostics**
 `FREE HEAP: <bytes> (min ever since boot: <bytes>)` — logged periodically.
 
 ---
 
-## 11. Troubleshooting
+## 11. Security & Recovery
+
+- **Everything requires login.** Every page *and* every save/write/reset
+  endpoint checks the session — there is no way to change settings or
+  actuate outputs over HTTP without being logged in. Log out with the
+  **Log Out** button (Dashboard or Settings).
+- **Login protection**: sessions are random per-login tokens
+  (HttpOnly cookie), idle out after 30 minutes, and a new login replaces
+  any previous session. Five failed login attempts lock the login page
+  for 60 seconds (`WEB LOGIN LOCKED OUT` in the Status Log).
+- **Credentials storage**: the web password is stored as a salted SHA-256
+  hash, never as plain text. Password fields in the UI never echo stored
+  values.
+- **Forgot the web login or AP password?** Connect the device over USB,
+  open a serial monitor at 115200 baud, and send:
+  ```
+  factory-reset-auth
+  ```
+  This restores the default web login (`admin`/`admin`) and default AP
+  password (`12345678`), then reboots. **Nothing else is touched** — all
+  Modbus parameters, data types, certificates, and cloud/cellular
+  configuration survive. (Physical USB access is required, which is the
+  point: anyone with the cable could re-flash the board anyway.)
+- **Honest limitation**: the web UI itself is plain HTTP, so the login
+  transits unencrypted on your local network/AP. This is the standard
+  posture for LAN-only device UIs; treat the AP password and your site
+  LAN as the perimeter. The cloud uplink (MQTT) is fully TLS-encrypted
+  and unaffected.
+
+## 12. Troubleshooting
 
 | Symptom | Check |
 |---|---|
