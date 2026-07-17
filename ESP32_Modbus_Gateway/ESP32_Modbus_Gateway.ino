@@ -77,7 +77,16 @@
      Device Shadow (which this replaced): shadow's desired/reported model
      is AWS-proprietary, and portability to other brokers (Azure IoT Hub,
      Mosquitto, ...) is a design goal. Only active when cloudConfig.mode
-     == UPLINK_MODE_MQTT and cloudConfig.commandsEnabled.
+     == UPLINK_MODE_MQTT and cloudConfig.commandsEnabled. Commands are
+     received over whichever transport is currently the active uplink:
+     WiFi/PubSubClient normally (mqttCallback()), or the modem's onboard
+     client during a cellular failover (+CMQTTSUB subscription + the
+     +CMQTTRX* URC pump in cellularTask; acks travel back over
+     AT+CMQTTPUB via small queues, never inline from a URC handler).
+     Caveat: while cellularTask is inside a TinyGSM modem.xxx() status
+     call, TinyGSM's own response parsing may consume an inbound-command
+     URC (a few-ms window per 5s cycle) - the peer should treat a missing
+     ack as "retry", same as any QoS-1 loss.
    - Raw TCP command channel: reuses the existing outbound tcpClient
      connection (the same one sendPayloadTcp() pushes telemetry on) instead
      of a separate listening socket - the master can send back newline-
@@ -389,7 +398,11 @@ TaskHandle_t cellularTaskHandle;
 // results turned into something readable - see cellularTask().
 #define CELLULAR_TASK_CORE 0
 #define CELLULAR_TASK_PRIORITY 1
-#define CELLULAR_TASK_STACK 4096
+// 8KB, not the 4KB the other Core-0 tasks get by default: this task's URC
+// path (consumeCellularInboundMessage -> handleMqttCommand -> ArduinoJson
+// + the write-submission helpers) can nest inside an in-flight AT command
+// wait, stacking both call chains at once.
+#define CELLULAR_TASK_STACK 8192
 
 struct CellularStatus {
   bool modemResponding;
@@ -399,7 +412,8 @@ struct CellularStatus {
   String operatorName;
   bool dataConnected;  // PDP/data context up (modem.gprsConnect()) - not yet used for any uplink traffic
   bool mqttCertsProvisioned;  // modem's own cert store + SSL context set up
-  bool mqttSessionConnected;  // modem's onboard MQTT client is connected + publishing telemetry (verification stage - not yet the active/failover uplink)
+  bool mqttSessionConnected;  // modem's onboard MQTT client is connected + publishing telemetry (only while failover is active)
+  bool mqttCommandsSubscribed;  // modem's client is subscribed to the command topic (inbound commands work during failover)
   unsigned long lastUpdateTime;
 };
 
@@ -3276,35 +3290,77 @@ uint16_t commandMqttBufferFloor() {
   return topicLen + MQTT_CMD_MAX_LEN + 64;
 }
 
-// Publishes one JSON ack on the command ack topic - same shape as the
-// raw-TCP channel's sendTcpAckLine() (minus the newline framing, which
-// MQTT's own message boundaries make redundant).
-void publishMqttAck(const String &name, float value, bool ok, uint8_t code, const String &reason) {
-  if (!mqttClient.connected()) {
-    return;
-  }
-
+// Ack JSON - same shape as the raw-TCP channel's sendTcpAckLine() (minus
+// the newline framing, which MQTT's own message boundaries make
+// redundant). Shared by the WiFi publish path below and the cellular ack
+// queue (queueCellularAck()/cellularTask).
+String buildMqttAckJson(const String &name, float value, bool ok, uint8_t code, const String &reason) {
   String line = "{\"ack\":\"" + jsonEscape(name) + "\",\"value\":" + String(value, 3) + ",\"ok\":" + (ok ? "true" : "false") + ",\"code\":" + String(code);
   if (reason.length() > 0) {
     line += ",\"reason\":\"" + jsonEscape(reason) + "\"";
   }
   line += "}";
+  return line;
+}
+
+// Publishes one JSON ack on the command ack topic over the WiFi/
+// PubSubClient connection. webTask only.
+void publishMqttAck(const String &name, float value, bool ok, uint8_t code, const String &reason) {
+  if (!mqttClient.connected()) {
+    return;
+  }
+
+  String line = buildMqttAckJson(name, value, ok, code, reason);
 
   if (!mqttClient.publish(mqttCommandAckTopic().c_str(), line.c_str())) {
     logKeyEvent("MQTT ACK PUBLISH FAILED: " + name);
   }
 }
 
+// Immediate acks/query responses for commands that arrived over the
+// CELLULAR path can't be published inline: the inbound message is parsed
+// from a URC that may surface in the middle of waiting for another AT
+// command's response (see waitForAtResponse()), where issuing a nested
+// AT+CMQTTTOPIC/PAYLOAD/PUB sequence would corrupt the command stream.
+// They're queued here instead and published by cellularTask at loop level
+// (drainCellularAckTxQueue()), where the UART is between commands.
+// Best-effort like the other ack queues.
+#define CELLULAR_ACK_JSON_MAX_LEN 256
+#define CELLULAR_ACK_TX_QUEUE_LEN 4
+
+struct CellularAckItem {
+  char json[CELLULAR_ACK_JSON_MAX_LEN];
+};
+
+QueueHandle_t cellularAckTxQueue;
+
+void queueCellularAck(const String &json) {
+  if (json.length() >= CELLULAR_ACK_JSON_MAX_LEN) {
+    logKeyEvent("CELLULAR ACK DROPPED (" + String(json.length()) + " bytes exceeds buffer)");
+    return;
+  }
+
+  CellularAckItem item;
+  json.toCharArray(item.json, CELLULAR_ACK_JSON_MAX_LEN);
+  xQueueSend(cellularAckTxQueue, &item, 0);
+}
+
 // Parses one inbound command message - mirrors handleTcpCommandLine()
 // exactly, just with MQTT publishes instead of socket writes for the
 // replies. Immediate rejections (parse error, unknown param, validation
 // failure) are acked right away; a successfully queued write's real
-// result is acked later via queueMqttAck()/drainMqttAckQueue().
+// result is acked later via queueMqttAck() (drained by webTask over WiFi,
+// or by cellularTask over the modem during failover).
 //
-// Safe to publish from inside the PubSubClient callback here: the inbound
-// payload is fully copied into the JsonDocument before any publish call
-// could reuse the client's shared rx/tx buffer.
-void handleMqttCommand(byte *payload, unsigned int length) {
+// viaCellular: true when the command arrived over the modem's onboard
+// MQTT client (cellularTask's URC pump) - replies are then queued for
+// cellularTask to publish (queueCellularAck()) instead of being sent
+// through the WiFi PubSubClient, which is down during a failover anyway.
+//
+// On the WiFi path it's safe to publish from inside the PubSubClient
+// callback: the inbound payload is fully copied into the JsonDocument
+// before any publish call could reuse the client's shared rx/tx buffer.
+void handleMqttCommand(const byte *payload, unsigned int length, bool viaCellular) {
   if (length == 0 || length > MQTT_CMD_MAX_LEN) {
     logKeyEvent("MQTT CMD IGNORED: payload size " + String(length) + " out of bounds");
     return;
@@ -3318,8 +3374,12 @@ void handleMqttCommand(byte *payload, unsigned int length) {
   }
 
   if (doc["query"].is<const char *>()) {
-    String response = buildQueryResponseJson(doc["query"].as<String>(), "MQTT");
-    mqttClient.publish(mqttCommandAckTopic().c_str(), response.c_str());
+    String response = buildQueryResponseJson(doc["query"].as<String>(), viaCellular ? "MQTT-CELL" : "MQTT");
+    if (viaCellular) {
+      queueCellularAck(response);
+    } else {
+      mqttClient.publish(mqttCommandAckTopic().c_str(), response.c_str());
+    }
     return;
   }
 
@@ -3335,7 +3395,11 @@ void handleMqttCommand(byte *payload, unsigned int length) {
   if (idx >= 0) {
     if (!submitWriteCommand(idx, value, WRITE_SOURCE_MQTT)) {
       // submitWriteCommand() already logged the specific reason.
-      publishMqttAck(paramName, value, false, 0xFF, "rejected - see Status Log");
+      if (viaCellular) {
+        queueCellularAck(buildMqttAckJson(paramName, value, false, 0xFF, "rejected - see Status Log"));
+      } else {
+        publishMqttAck(paramName, value, false, 0xFF, "rejected - see Status Log");
+      }
     }
     // else: queued OK - the real ack comes later via mqttAckQueue.
     return;
@@ -3344,20 +3408,28 @@ void handleMqttCommand(byte *payload, unsigned int length) {
   int doIdx = findDoChannelIndexByName(paramName);
   if (doIdx >= 0) {
     if (!submitDoWriteCommand(doIdx, value != 0, WRITE_SOURCE_MQTT)) {
-      publishMqttAck(paramName, value, false, 0xFF, "rejected - see Status Log");
+      if (viaCellular) {
+        queueCellularAck(buildMqttAckJson(paramName, value, false, 0xFF, "rejected - see Status Log"));
+      } else {
+        publishMqttAck(paramName, value, false, 0xFF, "rejected - see Status Log");
+      }
     }
     return;
   }
 
   logKeyEvent("MQTT CMD REJECTED: no parameter named '" + paramName + "'");
-  publishMqttAck(paramName, value, false, 0xFF, "unknown parameter");
+  if (viaCellular) {
+    queueCellularAck(buildMqttAckJson(paramName, value, false, 0xFF, "unknown parameter"));
+  } else {
+    publishMqttAck(paramName, value, false, 0xFF, "unknown parameter");
+  }
 }
 
 // PubSubClient callback - runs inside mqttClient.loop() on webTask (Core 0).
 // Only the command topic is ever subscribed today, so no topic dispatch
 // table is needed yet.
 void mqttCallback(char *topic, byte *payload, unsigned int length) {
-  handleMqttCommand(payload, length);
+  handleMqttCommand(payload, length, false);
 }
 
 // ===================== MQTT / AWS IoT Uplink =====================
@@ -4266,7 +4338,7 @@ void handleRoot() {
   // uplink data path, so this box is informational, independent of the
   // WiFi/MQTT/TCP status above.
   {
-    bool modemResponding, simReady, networkRegistered, dataConnected, mqttCertsProvisioned, mqttSessionConnected;
+    bool modemResponding, simReady, networkRegistered, dataConnected, mqttCertsProvisioned, mqttSessionConnected, mqttCommandsSubscribed;
     int signalQuality;
     String operatorName;
     unsigned long lastUpdateTime;
@@ -4280,6 +4352,7 @@ void handleRoot() {
     dataConnected = cellularStatus.dataConnected;
     mqttCertsProvisioned = cellularStatus.mqttCertsProvisioned;
     mqttSessionConnected = cellularStatus.mqttSessionConnected;
+    mqttCommandsSubscribed = cellularStatus.mqttCommandsSubscribed;
     lastUpdateTime = cellularStatus.lastUpdateTime;
     xSemaphoreGive(cellularMutex);
 
@@ -4302,6 +4375,9 @@ void handleRoot() {
       if (cloudConfig.mode == UPLINK_MODE_MQTT) {
         html += "<br><b>MQTT Certs on Modem:</b> " + String(mqttCertsProvisioned ? "Provisioned" : "Not yet provisioned");
         html += "<br><b>MQTT Session (cellular):</b> " + String(mqttSessionConnected ? "Connected, publishing" : "Not connected");
+        if (cloudConfig.commandsEnabled) {
+          html += "<br><b>Command Topic (cellular):</b> " + String(mqttCommandsSubscribed ? "Subscribed" : "Not subscribed");
+        }
 
         html += "<br><b>Active MQTT Uplink:</b> ";
         if (mqttFailoverActive) {
@@ -6069,6 +6145,7 @@ void setup() {
   rtuWriteQueue = xQueueCreate(WRITE_QUEUE_LEN, sizeof(WriteCommand));
   tcpWriteQueue = xQueueCreate(WRITE_QUEUE_LEN, sizeof(WriteCommand));
   mqttAckQueue = xQueueCreate(MQTT_ACK_QUEUE_LEN, sizeof(MqttAckItem));
+  cellularAckTxQueue = xQueueCreate(CELLULAR_ACK_TX_QUEUE_LEN, sizeof(CellularAckItem));
   tcpAckQueue = xQueueCreate(TCP_ACK_QUEUE_LEN, sizeof(TcpAckItem));
   doWriteQueue = xQueueCreate(DO_QUEUE_LEN, sizeof(DoWriteCommand));
 
@@ -6373,9 +6450,15 @@ void logTask(void *parameter) {
 }
 
 // Publishes a completion ack for each finished WRITE_SOURCE_MQTT command -
-// see the MqttAckItem comment near mqttAckQueue. Only webTask touches
-// mqttClient.publish(), so this is the only place that drains this queue.
+// see the MqttAckItem comment near mqttAckQueue. WiFi-side drain (webTask/
+// mqttClient); during a cellular failover the items are deliberately left
+// in the queue for cellularTask's own drain (drainMqttAckQueueCellular())
+// to publish over the modem instead.
 void drainMqttAckQueue() {
+  if (mqttFailoverActive) {
+    return;
+  }
+
   MqttAckItem item;
 
   while (xQueueReceive(mqttAckQueue, &item, 0) == pdTRUE) {
@@ -6504,9 +6587,218 @@ void powerOnModem() {
 #define AT_LINE_MAX_LEN 256
 #define AT_DEFAULT_TIMEOUT_MS 5000
 
+// ---- Inbound MQTT message URCs (+CMQTTRXSTART etc.) ----
+// While the modem's MQTT client is connected and subscribed, an inbound
+// message can surface on SerialAT at ANY time, as an unsolicited block:
+//   +CMQTTRXSTART: <client>,<topic_total_len>,<payload_total_len>
+//   +CMQTTRXTOPIC: <client>,<chunk_len>   then <chunk_len> raw topic bytes
+//   +CMQTTRXPAYLOAD: <client>,<chunk_len> then <chunk_len> raw payload bytes
+//   +CMQTTRXEND: <client>
+// (TOPIC/PAYLOAD chunks repeat until their totals are reached.) The
+// helpers below spot the RXSTART line wherever it appears - between
+// commands (pumpCellularMqttUrcs()) or in the middle of waiting for some
+// other command's response (waitForAtResponse()) - and synchronously
+// consume the rest of the block before carrying on.
+#define CELLULAR_RX_TOPIC_MAX_LEN 128
+#define CELLULAR_RX_BLOCK_TIMEOUT_MS 10000
+
+// Set when a +CMQTTCONNLOST / +CMQTTNONET URC is spotted; cellularTask
+// consumes it at loop level to mark the session down and reconnect.
+bool cellularMqttConnLost = false;
+
+// Line assembly for the between-commands pump - persistent so a line that
+// arrives split across pump calls isn't corrupted.
+String cellularUrcLineBuf;
+
+// Reads one complete non-empty line (blocking up to timeoutMs).
+bool readAtLine(String &line, unsigned long timeoutMs) {
+  line = "";
+  unsigned long start = millis();
+
+  while (millis() - start < timeoutMs) {
+    while (SerialAT.available()) {
+      char c = (char)SerialAT.read();
+      if (c == '\n') {
+        line.trim();
+        if (line.length() > 0) {
+          return true;
+        }
+      } else if (c != '\r') {
+        if (line.length() < AT_LINE_MAX_LEN) {
+          line += c;
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+
+  return false;
+}
+
+// Reads exactly len raw bytes (blocking up to timeoutMs) - used for the
+// topic/payload chunks, which are length-prefixed and may contain any
+// byte, so line-based reading would be wrong.
+bool readAtRawBytes(String &out, size_t len, unsigned long timeoutMs) {
+  out = "";
+  out.reserve(len);
+  unsigned long start = millis();
+
+  while (out.length() < len && millis() - start < timeoutMs) {
+    while (SerialAT.available() && out.length() < len) {
+      out += (char)SerialAT.read();
+    }
+    if (out.length() < len) {
+      vTaskDelay(pdMS_TO_TICKS(2));
+    }
+  }
+
+  return out.length() == len;
+}
+
+// Consumes one complete inbound-message block, starting right after its
+// +CMQTTRXSTART line, and hands the payload to handleMqttCommand() if the
+// topic matches the command topic. Oversized messages are drained (so the
+// URC stream stays in sync) but dropped.
+void consumeCellularInboundMessage(const String &startLine) {
+  int c1 = startLine.indexOf(',');
+  int c2 = startLine.lastIndexOf(',');
+  if (c1 < 0 || c2 <= c1) {
+    return;
+  }
+
+  long topicTotal = startLine.substring(c1 + 1, c2).toInt();
+  long payloadTotal = startLine.substring(c2 + 1).toInt();
+  bool oversized = (topicTotal > CELLULAR_RX_TOPIC_MAX_LEN || payloadTotal > MQTT_CMD_MAX_LEN);
+
+  String topic = "";
+  String payload = "";
+  unsigned long start = millis();
+
+  for (;;) {
+    // Recomputed before every blocking read - the subtraction must never
+    // underflow (unsigned), or a stalled modem could wedge this task for
+    // ~49 days instead of the intended block timeout.
+    unsigned long elapsed = millis() - start;
+    if (elapsed >= CELLULAR_RX_BLOCK_TIMEOUT_MS) {
+      break;
+    }
+    unsigned long remaining = CELLULAR_RX_BLOCK_TIMEOUT_MS - elapsed;
+
+    String line;
+    if (!readAtLine(line, remaining)) {
+      break;
+    }
+
+    if (line.startsWith("+CMQTTRXTOPIC:") || line.startsWith("+CMQTTRXPAYLOAD:")) {
+      long chunkLen = line.substring(line.lastIndexOf(',') + 1).toInt();
+      if (chunkLen < 0 || chunkLen > MQTT_CMD_MAX_LEN) {
+        break;  // implausible - abandon the block rather than block on it
+      }
+
+      elapsed = millis() - start;
+      if (elapsed >= CELLULAR_RX_BLOCK_TIMEOUT_MS) {
+        break;
+      }
+
+      String chunk;
+      if (!readAtRawBytes(chunk, (size_t)chunkLen, CELLULAR_RX_BLOCK_TIMEOUT_MS - elapsed)) {
+        break;
+      }
+
+      if (!oversized) {
+        if (line.startsWith("+CMQTTRXTOPIC:")) {
+          topic += chunk;
+        } else {
+          payload += chunk;
+        }
+      }
+      continue;
+    }
+
+    if (line.startsWith("+CMQTTRXEND:")) {
+      if (oversized) {
+        logKeyEvent("CELLULAR MQTT CMD IGNORED: message too large (topic " + String(topicTotal) + ", payload " + String(payloadTotal) + " bytes)");
+      } else if (topic == mqttCommandTopic()) {
+        logMessage("CELLULAR MQTT CMD RECEIVED: " + payload);
+        handleMqttCommand((const byte *)payload.c_str(), payload.length(), true);
+      } else {
+        logMessage("CELLULAR MQTT RX IGNORED (topic " + topic + ")");
+      }
+      return;
+    }
+
+    if (line.startsWith("+CMQTTCONNLOST:") || line.startsWith("+CMQTTNONET")) {
+      cellularMqttConnLost = true;
+      return;  // session is gone - the rest of the block won't arrive
+    }
+
+    // Any other line (a late OK, an unrelated URC) - skip and keep
+    // scanning for the rest of the block.
+  }
+
+  logKeyEvent("CELLULAR MQTT RX ABORTED (incomplete message block)");
+}
+
+// Reacts to one complete URC line seen between commands.
+void handleCellularUrcLine(const String &line) {
+  if (line.startsWith("+CMQTTRXSTART:")) {
+    consumeCellularInboundMessage(line);
+  } else if (line.startsWith("+CMQTTCONNLOST:") || line.startsWith("+CMQTTNONET")) {
+    cellularMqttConnLost = true;
+  }
+  // Anything else between commands is stale noise (a late OK etc.) -
+  // dropped, exactly as the old blind pre-command flush did.
+}
+
+// Drains whatever is sitting in the UART RX buffer, processing any URCs
+// found - called between AT commands and repeatedly while cellularTask
+// sleeps, so an inbound command is handled within ~the pump interval
+// instead of waiting for the next full status cycle.
+void pumpCellularMqttUrcs() {
+  while (SerialAT.available()) {
+    char c = (char)SerialAT.read();
+
+    if (c == '\n') {
+      cellularUrcLineBuf.trim();
+      if (cellularUrcLineBuf.length() > 0) {
+        String line = cellularUrcLineBuf;
+        cellularUrcLineBuf = "";
+        handleCellularUrcLine(line);
+      } else {
+        cellularUrcLineBuf = "";
+      }
+    } else if (c != '\r') {
+      if (cellularUrcLineBuf.length() < AT_LINE_MAX_LEN) {
+        cellularUrcLineBuf += c;
+      }
+    }
+  }
+}
+
+// Called before sending any AT command, replacing the old blind flush
+// (`while available: read`), which would have silently discarded any
+// inbound command sitting in the buffer. Processes pending URCs instead,
+// and gives a partially-received line a brief moment to finish (at 115200
+// baud a full line takes ~20ms) so the command's response parsing starts
+// on a clean line boundary.
+void syncCellularUartForCommand() {
+  pumpCellularMqttUrcs();
+
+  if (cellularUrcLineBuf.length() > 0) {
+    unsigned long start = millis();
+    while (cellularUrcLineBuf.length() > 0 && millis() - start < 250) {
+      vTaskDelay(pdMS_TO_TICKS(5));
+      pumpCellularMqttUrcs();
+    }
+    cellularUrcLineBuf = "";  // still unfinished - stale, drop it
+  }
+}
+
 // Reads lines from SerialAT until one starts with expectedPrefix (success,
 // optionally copied into resultLine) or is "ERROR"/"+CME ERROR"/"+CMS
-// ERROR" (failure), or timeoutMs elapses with neither (failure).
+// ERROR" (failure), or timeoutMs elapses with neither (failure). An
+// inbound-message URC block surfacing mid-wait is consumed inline (see
+// above) rather than discarded.
 bool waitForAtResponse(const String &expectedPrefix, unsigned long timeoutMs, String *resultLine = nullptr) {
   unsigned long start = millis();
   String line;
@@ -6521,6 +6813,16 @@ bool waitForAtResponse(const String &expectedPrefix, unsigned long timeoutMs, St
           if (line.startsWith(expectedPrefix)) {
             if (resultLine) *resultLine = line;
             return true;
+          }
+          if (line.startsWith("+CMQTTRXSTART:")) {
+            consumeCellularInboundMessage(line);
+            line = "";
+            continue;
+          }
+          if (line.startsWith("+CMQTTCONNLOST:") || line.startsWith("+CMQTTNONET")) {
+            cellularMqttConnLost = true;
+            line = "";
+            continue;
           }
           if (line == "ERROR" || line.startsWith("+CME ERROR") || line.startsWith("+CMS ERROR")) {
             if (resultLine) *resultLine = line;
@@ -6542,9 +6844,7 @@ bool waitForAtResponse(const String &expectedPrefix, unsigned long timeoutMs, St
 
 // Sends a plain "AT...\r\n" command and waits for its response line.
 bool sendAtCommand(const String &cmd, const String &expectedPrefix, unsigned long timeoutMs, String *resultLine = nullptr) {
-  while (SerialAT.available()) {
-    SerialAT.read();  // flush any stale bytes (e.g. a late URC) before sending
-  }
+  syncCellularUartForCommand();
 
   SerialAT.print(cmd);
   SerialAT.print("\r\n");
@@ -6553,13 +6853,12 @@ bool sendAtCommand(const String &cmd, const String &expectedPrefix, unsigned lon
 }
 
 // For commands that show a ">" prompt before accepting raw data
-// (AT+CCERTDOWN, AT+CMQTTTOPIC, AT+CMQTTPAYLOAD, AT+CMQTTSUBTOPIC, etc.):
+// (AT+CCERTDOWN, AT+CMQTTTOPIC, AT+CMQTTPAYLOAD, AT+CMQTTSUB, etc.):
 // sends the command, waits for the ">" prompt, writes the raw payload
-// bytes, then waits for the final response line.
-bool sendAtCommandWithData(const String &cmd, const uint8_t *data, size_t len, const String &expectedPrefix, unsigned long timeoutMs) {
-  while (SerialAT.available()) {
-    SerialAT.read();
-  }
+// bytes, then waits for the final response line (optionally captured in
+// resultLine, for callers that need to parse a trailing error code).
+bool sendAtCommandWithData(const String &cmd, const uint8_t *data, size_t len, const String &expectedPrefix, unsigned long timeoutMs, String *resultLine = nullptr) {
+  syncCellularUartForCommand();
 
   SerialAT.print(cmd);
   SerialAT.print("\r\n");
@@ -6584,7 +6883,14 @@ bool sendAtCommandWithData(const String &cmd, const uint8_t *data, size_t len, c
 
   SerialAT.write(data, len);
 
-  return waitForAtResponse(expectedPrefix, timeoutMs, nullptr);
+  return waitForAtResponse(expectedPrefix, timeoutMs, resultLine);
+}
+
+// Parses the trailing <err> field of a "+CMQTTXXX: ...,<err>" result line
+// (or the only field, e.g. "+CMQTTSTART: <err>"). 0 means success.
+int atTrailingErrCode(const String &resultLine, const String &resultPrefix) {
+  int lastComma = resultLine.lastIndexOf(',');
+  return (lastComma >= 0) ? resultLine.substring(lastComma + 1).toInt() : resultLine.substring(resultPrefix.length()).toInt();
 }
 
 // Many AT+CMQTT* commands (CONNECT/PUB/SUB/UNSUB/DISC/START) eventually
@@ -6601,9 +6907,7 @@ bool sendAtCommandWithData(const String &cmd, const uint8_t *data, size_t len, c
 // placeholder if none arrived) regardless of success/failure - lets callers
 // log the modem's actual error code on failure instead of just "it failed".
 bool sendMqttCommand(const String &cmd, const String &resultPrefix, unsigned long timeoutMs, String *outResultLine = nullptr) {
-  while (SerialAT.available()) {
-    SerialAT.read();
-  }
+  syncCellularUartForCommand();
 
   SerialAT.print(cmd);
   SerialAT.print("\r\n");
@@ -6618,9 +6922,7 @@ bool sendMqttCommand(const String &cmd, const String &resultPrefix, unsigned lon
 
   if (outResultLine) *outResultLine = resultLine;
 
-  int lastComma = resultLine.lastIndexOf(',');
-  int errCode = (lastComma >= 0) ? resultLine.substring(lastComma + 1).toInt() : resultLine.substring(resultPrefix.length()).toInt();
-  return errCode == 0;
+  return atTrailingErrCode(resultLine, resultPrefix) == 0;
 }
 
 // ===================== Cellular Modem: MQTT Certificate Provisioning =====================
@@ -6670,13 +6972,14 @@ bool provisionCellularMqttCerts() {
   return true;
 }
 
-// ===================== Cellular Modem: MQTT Session + Telemetry Publish =====================
-// Runs the modem's onboard MQTT client in parallel with the WiFi/
-// PubSubClient path for now (verification stage, not yet the active
-// uplink - see the Client* abstraction note for how Stage 3d will decide
-// which transport is "live"). Reuses the same cloudConfig.endpoint/port/
-// topic and buildTcpJson() payload as the WiFi path - same AWS IoT Thing,
-// same telemetry shape, different transport.
+// ===================== Cellular Modem: MQTT Session + Commands + Telemetry =====================
+// The modem's onboard MQTT client, run only while cellular failover is
+// active (see mqttFailoverActive). Reuses the same cloudConfig.endpoint/
+// port/topic, buildTcpJson() telemetry payload, and command/ack topics as
+// the WiFi/PubSubClient path - same broker identity, same message shapes,
+// different transport. Inbound commands arrive as +CMQTTRX* URC blocks
+// (see the URC pump above); outbound acks are queued and published at
+// loop level in cellularTask.
 #define CELLULAR_MQTT_CLIENT_INDEX 0
 #define CELLULAR_MQTT_START_TIMEOUT_MS 120000  // matches the manual's stated max response time for CMQTTSTART
 #define CELLULAR_MQTT_CONNECT_TIMEOUT_MS 60000
@@ -6766,15 +7069,15 @@ void disconnectCellularMqttSession() {
   sendMqttCommand(cmd, "+CMQTTDISC:", CELLULAR_MQTT_CONNECT_TIMEOUT_MS);
 }
 
-// Publishes the same telemetry payload the WiFi/PubSubClient path sends
-// (buildTcpJson()), over the modem's own MQTT client instead. outResultLine,
-// if given, is filled with a short failure reason on any step's failure.
-bool publishCellularMqttTelemetry(String *outResultLine = nullptr) {
+// Publishes one message on any topic over the modem's own MQTT client.
+// outResultLine, if given, is filled with a short failure reason on any
+// step's failure. cellularTask only, and only at loop level - never from
+// inside a URC handler (see queueCellularAck()).
+bool publishCellularMqtt(const String &topic, const String &payload, String *outResultLine = nullptr) {
   String ctx = String(CELLULAR_MQTT_CLIENT_INDEX);
-  String payload = buildTcpJson();
 
-  String topicCmd = "AT+CMQTTTOPIC=" + ctx + "," + String(cloudConfig.topic.length());
-  if (!sendAtCommandWithData(topicCmd, (const uint8_t *)cloudConfig.topic.c_str(), cloudConfig.topic.length(), "OK", AT_DEFAULT_TIMEOUT_MS)) {
+  String topicCmd = "AT+CMQTTTOPIC=" + ctx + "," + String(topic.length());
+  if (!sendAtCommandWithData(topicCmd, (const uint8_t *)topic.c_str(), topic.length(), "OK", AT_DEFAULT_TIMEOUT_MS)) {
     if (outResultLine) *outResultLine = "(CMQTTTOPIC failed)";
     return false;
   }
@@ -6789,7 +7092,66 @@ bool publishCellularMqttTelemetry(String *outResultLine = nullptr) {
   return sendMqttCommand(pubCmd, "+CMQTTPUB:", CELLULAR_MQTT_PUB_TIMEOUT_MS, outResultLine);
 }
 
+// Publishes the same telemetry payload the WiFi/PubSubClient path sends
+// (buildTcpJson()) to the same topic, over the modem's client instead.
+bool publishCellularMqttTelemetry(String *outResultLine = nullptr) {
+  return publishCellularMqtt(cloudConfig.topic, buildTcpJson(), outResultLine);
+}
+
+// Subscribes the modem's MQTT client to the command topic (QoS 1), so
+// inbound commands keep working during a failover - the counterpart of
+// connectMqtt()'s mqttClient.subscribe() on the WiFi path. The topic
+// arrives via the same ">"-prompt data mechanism as CMQTTTOPIC, and the
+// real result is the asynchronous "+CMQTTSUB: <client>,<err>" line.
+bool subscribeCellularMqttCommands() {
+  String topic = mqttCommandTopic();
+  String cmd = "AT+CMQTTSUB=" + String(CELLULAR_MQTT_CLIENT_INDEX) + "," + String(topic.length()) + ",1";
+
+  String result;
+  if (!sendAtCommandWithData(cmd, (const uint8_t *)topic.c_str(), topic.length(), "+CMQTTSUB:", CELLULAR_MQTT_PUB_TIMEOUT_MS, &result)
+      || atTrailingErrCode(result, "+CMQTTSUB:") != 0) {
+    logKeyEvent("CELLULAR MQTT CMD SUBSCRIBE FAILED: " + (result.length() > 0 ? result : String("(no response)")));
+    return false;
+  }
+
+  logKeyEvent("CELLULAR MQTT CMD SUBSCRIBED: " + topic);
+  return true;
+}
+
+// Publishes the immediate acks/query responses queued by
+// handleMqttCommand() for commands that arrived over cellular - see the
+// CellularAckItem comment. cellularTask loop level only.
+void drainCellularAckTxQueue() {
+  CellularAckItem item;
+
+  while (xQueueReceive(cellularAckTxQueue, &item, 0) == pdTRUE) {
+    publishCellularMqtt(mqttCommandAckTopic(), String(item.json));
+  }
+}
+
+// Cellular-side counterpart of webTask's drainMqttAckQueue(): during a
+// failover the completed-write acks are published over the modem instead.
+// Same best-effort semantics. The mqttFailoverActive check mirrors the
+// inverse check on the webTask side, so exactly one drain owns the queue
+// at any moment.
+void drainMqttAckQueueCellular() {
+  if (!mqttFailoverActive) {
+    return;
+  }
+
+  MqttAckItem item;
+
+  while (xQueueReceive(mqttAckQueue, &item, 0) == pdTRUE) {
+    String json = buildMqttAckJson(String(item.name), item.value, item.result == MB_SUCCESS, item.result, "");
+    publishCellularMqtt(mqttCommandAckTopic(), json);
+  }
+}
+
 void cellularTask(void *parameter) {
+  // Default UART RX buffer is 256 bytes - an inbound command URC block
+  // (topic + up to MQTT_CMD_MAX_LEN payload + framing) arriving while this
+  // task is asleep between pump calls must fit without overflowing.
+  SerialAT.setRxBufferSize(2048);
   SerialAT.begin(MODEM_BAUD, SERIAL_8N1, SERIAL2_RX_PIN, SERIAL2_TX_PIN);
 
   powerOnModem();
@@ -6808,6 +7170,10 @@ void cellularTask(void *parameter) {
   bool mqttClientAcquired = false;
   bool mqttSslBound = false;
   bool mqttConnected = false;
+  // Command-topic subscription state - reset alongside mqttConnected,
+  // since CMQTTCONNECT uses clean_session=1 (the broker forgets the
+  // subscription on disconnect, so every new CONNECT must re-subscribe).
+  bool mqttSubscribed = false;
 
   for (;;) {
     if (!everInitialized) {
@@ -6823,6 +7189,11 @@ void cellularTask(void *parameter) {
         continue;
       }
     }
+
+    // Process any inbound-command URCs buffered during the sleep loop
+    // BEFORE handing the UART to TinyGSM's status calls - TinyGSM's own
+    // response parsing would discard them as unrecognized lines.
+    pumpCellularMqttUrcs();
 
     bool responding = modem.testAT(3000);
     bool simReady = responding && (modem.getSimStatus() == SIM_READY);
@@ -6903,14 +7274,34 @@ void cellularTask(void *parameter) {
     // a cellular failover was active, so the session still tears down.
     bool shouldBeConnected = mqttFailoverActive && cloudConfig.mode == UPLINK_MODE_MQTT;
 
+    // A +CMQTTCONNLOST/+CMQTTNONET URC may have been spotted at any point
+    // since the last cycle (by the pump or mid-command) - fold it into the
+    // session state before deciding what to do this cycle.
+    if (cellularMqttConnLost) {
+      cellularMqttConnLost = false;
+      if (mqttConnected) {
+        logKeyEvent("CELLULAR MQTT CONNECTION LOST (modem URC) - will reconnect");
+        mqttConnected = false;
+        mqttSubscribed = false;
+      }
+    }
+
     if (certsProvisioned && shouldBeConnected) {
       if (!mqttConnected) {
+        mqttSubscribed = false;
         advanceCellularMqttSession(mqttStarted, mqttClientAcquired, mqttSslBound, mqttConnected);
       } else {
+        // Subscribe before the first publish of the session, so a command
+        // sent in reaction to the first telemetry can't slip through the gap.
+        if (cloudConfig.commandsEnabled && !mqttSubscribed) {
+          mqttSubscribed = subscribeCellularMqttCommands();
+        }
+
         String pubResult;
         if (!publishCellularMqttTelemetry(&pubResult)) {
           logKeyEvent("CELLULAR MQTT PUBLISH FAILED - will retry connect: " + pubResult);
           mqttConnected = false;  // re-attempt CONNECT next cycle; STARTED/ACCQ/SSLCFG stay done
+          mqttSubscribed = false;
         } else {
           logMessage("CELLULAR MQTT TELEMETRY PUBLISHED");
         }
@@ -6922,17 +7313,31 @@ void cellularTask(void *parameter) {
       // on the next failover.
       disconnectCellularMqttSession();
       mqttConnected = false;
+      mqttSubscribed = false;
     }
 
     xSemaphoreTake(cellularMutex, portMAX_DELAY);
     cellularStatus.mqttSessionConnected = mqttConnected;
+    cellularStatus.mqttCommandsSubscribed = mqttSubscribed;
     xSemaphoreGive(cellularMutex);
 
     if (mqttConnected != wasMqttConnected) {
       logKeyEvent(mqttConnected ? ("CELLULAR MQTT SESSION UP: " + cloudConfig.endpoint) : "CELLULAR MQTT SESSION DOWN");
     }
 
-    vTaskDelay(pdMS_TO_TICKS(CELLULAR_POLL_INTERVAL_MS));
+    // Sleep until the next status/telemetry cycle - but while the MQTT
+    // session is up, keep pumping the UART for inbound command URCs and
+    // flushing any resulting acks, so a command is handled within ~200ms
+    // instead of sitting in the RX buffer for the whole poll interval.
+    unsigned long sleepStart = millis();
+    while (millis() - sleepStart < CELLULAR_POLL_INTERVAL_MS) {
+      if (mqttConnected) {
+        pumpCellularMqttUrcs();
+        drainCellularAckTxQueue();
+        drainMqttAckQueueCellular();
+      }
+      vTaskDelay(pdMS_TO_TICKS(200));
+    }
   }
 }
 

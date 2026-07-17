@@ -236,6 +236,12 @@ its parsing code between both transports. These are plain MQTT topics —
 no AWS-specific features — so the channel works unchanged against AWS IoT
 Core, Azure IoT Hub, Mosquitto, or any other broker.
 
+The command channel follows the active uplink: over WiFi normally, and
+over the cellular modem during a failover (§8) — same topics, same JSON,
+no changes needed on the master side. During failover, allow a few
+seconds' extra latency per command (cellular round trips), and treat a
+missing ack as "retry the command".
+
 ### 7.3 Raw TCP command channel
 Over the same bidirectional Raw TCP connection (§6.1), send a
 newline-terminated JSON line:
@@ -260,9 +266,10 @@ WiFi is lost — **Raw TCP mode is never affected**, since it targets a
 private LAN IP that cellular data can't route to.
 
 - **Failover**: if WiFi is continuously down for **3 minutes**, the
-  gateway brings up the modem's onboard MQTT session and starts publishing
-  telemetry over cellular instead. (Cellular data is billed/metered, so
-  this only activates as a genuine fallback, not routinely.)
+  gateway brings up the modem's onboard MQTT session, re-subscribes to the
+  command topic, and continues both telemetry *and* two-way commands over
+  cellular. (Cellular data is billed/metered, so this only activates as a
+  genuine fallback, not routinely.)
 - **Failback**: once WiFi has been continuously connected and stable for
   another 3 minutes, the gateway switches back to WiFi and tears down the
   cellular MQTT session (kept warm at the lower level for a fast reconnect
@@ -315,7 +322,9 @@ retrying`, `TCP CONNECTED` / `TCP CONNECT FAILED` / `TCP DISCONNECTED`,
 `UPLINK FAILBACK: MQTT switching back to WiFi (stable 3+ min)`,
 `CELLULAR MQTT SESSION UP/DOWN`, `CELLULAR MQTT SESSION FAILED (<step>):
 <detail>`, `CELLULAR MQTT PUBLISH FAILED`, `CELLULAR MQTT CERT
-PROVISIONING START/OK`, `CELLULAR SIM READY/NOT READY`,
+PROVISIONING START/OK`, `CELLULAR MQTT CMD SUBSCRIBED/SUBSCRIBE FAILED`,
+`CELLULAR MQTT CONNECTION LOST (modem URC)`, `CELLULAR MQTT CMD IGNORED/
+RX ABORTED`, `CELLULAR SIM READY/NOT READY`,
 `CELLULAR NETWORK REGISTERED/LOST`, `CELLULAR DATA SESSION UP/DOWN`,
 `CELLULAR MODEM RESPONDING/NOT RESPONDING`.
 
