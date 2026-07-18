@@ -1958,7 +1958,11 @@ static const uint32_t SHA256_K[64] = {
 
 #define ROTR32(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
 
-void sha256Transform(Sha256Ctx *ctx, const uint8_t data[]) {
+// Built-in parameter types only (uint32_t*/uint8_t*), deliberately NOT
+// Sha256Ctx*: the Arduino builder hoists auto-generated prototypes above
+// this file's type definitions, so a .ino-defined struct in a function
+// signature fails to compile ("variable or field declared void").
+void sha256Transform(uint32_t *state, const uint8_t *data) {
   uint32_t m[64];
 
   for (int i = 0; i < 16; i++) {
@@ -1970,8 +1974,8 @@ void sha256Transform(Sha256Ctx *ctx, const uint8_t data[]) {
     m[i] = m[i - 16] + s0 + m[i - 7] + s1;
   }
 
-  uint32_t a = ctx->state[0], b = ctx->state[1], c = ctx->state[2], d = ctx->state[3];
-  uint32_t e = ctx->state[4], f = ctx->state[5], g = ctx->state[6], h = ctx->state[7];
+  uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+  uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
 
   for (int i = 0; i < 64; i++) {
     uint32_t S1 = ROTR32(e, 6) ^ ROTR32(e, 11) ^ ROTR32(e, 25);
@@ -1984,8 +1988,8 @@ void sha256Transform(Sha256Ctx *ctx, const uint8_t data[]) {
     d = c; c = b; b = a; a = t1 + t2;
   }
 
-  ctx->state[0] += a; ctx->state[1] += b; ctx->state[2] += c; ctx->state[3] += d;
-  ctx->state[4] += e; ctx->state[5] += f; ctx->state[6] += g; ctx->state[7] += h;
+  state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+  state[4] += e; state[5] += f; state[6] += g; state[7] += h;
 }
 
 String sha256Hex(const String &input) {
@@ -1998,7 +2002,7 @@ String sha256Hex(const String &input) {
   for (unsigned int i = 0; i < input.length(); i++) {
     ctx.data[ctx.datalen++] = (uint8_t)input[i];
     if (ctx.datalen == 64) {
-      sha256Transform(&ctx, ctx.data);
+      sha256Transform(ctx.state, ctx.data);
       ctx.bitlen += 512;
       ctx.datalen = 0;
     }
@@ -2010,14 +2014,14 @@ String sha256Hex(const String &input) {
   ctx.data[i++] = 0x80;
   if (i > 56) {
     while (i < 64) ctx.data[i++] = 0x00;
-    sha256Transform(&ctx, ctx.data);
+    sha256Transform(ctx.state, ctx.data);
     i = 0;
   }
   while (i < 56) ctx.data[i++] = 0x00;
   for (int j = 7; j >= 0; j--) {
     ctx.data[i++] = (uint8_t)(ctx.bitlen >> (j * 8));
   }
-  sha256Transform(&ctx, ctx.data);
+  sha256Transform(ctx.state, ctx.data);
 
   String out = "";
   out.reserve(64);
