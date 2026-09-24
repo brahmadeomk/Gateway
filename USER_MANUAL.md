@@ -161,7 +161,16 @@ add up to 20 custom types, or **Reset Data Types** to restore the defaults.
 
 ### 5.4 WiFi & TCP Configuration
 - **WiFi SSID / Password** — your site network, for the gateway to join
-  as a client (in addition to its own AP).
+  as a client (in addition to its own AP). A blank password field keeps
+  the saved password.
+- **Open network (no password)** — tick this to join an open SSID. It
+  clears any saved WiFi password (a blank password field alone can't).
+  Open networks are unencrypted, so the web UI and Modbus writes cross
+  them in plain text; MQTT stays TLS-encrypted.
+- **Device WiFi MAC** — the address your router sees when the gateway
+  joins as a client. On MAC-filtered networks, add this address to the
+  router's allow list. The device's own hotspot uses a different MAC,
+  which the router never sees.
 - **Master IP / Master Port** — target for Raw TCP uplink mode (§6.1).
 - **On-Premise NTP Server** — optional local time server, tried before
   public NTP (`pool.ntp.org`, then `time.nist.gov`).

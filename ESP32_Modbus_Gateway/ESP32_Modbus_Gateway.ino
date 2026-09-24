@@ -5405,7 +5405,14 @@ function toggleApSsidField() {
   html += "<form action='/saveUplink' method='POST'>";
   html += "<table>";
   html += "<tr><th>WiFi SSID</th><td><input type='text' name='ssid' value='" + htmlEscape(uplinkConfig.ssid) + "'></td></tr>";
-  html += "<tr><th>WiFi Password</th><td><input type='password' name='password' placeholder='Leave blank to keep unchanged'></td></tr>";
+  {
+    bool openNet = (uplinkConfig.ssid.length() > 0 && uplinkConfig.password.length() == 0);
+    html += "<tr><th>WiFi Password</th><td><input type='password' id='wifiPassInput' name='password' placeholder='Leave blank to keep unchanged'" + String(openNet ? " disabled" : "") + ">";
+    html += "<br><label><input type='checkbox' name='openNetwork' onchange=\"document.getElementById('wifiPassInput').disabled=this.checked\"" + String(openNet ? " checked" : "") + "> Open network (no password)</label>";
+    html += "<br><small>Ticking this clears any saved WiFi password. Open networks are unencrypted: the web UI and Modbus writes cross them in plain text (MQTT stays TLS-encrypted).</small></td></tr>";
+  }
+  html += "<tr><th>Device WiFi MAC</th><td><b>" + WiFi.macAddress() + "</b>"
+          "<br><small>For MAC-filtered networks, allow this address on your router/AP. It's the WiFi client (STA) MAC; the device's own hotspot uses a different one, which the router never sees.</small></td></tr>";
   html += "<tr><th>Master IP</th><td><input type='text' name='ip' value='" + htmlEscape(uplinkConfig.serverIP) + "'></td></tr>";
   html += "<tr><th>Master Port</th><td><input type='number' name='port' value='" + String(uplinkConfig.port) + "'>"
           "<br><small>When Uplink Mode below is Raw TCP, this connection is bidirectional: the master can send newline-framed JSON commands back - write: <code>{\"param\":\"Name\",\"value\":42}</code> (acked), or on-demand read: <code>{\"query\":\"Name\"}</code> (answered immediately, separate from the periodic telemetry broadcast).</small></td></tr>";
@@ -5949,7 +5956,13 @@ void handleSaveUplink() {
     uplinkConfig.ssid = server.arg("ssid");
   }
 
-  if (server.hasArg("password") && server.arg("password").length() > 0) {
+  // A blank password field means "keep the saved one", so an open network
+  // needs its own explicit flag - otherwise a previously saved password
+  // could never be cleared, and with a password set the ESP32 refuses to
+  // join an open AP.
+  if (server.hasArg("openNetwork")) {
+    uplinkConfig.password = "";
+  } else if (server.hasArg("password") && server.arg("password").length() > 0) {
     uplinkConfig.password = server.arg("password");
   }
 
@@ -5985,7 +5998,7 @@ void handleSaveUplink() {
   // immediately, not just after the next reboot.
   startNtp();
 
-  logKeyEvent("NETWORK CONFIG SAVED: ssid=" + uplinkConfig.ssid + " tcp=" + uplinkConfig.serverIP + ":" + String(uplinkConfig.port)
+  logKeyEvent("NETWORK CONFIG SAVED: ssid=" + uplinkConfig.ssid + (uplinkConfig.password.length() == 0 ? " (open)" : "") + " tcp=" + uplinkConfig.serverIP + ":" + String(uplinkConfig.port)
               + (uplinkConfig.ntpServer.length() > 0 ? (" ntp=" + uplinkConfig.ntpServer) : ""));
 
   server.sendHeader("Location", ok ? "/settings?uplinkSaved=1" : "/settings?uplinkSaveError=1");
