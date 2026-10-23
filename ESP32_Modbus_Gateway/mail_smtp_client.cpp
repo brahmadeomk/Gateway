@@ -4,7 +4,14 @@
 #include <stdio.h>
 #include <string.h>
 
-#include <esp_crt_bundle.h>
+#include <esp_err.h>
+
+// ESP-IDF's certificate bundle hook, declared here rather than through
+// <esp_crt_bundle.h>: Arduino's own ESP32 core ("Arduino ESP32 Boards") finds
+// WiFiClientSecure's header of the same name first, and that one declares only
+// arduino_esp_crt_bundle_attach. The IDF function itself is in libmbedtls on
+// both cores, with the built-in root certificate bundle.
+extern "C" esp_err_t esp_crt_bundle_attach(void* conf);
 
 namespace gwmail {
 namespace {
