@@ -192,6 +192,11 @@ add up to 20 custom types, or **Reset Data Types** to restore the defaults.
   upload the files from your broker/CA. Fields are never echoed back for
   security; leave blank to keep the currently-stored value.
 
+### 5.5a Email Alerts
+Mail server, recipients and alert behaviour for email alerts. Which
+parameters alarm, and at what limits, is set per row in the Modbus Settings
+table (§5.1). See §10 for the full guide.
+
 ### 5.6 Modbus TCP Targets
 Up to 4 remote Modbus TCP servers (e.g. a CNC controller) polled over
 WiFi as a second data source, alongside the RS485 bus. Configure
@@ -332,82 +337,230 @@ delivering fresh data during that window (see §8).
 
 ## 10. Email Alerts
 
-The gateway can email you when a Modbus parameter (RTU or TCP) leaves its
-limits or stops updating. Two places to set it up:
+The gateway can email up to four people when a Modbus parameter — RTU or
+TCP — goes outside its limits, stops updating, or returns to normal. Email
+goes out over WiFi, or over the SIM7600 cellular modem when WiFi can't
+deliver it.
 
-**1. Settings → Email Alerts** (the mail server and recipients):
+### 10.1 Quick start
+
+1. **Settings → Email Alerts:** fill in the SMTP server, login, From address
+   and at least one recipient (see §10.2), tick **Email Alerts: Enabled**,
+   and press **Save Email Settings**.
+2. Press **Send Test Email**, wait about 30 seconds, then refresh the page.
+   The result appears under the button. Fix anything it reports (§10.7)
+   before going further.
+3. **Settings → Modbus Settings table:** on each parameter to watch, tick
+   **Email Alert** and set its **Low** and/or **High** limit (§10.3). Press
+   **Save Modbus**.
+4. Check the Dashboard: an out-of-limits parameter shows **ALARM HIGH/LOW/NO
+   DATA** in red in its Status column, and the Status Log shows each alarm
+   and each email sent.
+
+Email Alerts is off on a new gateway, and every parameter starts with its
+alert unticked — including after a firmware update from a version without
+email alerts. Nothing is emailed until you set it up.
+
+### 10.2 Mail server settings (Settings → Email Alerts)
 
 | Field | Notes |
 |---|---|
-| Email Alerts | Master switch. While off, alarms are still tracked and shown on the Dashboard and Status Log, but nothing is emailed. |
-| SMTP Server / Port / Security | e.g. `smtp.office365.com`, port 587, STARTTLS. 465 = SSL/TLS. Choosing a security mode updates the port for you. **None** (port 25) sends the password and alerts unencrypted — only for an internal relay without TLS. |
-| Username / Password | The mail account. Leave Username blank for an internal relay that needs no login. The password is write-only: it is never shown again, and a blank field keeps the saved one. Office 365 and Gmail usually need an **app password**, or SMTP AUTH enabled for the mailbox. |
-| From Address | Usually must be the same as the login account, or the server rejects it. |
-| Recipients 1–4 | Every recipient gets every alert, in a single email. |
-| Subject Prefix | Starts every subject, e.g. `[Panel-7]`. Blank = the Device Name. |
-| Reminder Interval (min) | Re-sends an alarm that is still active after this long. 0 = never. Default 60. |
-| Cellular | **Send over cellular when WiFi is down** (on by default). Uses SIM data, roughly 10–20 KB per email. See *Delivery* below. |
+| Email Alerts | Master switch. While off, alarms are still tracked and shown on the Dashboard and Status Log, but nothing is emailed, and switching it off discards any emails still waiting to send. |
+| SMTP Server | Outgoing mail server, e.g. `smtp.office365.com`. Up to 64 characters. |
+| Security | **STARTTLS** (port 587, the usual choice), **SSL/TLS** (port 465), or **None** (port 25). Changing Security moves the Port to match, unless you have typed a non-standard port. **None** sends the password and every alert unencrypted — only for an internal relay that doesn't support TLS. |
+| SMTP Port | Normally set by Security. |
+| Username | The mail account to log in with. Leave blank for a relay that needs no login (no password is then sent or kept). |
+| Password | Write-only: never shown again after saving. A blank field keeps the saved password; tick **Clear saved password** to remove it. |
+| From Address | The sender. Most servers reject mail whose From doesn't match the login account. |
+| Recipients 1–4 | Every recipient gets every alert, in one email addressed to all of them. At least one is required. |
+| Subject Prefix | Starts every subject in brackets, e.g. `[Boiler House]`, so recipients can tell gateways apart and filter on it. Up to 32 characters. Blank = the Device Name. |
+| Reminder Interval (min) | Re-sends an alarm that is still active after this many minutes, then again every interval. 0 = never. Default 60, maximum 1440 (24 h). |
+| Cellular | **Send over cellular when WiFi is down.** On by default. Uses SIM data — roughly 10–20 KB per email. See §10.6. |
 | Return to Normal | Also email when an alarm clears. On by default. |
-| No-Data Alarms | Alarm when an alert-enabled parameter has had no valid reading (device not responding / read error) for this many seconds. Default on, 60 s. |
+| No-Data Alarms | Alarm when an alert-enabled parameter has had no valid reading for this many seconds (0–3600, default 60). See §10.4. |
 
-Press **Send Test Email** after saving. It sends a real email the same way
-an alert would, then shows the result under the button (refresh the page
-after ~30 s), including which path it used (`OK via WiFi` / `OK via
-cellular`). **Test via Cellular** forces the modem path even while WiFi is
-up, so you can prove cellular email works during commissioning without
-unplugging anything. A failure names the exact step that failed and what to
-check:
+If a save is rejected, a red banner says why and **nothing** is changed:
+`SMTP server is missing or invalid`, `From address is not a valid email
+address`, `at least one recipient is required`, `a recipient is not a valid
+email address`, or `a field is too long (max 64 characters)`. The address
+checks only apply while Email Alerts is ticked, so you can save a
+half-finished setup with alerts off.
 
-| Test result says | Check |
+**Common setups:**
+
+| Mail service | Server | Security / Port | Notes |
+|---|---|---|---|
+| Microsoft 365 / Office 365 | `smtp.office365.com` | STARTTLS / 587 | The mailbox must have **Authenticated SMTP** (SMTP AUTH) allowed; many company tenants switch it off. If login fails with the correct password (`server said 535`), ask your IT team to allow SMTP AUTH for the sending mailbox, or for an internal relay. From must be the login mailbox. |
+| Gmail / Google Workspace | `smtp.gmail.com` | STARTTLS / 587 | Needs an **app password** (Google account → Security → 2-Step Verification → App passwords), not the normal password. |
+| Site's internal mail relay | Your relay's name or IP | Usually None / 25, or STARTTLS / 587 | Often needs no login: leave Username blank. **A relay on the site network can't be reached over cellular** — see §10.6. |
+
+Use a dedicated mailbox for the gateway rather than a person's account: its
+password is stored on the device (§12).
+
+### 10.3 Choosing which parameters alarm (Modbus Settings table)
+
+Each row in the Modbus Settings table has two alert columns:
+
+| Column | Field | Meaning |
+|---|---|---|
+| **Email Alert: Low / High** | tick box | Watch this parameter. The row must also be **Enabled** (polled) — a row that isn't polled never alarms. |
+| | Low, High | Alarm when the value goes **below Low** or **above High**. Either can be left blank for no limit on that side; with both blank, the row can only raise NO DATA alarms. Limits are in the same engineering units the Dashboard shows (after the Data Type's scaling). |
+| **Deadband / Delay (s)** | Deadband | Hysteresis. A HIGH alarm only clears once the value is back down to **High − Deadband** or below; a LOW alarm once it is back up to **Low + Deadband** or above. Stops a value hovering on the limit from sending a stream of alarm/clear emails. 0 = clear as soon as it's back inside the limit. |
+| | Delay | How long a breach must last, without a break, before it becomes an alarm — and how long a recovery must last before the alarm clears. Filters out one-poll spikes. 0–3600 s. |
+
+For a Coil or Discrete Input (value 0 or 1): High = `0.5` alarms when it reads
+1; Low = `0.5` alarms when it reads 0.
+
+**Worked example** — a tank temperature, High = 80, Deadband = 2, Delay = 10:
+
+| Time | Reading | What happens |
+|---|---|---|
+| 08:32:51 | 80.4 | Above 80: the 10 s delay starts. Nothing shown yet. |
+| 08:33:01 | 81.2 | Still above 80 after 10 s: **ALARM HIGH**. Red on the Dashboard, logged. |
+| ~08:33:12 | — | Email sent (alerts wait 10 s to be grouped — §10.5). |
+| 08:50:00 | 79.0 | Below 80 but not below 78: **still in alarm** (deadband). |
+| 09:10:00 | 77.5 | At or below 78: the 10 s clear delay starts. |
+| 09:10:10 | 77.0 | Stayed down for 10 s: **CLEARED**, and a Return-to-Normal email. |
+
+Had the reading gone back above 78 at any point during the clear delay, the
+alarm would have stayed active and the delay would start again next time.
+
+### 10.4 How alarms behave
+
+- **HIGH, LOW and NO DATA.** HIGH and LOW come from the limits. NO DATA
+  means the parameter hasn't had a valid reading — the slave isn't
+  responding, or the read returned an error — for the No-Data time (default
+  60 s). That time is gateway-wide rather than per row because every
+  parameter reads as invalid briefly at boot, and for about 30 s whenever a
+  slave goes into its not-responding pause; a short per-row delay would
+  turn both into false alarms. Turn **No-Data Alarms** off to have only
+  limit alarms.
+- **A slave dropping off the bus** gives one NO DATA alarm per alert-enabled
+  parameter on it, all in a single email (§10.5).
+- **Losing data during a HIGH or LOW alarm** doesn't clear it or turn it
+  into NO DATA. The limit breach stays the alarm being reported until a
+  valid reading shows the value back inside its limit.
+- **Jumping straight from HIGH to LOW** (or data returning to a NO DATA
+  alarm while out of limits) is reported as a new alarm.
+- **Reminders** repeat a still-active alarm every Reminder Interval, as a
+  `STILL IN ALARM` email.
+- **Saving the Modbus Settings table, or restarting the gateway, restarts
+  every alarm from normal.** A parameter that is still out of limits alarms
+  again after its delay, with a new ALARM email, and nothing is sent for
+  the alarm that was replaced.
+- **Unticking a row's Email Alert, or disabling the row,** drops its alarm
+  silently: no CLEARED email.
+- **Switching Email Alerts on** while alarms are already active doesn't
+  email them straight away. Each one is emailed at its next reminder, or
+  when it clears.
+- Alarms are always tracked — Dashboard and Status Log — even while Email
+  Alerts is off.
+
+### 10.5 What the emails look like
+
+Alarms raised within **10 seconds** of each other are grouped into one
+email, so a slave dropping off the bus sends one message listing all of
+its parameters rather than one each. An email therefore goes out about
+10 seconds after the first alarm in it, plus the time to send. One email
+lists up to 12 events; any beyond that are counted at the end.
+
+The subject names the most urgent event — new alarms first, then
+reminders, then clears — and how many others the email contains:
+
+```
+[Boiler House] ALARM: TankTemp HIGH (+1 more)
+[Boiler House] STILL IN ALARM: TankTemp HIGH
+[Boiler House] CLEARED: TankTemp
+[Boiler House] Test email
+```
+
+A typical body:
+
+```
+Modbus Gateway alert from GW01_A1B2C
+Sent: 2026-10-23 08:33:12 UTC
+
+ALARM     TankTemp: HIGH - value 81.200, high limit 80.000 [RTU slave 1] at 2026-10-23 08:33:01 UTC
+ALARM     Flow2: NO DATA - no valid reading (device not responding or read error) [TCP target CNC] at 2026-10-23 08:33:04 UTC
+
+Active alarms on the gateway right now: 2
+
+Sent automatically by the gateway. Alarm limits are set in the Modbus Settings table; email settings under Settings > Email Alerts.
+```
+
+Each event line gives the parameter, the condition, the reading and limit,
+where it comes from (RTU slave number or TCP target name), and **when it
+happened** — which matters for an email that was held back during an
+outage (§10.6). Cleared events read `CLEARED   TankTemp: back to normal
+(was HIGH) - value 77.000 ...`, and reminders start `STILL IN`.
+
+**All times are UTC** (India Standard Time is UTC + 5:30). Before the
+gateway has the correct time they show as `uptime N s (clock not synced)`.
+Names are sent in plain ASCII; any other character appears as `?`.
+
+### 10.6 Delivery: WiFi, cellular, queue and retries
+
+- **WiFi first.** Whenever WiFi is connected, email goes over WiFi.
+- **Cellular when WiFi can't deliver.** If WiFi is down — or WiFi is up but
+  can't even reach the mail server, e.g. the site's internet is out — the
+  email goes over the SIM7600 modem instead, with the same secure
+  connection and certificate checks. This doesn't wait for the 3-minute
+  MQTT failover (§8); it's used as soon as WiFi can't deliver, as long as
+  **Cellular** is ticked and the Dashboard shows the cellular **Data
+  Session: Connected**. While a cellular email is sending (usually 10–20 s),
+  cellular MQTT pauses, then carries on.
+- **Over cellular, only internet mail servers work.** The SIM is on the
+  public internet, not your site network, so an internal relay with a
+  private address can't be reached over cellular. If you use one, alerts
+  still wait for WiFi.
+- **Waiting.** If neither path is available, emails wait in a queue (up to
+  8 emails) and go out as soon as one is, in order. A waiting email doesn't
+  use up its retries. If the queue fills, further alerts are logged as
+  `EMAIL QUEUE FULL` and not emailed.
+- **Retries.** A send that fails is retried twice more — after 30 s, then
+  60 s — and then dropped, with `EMAIL DROPPED after 3 attempts` and the
+  last error in the Status Log.
+- **The correct time.** Secure email checks the mail server's certificate
+  dates, so it needs the right time. The gateway normally gets it from the
+  internet over WiFi. If it starts up while WiFi is down (for example after
+  a power cut), it gets the time through the cellular network instead and
+  logs `CLOCK SET FROM CELLULAR NETWORK`. Until it has the time, secure
+  emails wait.
+
+The Dashboard's top box shows whether email alerts are on, how many emails
+are waiting to send, and the number of active alarms. The Email Alerts box
+in Settings shows the queue and the totals sent and dropped since boot.
+
+### 10.7 Testing and fixing problems
+
+**Send Test Email** sends a real email exactly the way an alert would — same
+server, security and recipients — using the **saved** settings, so save
+first. It works while Email Alerts is still switched off. **Test via
+Cellular** forces the modem, even while WiFi is up and even with the
+Cellular box unticked, so you can prove cellular email works during
+commissioning without unplugging anything. About 30 seconds later, refresh
+the page: the result is shown under the buttons (it reads `sending...` until
+then), and also appears in the Status Log as `EMAIL TEST: ...`.
+
+A successful test reads `OK via WiFi - sent to 2 recipients` (or `via
+cellular`). A failure names the step that failed:
+
+| Result says | What to check |
 |---|---|
-| failed at DNS lookup | SMTP server name, and that the site network has DNS/internet access |
-| failed at TCP connect | Port number, and that the site firewall allows outbound SMTP |
+| failed at DNS lookup | SMTP server name spelled correctly, and the site network has DNS/internet access |
+| failed at TCP connect | Port number, and that the site firewall allows outbound mail on that port. Over cellular, some mobile networks block port 25 — use 587 or 465 |
 | failed at TLS handshake | Security matches the port (587 = STARTTLS, 465 = SSL/TLS) |
-| failed at authentication: server said 535 | Username/password — usually an app password is needed, or SMTP AUTH is disabled for the mailbox |
-| failed at sender address | From must match the login account |
-| not sent: waiting for a valid clock | The gateway has no correct time yet (NTP over WiFi, or the cellular network's time); secure email checks certificate dates, so it waits |
-| not sent: the cellular data session is not up | (Test via Cellular) check the Dashboard's Cellular Modem box: SIM, network, Data Session, APN |
+| failed at STARTTLS | The server doesn't offer STARTTLS on this port: try SSL/TLS on 465 |
+| failed at authentication: server said 535 | Username/password. Office 365: SMTP AUTH may be off for the mailbox; Gmail: use an app password (§10.2) |
+| failed at sender address | From must be the login account's address |
+| failed at recipient address | Every recipient was refused — check the addresses |
+| not sent: waiting for a valid clock | The gateway doesn't have the correct time yet (§10.6) |
+| not sent: WiFi is not connected and the cellular data session is not up | Neither path is available right now |
+| not sent: the cellular data session is not up | (Test via Cellular) Check the Dashboard's Cellular Modem box: SIM, Network, Data Session; set the APN (§5.8) |
 
-**2. Settings → Modbus Settings table** (which parameters, and their limits):
-tick **Email Alert** on a row and fill in:
-
-- **Low / High** — alarm when the value goes below Low or above High. Either
-  can be blank. For a Coil or Discrete Input, use High = `0.5` to alarm
-  whenever it reads 1.
-- **Deadband** — hysteresis. A HIGH alarm clears only once the value is back
-  below High − Deadband (LOW: above Low + Deadband), so a reading hovering
-  on the limit doesn't send a stream of alarm/clear emails.
-- **Delay (s)** — how long a breach must last before it alarms, and how long
-  a recovery must last before it clears. Filters out one-poll spikes.
-
-**What gets emailed:** `ALARM` when a limit is breached (or NO DATA),
-`STILL IN ALARM` reminders, and `CLEARED` when it returns to normal. Alarms
-raised within 10 seconds of each other share one email, so a device
-dropping off the bus sends one message listing all of its parameters
-rather than one each. The subject names the most urgent event, e.g.
-`[Panel-7] ALARM: TankTemp HIGH (+2 more)`; the body lists each event with
-its value, limit, source (RTU slave / TCP target) and time.
-
-**Delivery:** over WiFi whenever WiFi is connected. If WiFi is down — or
-WiFi is up but can't reach the mail server (the site's internet is down) —
-the email goes over the SIM7600 cellular modem instead, with the same
-secure connection and certificate checks. Cellular email doesn't wait for
-the 3-minute MQTT failover (§8): it's used as soon as WiFi can't deliver.
-While a cellular email is sending (usually 10–20 s), cellular MQTT pauses
-and resumes afterwards.
-
-If neither path is available, alerts wait in a queue of up to 8 emails and
-are sent as soon as one is; each email lists the time each alarm actually
-happened. A failed send is retried twice more (after 30 s and 60 s), then
-dropped and logged.
-
-Secure email needs the correct date. The gateway normally gets it from NTP
-over WiFi; if it starts up while WiFi is down, it gets the time over the
-cellular network instead (`CLOCK SET FROM CELLULAR NETWORK` in the Status
-Log), so cellular email still works after a power cut.
-
-The Dashboard shows active alarms in red in the Status column, and the top
-box shows the active-alarm count and any emails waiting to send.
+If the test says OK but nothing arrives, look in the recipients' spam or
+junk folder, and ask IT whether mail from the gateway's mailbox is being
+quarantined.
 
 ---
 
@@ -465,7 +618,8 @@ failed.
 `CLEARED HIGH/LOW/NO DATA: <name>`, `EMAIL SENT via WiFi/cellular:
 <subject> (sent to N recipients)`, `EMAIL FAILED via WiFi/cellular (attempt
 N/3), will retry: failed at <step>...`, `EMAIL DROPPED after 3 attempts`,
-`EMAIL QUEUE FULL`, `EMAIL TEST: OK/FAILED via WiFi/cellular - ...`,
+`EMAIL QUEUE FULL (8 emails waiting) - alert for <name> not emailed`,
+`EMAIL TEST: OK/FAILED via WiFi/cellular - ...`,
 `EMAIL SETTINGS SAVED`, `EMAIL ALERT TASK STARTED`,
 `CLOCK SET FROM CELLULAR NETWORK: <time> (modem NTP / network time)`,
 `CELLULAR NETWORK TIME NOT AVAILABLE - retrying in 10 min`.
@@ -493,6 +647,13 @@ N/3), will retry: failed at <step>...`, `EMAIL DROPPED after 3 attempts`,
 - **Credentials storage**: the web password is stored as a salted SHA-256
   hash, never as plain text. Password fields in the UI never echo stored
   values.
+- **The email (SMTP) password** can't be hashed — the gateway has to send
+  it to the mail server — so it is stored readable in the device's flash.
+  It is never shown in the UI, never written to the Status Log, and only
+  ever sent to the mail server over the encrypted connection (unless
+  Security is set to None). It crosses your local network unencrypted once,
+  when you type it into the Settings page. Use a dedicated mailbox for the
+  gateway, not a person's account.
 - **Forgot the web login or AP password?** Connect the device over USB,
   open a serial monitor at 115200 baud, and send:
   ```
@@ -519,4 +680,9 @@ N/3), will retry: failed at <step>...`, `EMAIL DROPPED after 3 attempts`,
 | MQTT never connects | Confirm Endpoint/Port, that all 3 cert fields are populated, and that NTP has synced (`MQTT WAITING FOR NTP TIME SYNC` means the clock isn't set yet) |
 | Write rejected | Check the parameter is marked Writable and the value is within Write Min/Max in Settings |
 | Cellular Data Session never comes up | Set the APN explicitly under Settings → Cellular Modem |
+| Test email works but no alert emails arrive | Email Alerts ticked and saved? The row's **Email Alert** ticked and the row **Enabled**? Does the Status Log show `ALARM ...` (alarm raised) and `EMAIL SENT ...`? If sent, check spam/junk folders |
+| Alert emails arrive late | WiFi down and **Cellular** unticked, the data session down, or the gateway waiting for the correct time — the Dashboard top box shows emails waiting (§10.6) |
+| Too many alarm/clear emails | Raise the row's **Deadband** and/or **Delay**, or lengthen the **Reminder Interval** (§10.3) |
+| NO DATA alarms after every restart | The slave takes longer than the No-Data time to answer after power-up: raise **No-Data Alarms** seconds (§10.4) |
+| Cellular email fails at TCP connect | The mobile network may block that port — use 587 or 465. An internal relay can't be reached over cellular at all (§10.6) |
 | Cellular failback never happens despite WiFi showing Connected | Watch the Dashboard's "Active MQTT Uplink" countdown — if the elapsed-seconds figure keeps resetting instead of climbing to 180s, WiFi is flapping (weak signal/AP issue), not a firmware fault |
