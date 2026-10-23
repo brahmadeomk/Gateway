@@ -172,6 +172,15 @@
 // robustly than a hand-rolled AT parser would.
 #define TINY_GSM_MODEM_SIM7600
 #include <TinyGsmClient.h>
+// Email alerts (mail_*.h/.cpp beside this sketch): SMTP over a raw lwIP
+// socket with mbedtls driven directly, so STARTTLS works - WiFiClientSecure
+// can't upgrade an open connection. Kept in separate .cpp files because
+// they're class-based, and the Arduino builder's prototype hoisting breaks
+// any .ino function whose signature uses a type defined in the .ino.
+#include "mail_config.h"
+#include "mail_mime_writer.h"
+#include "mail_smtp_client.h"
+#include "mail_socket_stream.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -396,11 +405,21 @@ SemaphoreHandle_t dataMutex;
 SemaphoreHandle_t logMutex;
 SemaphoreHandle_t serialMutex;
 SemaphoreHandle_t cellularMutex;
+SemaphoreHandle_t alertMutex;
 SemaphoreHandle_t pollCompleteSem;
 SemaphoreHandle_t tcpSendDoneSem;
 TaskHandle_t modbusTaskHandle;
 TaskHandle_t tcpPollTaskHandle;
 TaskHandle_t cellularTaskHandle;
+TaskHandle_t alertTaskHandle;
+
+// Sends alert/test emails. Core 0, lowest priority: a send can block for
+// tens of seconds (DNS, TLS handshake, slow server), which must stall
+// neither the web UI nor Modbus polling. 12KB because an mbedtls handshake
+// with certificate-chain verification runs on this stack.
+#define ALERT_TASK_CORE 0
+#define ALERT_TASK_PRIORITY 1
+#define ALERT_TASK_STACK 12288
 
 // ===================== Cellular Modem Status =====================
 // Written only by cellularTask; read by webTask for the Dashboard/data
@@ -791,6 +810,125 @@ struct ModbusParam {
 
 ModbusParam params[MAX_PARAMS];
 int paramCount = 0;
+
+// ===================== Email Alerts: Per-Parameter Alarms =====================
+// One entry per params[] row, index-aligned with it: both are rebuilt
+// together from the same Settings form submission (handleSave()), so a row
+// inserted or deleted in the table can never leave an alarm attached to the
+// wrong parameter. Persisted in their own NVS namespace ("alarms") rather
+// than as a third version of the "modbus" row blob, which keeps the
+// existing param storage and its migration paths untouched.
+//
+// Evaluated, edited and read only on webTask - no lock of its own. The
+// alert queue below is the only thing shared with alertTask.
+#define ALARM_COND_NONE 0
+#define ALARM_COND_HIGH 1
+#define ALARM_COND_LOW 2
+#define ALARM_COND_NODATA 3
+
+#define ALARM_STATE_NORMAL 0
+#define ALARM_STATE_PENDING 1   // condition seen, delay not yet elapsed
+#define ALARM_STATE_ACTIVE 2
+#define ALARM_STATE_CLEARING 3  // back inside limits, clear delay running
+
+#define ALARM_EVAL_INTERVAL_MS 1000
+#define ALARM_MAX_DELAY_S 3600
+
+struct ParamAlarm {
+  bool enabled;
+  bool hasLow;
+  bool hasHigh;
+  float low;
+  float high;
+  // Hysteresis: a HIGH alarm clears only once the value is back below
+  // high - deadband (LOW: above low + deadband), so a reading hovering on
+  // the limit can't flap the alarm on and off.
+  float deadband;
+  // Applies to raising and clearing alike: a breach (or a recovery) must
+  // persist this long to count, which filters out one-poll spikes.
+  uint16_t delaySec;
+
+  uint8_t state;  // ALARM_STATE_*
+  uint8_t cond;   // ALARM_COND_* being timed (PENDING) or in alarm
+  unsigned long sinceMs;
+  unsigned long lastNotifyMs;
+};
+
+ParamAlarm paramAlarms[MAX_PARAMS];
+int activeAlarmCount = 0;
+
+// Gateway-wide alert behaviour (Settings -> Email Alerts).
+struct AlertSettings {
+  uint16_t renotifyMin;   // reminder for a still-active alarm; 0 = never
+  bool sendClear;         // email when an alarm returns to normal
+  bool noDataAlerts;      // alarm when an alert-enabled param stops updating
+  uint16_t noDataDelaySec;
+};
+
+AlertSettings alertSettings = { 60, true, true, 60 };
+
+// ===================== Email Alerts: Outgoing Queue =====================
+// Shared between webTask (evaluateParamAlarms() adds events) and alertTask
+// (sends), under alertMutex. Events raised within ALERT_COALESCE_MS of each
+// other share one email - a slave dropping off the bus takes all of its
+// parameters with it, and that should be one message, not one each.
+#define ALERT_EVENT_ALARM 0
+#define ALERT_EVENT_CLEARED 1
+#define ALERT_EVENT_REMINDER 2
+
+#define ALERT_NAME_LEN 32
+#define ALERT_SOURCE_LEN 32
+#define ALERT_MAX_EVENTS 12
+#define ALERT_QUEUE_DEPTH 8
+#define ALERT_MAX_ATTEMPTS 3
+#define ALERT_RETRY_BACKOFF_MS 30000UL  // doubled per failed attempt
+#define ALERT_COALESCE_MS 10000UL
+
+struct AlertEvent {
+  char name[ALERT_NAME_LEN];
+  char source[ALERT_SOURCE_LEN];  // "RTU slave 3" / "TCP target CNC"
+  uint8_t kind;                   // ALERT_EVENT_*
+  uint8_t cond;                   // ALARM_COND_*
+  bool valueValid;
+  float value;
+  float limit;
+  unsigned long timestamp;  // getTimestamp() when it happened
+  bool timeIsUtc;           // else seconds since boot
+};
+
+struct AlertEntry {
+  bool inUse;
+  bool sending;  // alertTask has a copy in flight - don't append to it
+  uint8_t attempts;
+  unsigned long createdMs;
+  unsigned long nextAttemptMs;
+  uint8_t eventCount;
+  uint16_t moreCount;  // events past ALERT_MAX_EVENTS, reported as "+N more"
+  char deviceName[40];  // captured on webTask when the entry is created
+  AlertEvent events[ALERT_MAX_EVENTS];
+};
+
+AlertEntry alertQueue[ALERT_QUEUE_DEPTH];
+uint32_t alertSentTotal = 0;
+uint32_t alertDroppedTotal = 0;   // gave up after ALERT_MAX_ATTEMPTS
+uint32_t alertOverflowTotal = 0;  // queue full, event discarded
+unsigned long lastAlertOverflowLogMs = 0;
+
+// SMTP settings. Written only by the Settings handler on webTask; alertTask
+// takes a private copy under alertMutex before each send.
+gwmail::EmailConfig emailConfig;
+
+// Test email: requested by the Settings page, run by alertTask (a send can
+// block for tens of seconds - never on webTask). Result guarded by
+// alertMutex.
+volatile bool emailTestRequested = false;
+String emailTestResult = "";
+unsigned long emailTestTimestamp = 0;
+bool emailTestTimeIsUtc = false;
+char emailTestDeviceName[40] = "";  // captured on webTask by handleTestEmail()
+
+// Past the end of gwmail::EmailValidation, for the Settings error banner.
+#define EMAIL_FIELD_TOO_LONG 100
 
 // ===================== Local Digital I/O =====================
 // Independent of the Modbus params[] table above - plain local GPIO, no
@@ -2881,6 +3019,177 @@ void loadSettings() {
   logKeyEvent("MODBUS SETTINGS MIGRATED to compact storage - freed flash space");
 }
 
+// ===================== Save / Load Parameter Alarms =====================
+// Fixed-size on-flash layout, separate from the in-RAM ParamAlarm (which
+// also carries runtime state that must never be persisted).
+struct StoredAlarmRow {
+  uint8_t flags;  // bit0 enabled, bit1 hasLow, bit2 hasHigh
+  uint8_t reserved;
+  uint16_t delaySec;
+  float low;
+  float high;
+  float deadband;
+};
+
+// A blank field means "not set". Returns false for blank, leaving *out alone.
+bool parseOptionalFloat(String text, float *out) {
+  text.trim();
+  if (text.length() == 0) return false;
+  *out = text.toFloat();
+  return true;
+}
+
+void resetAlarmRuntime(int i) {
+  paramAlarms[i].state = ALARM_STATE_NORMAL;
+  paramAlarms[i].cond = ALARM_COND_NONE;
+  paramAlarms[i].sinceMs = 0;
+  paramAlarms[i].lastNotifyMs = 0;
+}
+
+void loadDefaultAlarms() {
+  for (int i = 0; i < MAX_PARAMS; i++) {
+    paramAlarms[i].enabled = false;
+    paramAlarms[i].hasLow = false;
+    paramAlarms[i].hasHigh = false;
+    paramAlarms[i].low = 0;
+    paramAlarms[i].high = 0;
+    paramAlarms[i].deadband = 0;
+    paramAlarms[i].delaySec = 0;
+    resetAlarmRuntime(i);
+  }
+}
+
+bool saveAlarmSettings() {
+  nvsWriteFailures = 0;
+  preferences.begin("alarms", false);
+  preferences.clear();
+
+  trackNvsWrite(preferences.putInt("count", paramCount));
+
+  if (paramCount > 0) {
+    StoredAlarmRow *rows = new StoredAlarmRow[paramCount];
+
+    for (int i = 0; i < paramCount; i++) {
+      memset(&rows[i], 0, sizeof(StoredAlarmRow));
+      rows[i].flags = (paramAlarms[i].enabled ? 1 : 0) | (paramAlarms[i].hasLow ? 2 : 0) | (paramAlarms[i].hasHigh ? 4 : 0);
+      rows[i].delaySec = paramAlarms[i].delaySec;
+      rows[i].low = paramAlarms[i].low;
+      rows[i].high = paramAlarms[i].high;
+      rows[i].deadband = paramAlarms[i].deadband;
+    }
+
+    size_t expectedLen = (size_t)paramCount * sizeof(StoredAlarmRow);
+    if (preferences.putBytes("rows", rows, expectedLen) != expectedLen) {
+      nvsWriteFailures++;
+    }
+
+    delete[] rows;
+  }
+
+  preferences.end();
+
+  if (nvsWriteFailures > 0) {
+    logKeyEvent("NVS SAVE INCOMPLETE (alarms): " + String(nvsWriteFailures) + " write(s) failed - flash may be full, alarm limits may not persist");
+  }
+
+  return nvsWriteFailures == 0;
+}
+
+// Must run after loadSettings(): alarms are matched to params[] by index,
+// and only accepted when they were saved for the same number of rows.
+void loadAlarmSettings() {
+  loadDefaultAlarms();
+
+  preferences.begin("alarms", true);
+  int count = preferences.getInt("count", -1);
+  size_t expectedLen = (size_t)count * sizeof(StoredAlarmRow);
+
+  if (count != paramCount || count <= 0 || preferences.getBytesLength("rows") != expectedLen) {
+    // Nothing saved yet (a device upgraded from firmware without alerts),
+    // or saved against a different table - start with every alarm off
+    // rather than guess which row a limit belonged to.
+    preferences.end();
+    return;
+  }
+
+  StoredAlarmRow *rows = new StoredAlarmRow[count];
+  preferences.getBytes("rows", rows, expectedLen);
+  preferences.end();
+
+  for (int i = 0; i < count; i++) {
+    paramAlarms[i].enabled = (rows[i].flags & 1) != 0;
+    paramAlarms[i].hasLow = (rows[i].flags & 2) != 0;
+    paramAlarms[i].hasHigh = (rows[i].flags & 4) != 0;
+    paramAlarms[i].low = rows[i].low;
+    paramAlarms[i].high = rows[i].high;
+    paramAlarms[i].deadband = (rows[i].deadband >= 0) ? rows[i].deadband : 0;
+    paramAlarms[i].delaySec = (rows[i].delaySec <= ALARM_MAX_DELAY_S) ? rows[i].delaySec : ALARM_MAX_DELAY_S;
+  }
+
+  delete[] rows;
+}
+
+// ===================== Save / Load Email Settings =====================
+bool saveEmailConfig() {
+  nvsWriteFailures = 0;
+  preferences.begin("email", false);
+
+  trackNvsWrite(preferences.putBool("en", emailConfig.enabled));
+  trackNvsWrite(preferences.putString("srv", emailConfig.server));
+  trackNvsWrite(preferences.putUShort("port", emailConfig.port));
+  trackNvsWrite(preferences.putUChar("sec", emailConfig.security));
+  trackNvsWrite(preferences.putString("user", emailConfig.username));
+  trackNvsWrite(preferences.putString("pass", emailConfig.password));
+  trackNvsWrite(preferences.putString("from", emailConfig.from));
+  for (int i = 0; i < gwmail::kMaxRecipients; i++) {
+    trackNvsWrite(preferences.putString(("to" + String(i)).c_str(), emailConfig.recipients[i].address));
+  }
+  trackNvsWrite(preferences.putString("pfx", emailConfig.subject_prefix));
+  trackNvsWrite(preferences.putUShort("rnm", alertSettings.renotifyMin));
+  trackNvsWrite(preferences.putBool("clr", alertSettings.sendClear));
+  trackNvsWrite(preferences.putBool("nd", alertSettings.noDataAlerts));
+  trackNvsWrite(preferences.putUShort("ndd", alertSettings.noDataDelaySec));
+
+  preferences.end();
+
+  if (nvsWriteFailures > 0) {
+    logKeyEvent("NVS SAVE INCOMPLETE (email): " + String(nvsWriteFailures) + " write(s) failed - flash may be full, email settings may not persist");
+  }
+
+  return nvsWriteFailures == 0;
+}
+
+void loadEmailConfig() {
+  emailConfig = gwmail::EmailConfig();
+
+  preferences.begin("email", true);
+
+  emailConfig.enabled = preferences.getBool("en", false);
+  strlcpy(emailConfig.server, preferences.getString("srv", "").c_str(), sizeof(emailConfig.server));
+  emailConfig.port = preferences.getUShort("port", 587);
+  emailConfig.security = preferences.getUChar("sec", gwmail::kSmtpSecurityStartTls);
+  strlcpy(emailConfig.username, preferences.getString("user", "").c_str(), sizeof(emailConfig.username));
+  strlcpy(emailConfig.password, preferences.getString("pass", "").c_str(), sizeof(emailConfig.password));
+  strlcpy(emailConfig.from, preferences.getString("from", "").c_str(), sizeof(emailConfig.from));
+  for (int i = 0; i < gwmail::kMaxRecipients; i++) {
+    strlcpy(emailConfig.recipients[i].address, preferences.getString(("to" + String(i)).c_str(), "").c_str(), sizeof(emailConfig.recipients[i].address));
+  }
+  strlcpy(emailConfig.subject_prefix, preferences.getString("pfx", "").c_str(), sizeof(emailConfig.subject_prefix));
+  alertSettings.renotifyMin = preferences.getUShort("rnm", 60);
+  alertSettings.sendClear = preferences.getBool("clr", true);
+  alertSettings.noDataAlerts = preferences.getBool("nd", true);
+  alertSettings.noDataDelaySec = preferences.getUShort("ndd", 60);
+
+  preferences.end();
+
+  if (emailConfig.security > gwmail::kSmtpSecuritySsl) {
+    emailConfig.security = gwmail::kSmtpSecurityStartTls;
+  }
+  if (alertSettings.noDataDelaySec > ALARM_MAX_DELAY_S) {
+    alertSettings.noDataDelaySec = ALARM_MAX_DELAY_S;
+  }
+}
+
 // ===================== Dropdown =====================
 String getTypeOptions(String selected) {
   String html = "";
@@ -4625,6 +4934,12 @@ void handleRoot() {
   }
   html += "<b>Poll Interval:</b> " + String(pollIntervalMs) + " ms";
   html += "<br><b>Free Heap:</b> " + String(ESP.getFreeHeap()) + " bytes (min ever: " + String(ESP.getMinFreeHeap()) + ")";
+  html += "<br><b>Email Alerts:</b> " + String(emailConfig.enabled ? "Enabled" : "Disabled");
+  if (emailConfig.enabled) {
+    int queued = alertQueueDepth();
+    if (queued > 0) html += " (" + String(queued) + " waiting to send)";
+  }
+  html += " &middot; <b>Active alarms:</b> " + String(activeAlarmCount);
 
   // Only shown while there is an undelivered backlog (uplink outage).
   if (sfCount > 0) {
@@ -4820,7 +5135,10 @@ function updateRowFields(data){
    if (valEl) valEl.textContent = p.value ?? '-';
 
    let statEl = document.getElementById("stat" + i);
-   if (statEl) statEl.textContent = p.valid ? 'OK' : 'ERR';
+   if (statEl) {
+     // p.alarm is one of a fixed set of server-side words, never user text.
+     statEl.innerHTML = (p.valid ? 'OK' : 'ERR') + (p.alarm ? ' <b style="color:#c00">ALARM ' + p.alarm + '</b>' : '');
+   }
 
    let ageEl = document.getElementById("age" + i);
    if (ageEl) {
@@ -5029,6 +5347,8 @@ void handleSettings() {
 <th>Register Address</th>
 <th>Writable</th>
 <th>Write Min / Max</th>
+<th>Email Alert: Low / High</th>
+<th>Deadband / Delay (s)</th>
 <th>Enable</th>
 <th>Action</th>
 </tr>
@@ -5088,6 +5408,15 @@ void handleSettings() {
       if (!rowWritable) html += " disabled";
       html += ">";
       html += "</td>";
+    }
+
+    {
+      const ParamAlarm &al = paramAlarms[i];
+      html += "<td style='white-space:nowrap'><input type='checkbox' name='alEn" + String(i) + "' title='Email alert on this parameter'" + String(al.enabled ? " checked" : "") + "> ";
+      html += "<input name='alLo" + String(i) + "' placeholder='Low' style='width:60px' value='" + String(al.hasLow ? String(al.low, 3) : "") + "'> / ";
+      html += "<input name='alHi" + String(i) + "' placeholder='High' style='width:60px' value='" + String(al.hasHigh ? String(al.high, 3) : "") + "'></td>";
+      html += "<td style='white-space:nowrap'><input name='alDb" + String(i) + "' placeholder='0' style='width:50px' value='" + String(al.deadband, 3) + "'> / ";
+      html += "<input name='alDl" + String(i) + "' placeholder='0' style='width:50px' value='" + String(al.delaySec) + "'></td>";
     }
 
     html += "<td><input type='checkbox' name='en" + String(i) + "'";
@@ -5241,6 +5570,8 @@ function buildParamRow() {
     <td><input name="addrX" value="0"></td>
     <td><input type="checkbox" name="wrX" onchange="updateWritableFields(this)" disabled></td>
     <td><input name="wminX" placeholder="Min" style="width:70px" value="0" disabled> / <input name="wmaxX" placeholder="Max" style="width:70px" value="0" disabled></td>
+    <td style="white-space:nowrap"><input type="checkbox" name="alEnX" title="Email alert on this parameter"> <input name="alLoX" placeholder="Low" style="width:60px" value=""> / <input name="alHiX" placeholder="High" style="width:60px" value=""></td>
+    <td style="white-space:nowrap"><input name="alDbX" placeholder="0" style="width:50px" value="0"> / <input name="alDlX" placeholder="0" style="width:50px" value="0"></td>
     <td><input type="checkbox" name="enX" checked></td>
     <td>
       <button type="button" class="add" onclick="addParamRowAtEnd()">Add</button>
@@ -5284,6 +5615,11 @@ function renumberParamRows() {
     row.querySelector("input[name^='wmin']").name = "wmin" + index;
     row.querySelector("input[name^='wmax']").name = "wmax" + index;
     row.querySelector("input[name^='en']").name = "en" + index;
+    row.querySelector("input[name^='alEn']").name = "alEn" + index;
+    row.querySelector("input[name^='alLo']").name = "alLo" + index;
+    row.querySelector("input[name^='alHi']").name = "alHi" + index;
+    row.querySelector("input[name^='alDb']").name = "alDb" + index;
+    row.querySelector("input[name^='alDl']").name = "alDl" + index;
   });
 
   document.getElementById("rowCount").value = rows.length;
@@ -5504,6 +5840,91 @@ function toggleApSsidField() {
   html += "</table>";
   html += "</form>";
   html += "</div>";
+
+  flushHtmlChunk(html);
+
+  // EMAIL ALERTS FORM
+  {
+    String testResult;
+    unsigned long testTs;
+    bool testUtc;
+    xSemaphoreTake(alertMutex, portMAX_DELAY);
+    testResult = emailTestResult;
+    testTs = emailTestTimestamp;
+    testUtc = emailTestTimeIsUtc;
+    uint32_t sentTotal = alertSentTotal;
+    uint32_t droppedTotal = alertDroppedTotal;
+    uint32_t overflowTotal = alertOverflowTotal;
+    xSemaphoreGive(alertMutex);
+    int queued = alertQueueDepth();
+
+    html += "<div class='box' id='email'>";
+    html += "<h2>Email Alerts</h2>";
+    html += "<p><small>Emails when a parameter with <b>Email Alert</b> ticked in the Modbus Settings table goes above its High or below its Low limit, or stops updating (NO DATA). Alerts raised within 10 s of each other share one email. Email is sent over WiFi only; alerts raised during a WiFi outage wait and go out when WiFi returns.</small></p>";
+
+    if (server.hasArg("emailSaveError")) {
+      html += "<div class='error'>Save FAILED - flash may be full. Check the Status Log; email settings may not have persisted across reboot.</div>";
+    } else if (server.hasArg("emailInvalid")) {
+      int code = server.arg("emailInvalid").toInt();
+      String why = (code == EMAIL_FIELD_TOO_LONG) ? String("a field is too long (max 64 characters)") : String(gwmail::EmailValidationText((gwmail::EmailValidation)code));
+      html += "<div class='error'>Email settings NOT saved: " + htmlEscape(why) + ".</div>";
+    } else if (server.hasArg("emailSaved")) {
+      html += "<div class='success'>Email Settings Saved Successfully</div>";
+    } else if (server.hasArg("emailTestStarted")) {
+      html += "<div class='success'>Test email started - refresh this page in about 30 seconds to see the result below.</div>";
+    }
+
+    html += "<form action='/saveEmail' method='POST'>";
+    html += "<table>";
+    html += "<tr><th>Email Alerts</th><td><label><input type='checkbox' name='emEn'" + String(emailConfig.enabled ? " checked" : "") + "> Enabled</label></td></tr>";
+    html += "<tr><th>SMTP Server</th><td><input type='text' name='emSrv' maxlength='64' placeholder='e.g. smtp.office365.com' value='" + htmlEscape(emailConfig.server) + "'></td></tr>";
+    html += "<tr><th>Security</th><td><select name='emSec' id='emSec' onchange='emailSecurityChanged()'>";
+    html += "<option value='1'" + String(emailConfig.security == gwmail::kSmtpSecurityStartTls ? " selected" : "") + ">STARTTLS (port 587)</option>";
+    html += "<option value='2'" + String(emailConfig.security == gwmail::kSmtpSecuritySsl ? " selected" : "") + ">SSL/TLS (port 465)</option>";
+    html += "<option value='0'" + String(emailConfig.security == gwmail::kSmtpSecurityNone ? " selected" : "") + ">None (port 25)</option>";
+    html += "</select><br><small id='emSecWarn' style='color:#c00;display:" + String(emailConfig.security == gwmail::kSmtpSecurityNone ? "inline" : "none") + "'>Unencrypted: the password and every alert cross the network in plain text. Only for an internal relay that doesn't support TLS.</small></td></tr>";
+    html += "<tr><th>SMTP Port</th><td><input type='number' name='emPort' id='emPort' min='1' max='65535' value='" + String(emailConfig.port) + "'></td></tr>";
+    html += "<tr><th>Username</th><td><input type='text' name='emUser' maxlength='64' placeholder='Blank = no login (internal relay)' value='" + htmlEscape(emailConfig.username) + "'></td></tr>";
+    html += "<tr><th>Password</th><td><input type='password' name='emPass' maxlength='64' placeholder='" + String(emailConfig.password[0] != '\0' ? "(saved - leave blank to keep)" : "Leave blank if not needed") + "'>";
+    html += "<br><label><input type='checkbox' name='emPassClear'> Clear saved password</label>";
+    html += "<br><small>Many providers (Office 365, Gmail) need an app password, or SMTP AUTH enabled for the mailbox, rather than the normal login password.</small></td></tr>";
+    html += "<tr><th>From Address</th><td><input type='text' name='emFrom' maxlength='64' placeholder='Usually the same as the login account' value='" + htmlEscape(emailConfig.from) + "'></td></tr>";
+    for (int i = 0; i < gwmail::kMaxRecipients; i++) {
+      html += "<tr><th>Recipient " + String(i + 1) + "</th><td><input type='text' name='emTo" + String(i) + "' maxlength='64'" + String(i == 0 ? " placeholder='At least one required'" : "") + " value='" + htmlEscape(emailConfig.recipients[i].address) + "'></td></tr>";
+    }
+    html += "<tr><th>Subject Prefix</th><td><input type='text' name='emPfx' maxlength='32' placeholder='Blank = Device Name (" + htmlEscape(getDeviceName()) + ")' value='" + htmlEscape(emailConfig.subject_prefix) + "'></td></tr>";
+    html += "<tr><th>Reminder Interval (min)</th><td><input type='number' name='emRnm' min='0' max='1440' value='" + String(alertSettings.renotifyMin) + "'><br><small>Re-sends an alarm that is still active after this long. 0 = never.</small></td></tr>";
+    html += "<tr><th>Return to Normal</th><td><label><input type='checkbox' name='emClr'" + String(alertSettings.sendClear ? " checked" : "") + "> Email when an alarm clears</label></td></tr>";
+    html += "<tr><th>No-Data Alarms</th><td><label><input type='checkbox' name='emNd'" + String(alertSettings.noDataAlerts ? " checked" : "") + "> Alarm when an alert-enabled parameter stops updating</label>";
+    html += "<br>after <input type='number' name='emNdd' min='0' max='" + String(ALARM_MAX_DELAY_S) + "' style='width:80px' value='" + String(alertSettings.noDataDelaySec) + "'> s without a valid reading</td></tr>";
+    html += "<tr><td colspan='2'><button type='submit'>Save Email Settings</button></td></tr>";
+    html += "</table>";
+    html += "</form>";
+
+    html += "<form action='/testEmail' method='POST' style='margin-top:10px'>";
+    html += "<button type='submit'>Send Test Email</button> <small>Uses the <b>saved</b> settings - save first. Works while alerts are switched off.</small>";
+    html += "</form>";
+    if (testResult.length() > 0) {
+      html += "<p><b>Last test:</b> " + htmlEscape(testResult);
+      if (testTs > 0) html += " <small>(" + htmlEscape(formatAlertTime(testTs, testUtc)) + ")</small>";
+      html += "</p>";
+    }
+    html += "<p><small>Queued now: " + String(queued) + " &middot; Sent since boot: " + String(sentTotal) + " &middot; Dropped after " + String(ALERT_MAX_ATTEMPTS) + " failed attempts: " + String(droppedTotal) + (overflowTotal > 0 ? (" &middot; Lost to a full queue: " + String(overflowTotal)) : String("")) + "</small></p>";
+
+    html += R"rawscript(<script>
+function emailSecurityChanged() {
+  let sec = document.getElementById('emSec').value;
+  let port = document.getElementById('emPort');
+  // Only follow the standard port while the field still holds one of the
+  // standard ports - never overwrite a custom port someone typed.
+  if (['587', '465', '25'].includes(port.value)) {
+    port.value = (sec === '1') ? '587' : (sec === '2') ? '465' : '25';
+  }
+  document.getElementById('emSecWarn').style.display = (sec === '0') ? 'inline' : 'none';
+}
+</script>)rawscript";
+    html += "</div>";
+  }
 
   flushHtmlChunk(html);
 
@@ -5877,13 +6298,31 @@ void handleSave() {
 
     if (params[i].slaveId < 1) params[i].slaveId = 1;
     if (params[i].slaveId > 247) params[i].slaveId = 247;
+
+    // Alarm columns. A blank Low/High means "no limit on that side"; any
+    // saved table change restarts every alarm from NORMAL, since rows may
+    // have moved underneath the old runtime state.
+    paramAlarms[i].enabled = server.hasArg("alEn" + index);
+    paramAlarms[i].hasLow = parseOptionalFloat(server.arg("alLo" + index), &paramAlarms[i].low);
+    paramAlarms[i].hasHigh = parseOptionalFloat(server.arg("alHi" + index), &paramAlarms[i].high);
+    if (!paramAlarms[i].hasLow) paramAlarms[i].low = 0;
+    if (!paramAlarms[i].hasHigh) paramAlarms[i].high = 0;
+    float deadband = server.arg("alDb" + index).toFloat();
+    paramAlarms[i].deadband = (deadband > 0) ? deadband : 0;
+    long delaySec = server.arg("alDl" + index).toInt();
+    paramAlarms[i].delaySec = (delaySec < 0) ? 0 : (delaySec > ALARM_MAX_DELAY_S) ? ALARM_MAX_DELAY_S : (uint16_t)delaySec;
+    resetAlarmRuntime(i);
   }
 
   xSemaphoreGive(dataMutex);
 
   // registerLength persisted here is recomputed from type on every load
   // anyway (see loadSettings()), so it's safe to persist without the lock.
-  bool ok = saveSettings();
+  // Both saved every time: alarms are matched to rows by index, so they
+  // must never be stored against a different table than the params.
+  bool paramsOk = saveSettings();
+  bool alarmsOk = saveAlarmSettings();
+  bool ok = paramsOk && alarmsOk;
 
   server.sendHeader("Location", ok ? "/settings?saved=1" : "/settings?saveError=1");
   server.send(303);
@@ -6328,6 +6767,105 @@ void handleSaveSecurity() {
   server.send(303);
 }
 
+// ===================== Save Email Settings / Test Email =====================
+// Trimmed copy of a form field into a fixed buffer. Returns false if it
+// doesn't fit - truncating an address would send mail to the wrong one.
+bool copyFormField(const char *argName, char *out, size_t outLen) {
+  String value = server.arg(argName);
+  value.trim();
+  if (value.length() >= outLen) return false;
+  strlcpy(out, value.c_str(), outLen);
+  return true;
+}
+
+void handleSaveEmail() {
+  if (!requireAuth()) return;
+
+  // Built on a copy and swapped in only once valid, so a rejected save
+  // changes nothing. Starting from the current config keeps the write-only
+  // password when its field is left blank.
+  gwmail::EmailConfig cfg = emailConfig;
+  AlertSettings as = alertSettings;
+
+  cfg.enabled = server.hasArg("emEn");
+
+  bool fits = copyFormField("emSrv", cfg.server, sizeof(cfg.server))
+              && copyFormField("emUser", cfg.username, sizeof(cfg.username))
+              && copyFormField("emFrom", cfg.from, sizeof(cfg.from))
+              && copyFormField("emPfx", cfg.subject_prefix, sizeof(cfg.subject_prefix));
+  for (int i = 0; i < gwmail::kMaxRecipients && fits; i++) {
+    fits = copyFormField(("emTo" + String(i)).c_str(), cfg.recipients[i].address, sizeof(cfg.recipients[i].address));
+  }
+
+  if (server.hasArg("emPassClear")) {
+    cfg.password[0] = '\0';
+  } else if (server.arg("emPass").length() > 0) {
+    if (server.arg("emPass").length() >= sizeof(cfg.password)) {
+      fits = false;
+    } else {
+      strlcpy(cfg.password, server.arg("emPass").c_str(), sizeof(cfg.password));
+    }
+  }
+  // No username means no AUTH at all, so a leftover password could never
+  // be used - drop it rather than make the save fail validation.
+  if (cfg.username[0] == '\0') cfg.password[0] = '\0';
+
+  long port = server.arg("emPort").toInt();
+  cfg.port = (port >= 1 && port <= 65535) ? (uint16_t)port : 0;
+  cfg.security = (uint8_t)server.arg("emSec").toInt();
+
+  long rnm = server.arg("emRnm").toInt();
+  as.renotifyMin = (rnm < 0) ? 0 : (rnm > 1440) ? 1440 : (uint16_t)rnm;
+  as.sendClear = server.hasArg("emClr");
+  as.noDataAlerts = server.hasArg("emNd");
+  long ndd = server.arg("emNdd").toInt();
+  as.noDataDelaySec = (ndd < 0) ? 0 : (ndd > ALARM_MAX_DELAY_S) ? ALARM_MAX_DELAY_S : (uint16_t)ndd;
+
+  int invalid = -1;
+  if (!fits) {
+    invalid = EMAIL_FIELD_TOO_LONG;
+  } else {
+    gwmail::EmailValidation v = gwmail::ValidateEmailConfig(cfg);
+    if (v != gwmail::kEmailOk) invalid = (int)v;
+  }
+  if (invalid >= 0) {
+    server.sendHeader("Location", "/settings?emailInvalid=" + String(invalid) + "#email");
+    server.send(303);
+    return;
+  }
+
+  xSemaphoreTake(alertMutex, portMAX_DELAY);
+  emailConfig = cfg;
+  alertSettings = as;
+  if (!cfg.enabled) clearAlertQueueLocked();
+  xSemaphoreGive(alertMutex);
+
+  bool ok = saveEmailConfig();
+
+  logKeyEvent("EMAIL SETTINGS SAVED: alerts " + String(cfg.enabled ? "ON" : "OFF")
+              + (cfg.server[0] != '\0' ? (" via " + String(cfg.server) + ":" + String(cfg.port)) : String("")));
+
+  server.sendHeader("Location", ok ? "/settings?emailSaved=1#email" : "/settings?emailSaveError=1#email");
+  server.send(303);
+}
+
+void handleTestEmail() {
+  if (!requireAuth()) return;
+
+  if (!emailTestRequested) {
+    String deviceName = getDeviceName();
+    xSemaphoreTake(alertMutex, portMAX_DELAY);
+    emailTestResult = "sending...";
+    emailTestTimestamp = 0;
+    deviceName.toCharArray(emailTestDeviceName, sizeof(emailTestDeviceName));
+    xSemaphoreGive(alertMutex);
+    emailTestRequested = true;
+  }
+
+  server.sendHeader("Location", "/settings?emailTestStarted=1#email");
+  server.send(303);
+}
+
 // ===================== Save Cloud Uplink =====================
 // Minimal sanity check that content is PEM text, not an accidentally
 // selected binary (DER/.p12) or wrong file - protects the stored certs.
@@ -6546,6 +7084,10 @@ void handleData() {
     json += "\"lastWriteResult\":" + String(params[i].lastWriteResult) + ",";
     json += "\"lastWriteTime\":" + String(params[i].lastWriteTime) + ",";
 
+    // handleData() runs on webTask, which owns paramAlarms - no lock needed.
+    bool inAlarm = paramAlarms[i].state == ALARM_STATE_ACTIVE || paramAlarms[i].state == ALARM_STATE_CLEARING;
+    json += "\"alarm\":\"" + String(inAlarm ? alarmCondText(paramAlarms[i].cond) : "") + "\",";
+
     if (params[i].valid) {
       json += "\"value\":" + String(params[i].value, 3);
     } else {
@@ -6658,6 +7200,8 @@ void handleReset() {
 
   loadDefaultSettings();
   saveSettings();
+  loadDefaultAlarms();
+  saveAlarmSettings();
 
   logKeyEvent("MODBUS SETTINGS RESET - all records deleted");
 
@@ -6683,6 +7227,7 @@ void setup() {
   logMutex = xSemaphoreCreateMutex();
   serialMutex = xSemaphoreCreateMutex();
   cellularMutex = xSemaphoreCreateMutex();
+  alertMutex = xSemaphoreCreateMutex();
   pollCompleteSem = xSemaphoreCreateBinary();
   tcpSendDoneSem = xSemaphoreCreateBinary();
   logQueue = xQueueCreate(LOG_QUEUE_LEN, sizeof(LogQueueItem));
@@ -6738,6 +7283,7 @@ void setup() {
   loadCloudConfig();
   loadCerts();
   loadCellularConfig();
+  loadEmailConfig();
 
   Serial1.begin(
     commBaudRate,
@@ -6747,6 +7293,7 @@ void setup() {
 
   loadTypes();
   loadSettings();
+  loadAlarmSettings();
   loadTcpTargets();
   loadDigitalIOSettings();
 
@@ -6803,6 +7350,8 @@ void setup() {
   server.on("/login", HTTP_POST, handleLoginPost);
   server.on("/logout", HTTP_GET, handleLogout);
   server.on("/saveSecurity", HTTP_POST, handleSaveSecurity);
+  server.on("/saveEmail", HTTP_POST, handleSaveEmail);
+  server.on("/testEmail", HTTP_POST, handleTestEmail);
 
   // WebServer only exposes headers it was told to collect BEFORE begin() -
   // without this, server.header("Cookie") is always empty and every
@@ -6862,6 +7411,17 @@ void setup() {
     CELLULAR_TASK_CORE);
 
   logKeyEvent("CELLULAR MODEM TASK STARTED (core " + String(CELLULAR_TASK_CORE) + ")");
+
+  xTaskCreatePinnedToCore(
+    alertTask,
+    "AlertTask",
+    ALERT_TASK_STACK,
+    NULL,
+    ALERT_TASK_PRIORITY,
+    &alertTaskHandle,
+    ALERT_TASK_CORE);
+
+  logKeyEvent("EMAIL ALERT TASK STARTED (core " + String(ALERT_TASK_CORE) + ")" + (emailConfig.enabled ? "" : " - email alerts disabled"));
 }
 
 // ===================== Summary Debug =====================
@@ -7918,6 +8478,516 @@ void cellularTask(void *parameter) {
   }
 }
 
+// ===================== Email Alerts: Alarm Evaluation (webTask) =====================
+const char *alarmCondText(uint8_t cond) {
+  switch (cond) {
+    case ALARM_COND_HIGH: return "HIGH";
+    case ALARM_COND_LOW: return "LOW";
+    case ALARM_COND_NODATA: return "NO DATA";
+    default: return "";
+  }
+}
+
+// What the current reading says, ignoring delays. Caller holds dataMutex.
+uint8_t alarmConditionNow(int i) {
+  if (!params[i].valid) {
+    return alertSettings.noDataAlerts ? ALARM_COND_NODATA : ALARM_COND_NONE;
+  }
+  float v = params[i].value;
+  if (paramAlarms[i].hasHigh && v > paramAlarms[i].high) return ALARM_COND_HIGH;
+  if (paramAlarms[i].hasLow && v < paramAlarms[i].low) return ALARM_COND_LOW;
+  return ALARM_COND_NONE;
+}
+
+// True once the reading is back inside its limit by at least the deadband.
+// Caller holds dataMutex.
+bool alarmRecovered(int i, uint8_t cond) {
+  if (!params[i].valid) return false;
+  float v = params[i].value;
+  switch (cond) {
+    case ALARM_COND_HIGH: return v <= paramAlarms[i].high - paramAlarms[i].deadband;
+    case ALARM_COND_LOW: return v >= paramAlarms[i].low + paramAlarms[i].deadband;
+    default: return true;  // NO DATA: any valid reading ends it
+  }
+}
+
+// NO DATA has its own, gateway-wide delay: every parameter reads as
+// invalid at boot until its first poll, and a slave in its 30s
+// not-responding backoff also reads invalid - a per-row delay tuned for a
+// fast-moving value would turn both into false alarms.
+unsigned long alarmRaiseDelayMs(int i, uint8_t cond) {
+  unsigned long sec = (cond == ALARM_COND_NODATA) ? alertSettings.noDataDelaySec : paramAlarms[i].delaySec;
+  return sec * 1000UL;
+}
+
+void logAlarmTransition(int i, const char *what, uint8_t cond) {
+  String msg = String(what) + " " + alarmCondText(cond) + ": " + params[i].name;
+  if (cond != ALARM_COND_NODATA && params[i].valid) {
+    msg += " = " + String(params[i].value, 3);
+    if (cond == ALARM_COND_HIGH) msg += " (high limit " + String(paramAlarms[i].high, 3) + ")";
+    if (cond == ALARM_COND_LOW) msg += " (low limit " + String(paramAlarms[i].low, 3) + ")";
+  }
+  logKeyEvent(msg);
+}
+
+// Adds one event to the outgoing queue, merging it into the newest entry
+// that is still inside its coalescing window. Caller holds dataMutex (reads
+// the param row); takes alertMutex itself - lock order is always
+// dataMutex -> alertMutex, and alertTask never takes dataMutex.
+void queueAlertEvent(int i, uint8_t kind, uint8_t cond) {
+  AlertEvent ev;
+  memset(&ev, 0, sizeof(ev));
+  params[i].name.toCharArray(ev.name, ALERT_NAME_LEN);
+  if (params[i].transport == TRANSPORT_TCP) {
+    String target = (params[i].tcpTargetIndex < tcpTargetCount) ? tcpTargets[params[i].tcpTargetIndex].name : String(params[i].tcpTargetIndex);
+    snprintf(ev.source, sizeof(ev.source), "TCP target %s", target.c_str());
+  } else {
+    snprintf(ev.source, sizeof(ev.source), "RTU slave %u", (unsigned)params[i].slaveId);
+  }
+  ev.kind = kind;
+  ev.cond = cond;
+  ev.valueValid = params[i].valid;
+  ev.value = params[i].value;
+  ev.limit = (cond == ALARM_COND_HIGH) ? paramAlarms[i].high : (cond == ALARM_COND_LOW) ? paramAlarms[i].low : 0;
+  ev.timestamp = getTimestamp();
+  ev.timeIsUtc = isTimeSynced();
+
+  // Captured here on webTask, which owns the device-name String, so
+  // alertTask never reads a String another task can reassign.
+  String deviceName = getDeviceName();
+
+  bool overflow = false;
+  xSemaphoreTake(alertMutex, portMAX_DELAY);
+  unsigned long now = millis();
+  int target = -1;
+
+  for (int q = 0; q < ALERT_QUEUE_DEPTH; q++) {
+    AlertEntry &e = alertQueue[q];
+    if (e.inUse && !e.sending && e.attempts == 0 && now - e.createdMs < ALERT_COALESCE_MS) {
+      if (target < 0 || e.createdMs > alertQueue[target].createdMs) target = q;
+    }
+  }
+
+  if (target < 0) {
+    for (int q = 0; q < ALERT_QUEUE_DEPTH; q++) {
+      if (!alertQueue[q].inUse) {
+        AlertEntry &e = alertQueue[q];
+        e.inUse = true;
+        e.sending = false;
+        e.attempts = 0;
+        e.createdMs = now;
+        e.nextAttemptMs = now;
+        e.eventCount = 0;
+        e.moreCount = 0;
+        deviceName.toCharArray(e.deviceName, sizeof(e.deviceName));
+        target = q;
+        break;
+      }
+    }
+  }
+
+  if (target < 0) {
+    alertOverflowTotal++;
+    overflow = true;
+  } else if (alertQueue[target].eventCount < ALERT_MAX_EVENTS) {
+    alertQueue[target].events[alertQueue[target].eventCount++] = ev;
+  } else {
+    alertQueue[target].moreCount++;
+  }
+  xSemaphoreGive(alertMutex);
+
+  if (overflow && millis() - lastAlertOverflowLogMs >= DEBUG_ERROR_REPEAT_MS) {
+    lastAlertOverflowLogMs = millis();
+    logKeyEvent("EMAIL QUEUE FULL (" + String(ALERT_QUEUE_DEPTH) + " emails waiting) - alert for " + params[i].name + " not emailed");
+  }
+}
+
+// Called every webTask loop; runs once per ALARM_EVAL_INTERVAL_MS. Tracks
+// alarm state whether or not email is enabled (the Dashboard and Status
+// Log show it either way); only queues emails when it is.
+void evaluateParamAlarms() {
+  static unsigned long lastEvalMs = 0;
+  unsigned long now = millis();
+  if (now - lastEvalMs < ALARM_EVAL_INTERVAL_MS) return;
+  lastEvalMs = now;
+
+  bool email = emailConfig.enabled;
+  unsigned long renotifyMs = (unsigned long)alertSettings.renotifyMin * 60000UL;
+  int active = 0;
+
+  xSemaphoreTake(dataMutex, portMAX_DELAY);
+
+  for (int i = 0; i < paramCount; i++) {
+    ParamAlarm &a = paramAlarms[i];
+
+    if (!a.enabled || !params[i].enabled) {
+      resetAlarmRuntime(i);  // switching an alarm off forgets its state, no email
+      continue;
+    }
+
+    uint8_t c = alarmConditionNow(i);
+
+    switch (a.state) {
+      case ALARM_STATE_NORMAL:
+        if (c == ALARM_COND_NONE) break;
+        a.state = ALARM_STATE_PENDING;
+        a.cond = c;
+        a.sinceMs = now;
+        // fall through - a zero delay raises in this same cycle
+
+      case ALARM_STATE_PENDING:
+        if (c == ALARM_COND_NONE) {
+          resetAlarmRuntime(i);  // breach must be continuous for the whole delay
+          break;
+        }
+        if (c != a.cond) {
+          a.cond = c;
+          a.sinceMs = now;
+        }
+        if (now - a.sinceMs >= alarmRaiseDelayMs(i, a.cond)) {
+          a.state = ALARM_STATE_ACTIVE;
+          a.lastNotifyMs = now;
+          logAlarmTransition(i, "ALARM", a.cond);
+          if (email) queueAlertEvent(i, ALERT_EVENT_ALARM, a.cond);
+        }
+        break;
+
+      case ALARM_STATE_ACTIVE:
+      case ALARM_STATE_CLEARING:
+        // A jump straight across from HIGH to LOW (or data returning to a
+        // NO DATA alarm already out of limits) is a new alarm in its own
+        // right. Losing data while HIGH/LOW is not - it can't clear the
+        // alarm (alarmRecovered() needs a valid reading) and the original
+        // limit breach stays the thing being reported.
+        if ((c == ALARM_COND_HIGH || c == ALARM_COND_LOW) && c != a.cond) {
+          a.cond = c;
+          a.state = ALARM_STATE_ACTIVE;
+          a.lastNotifyMs = now;
+          logAlarmTransition(i, "ALARM", a.cond);
+          if (email) queueAlertEvent(i, ALERT_EVENT_ALARM, a.cond);
+          break;
+        }
+
+        if (alarmRecovered(i, a.cond)) {
+          if (a.state == ALARM_STATE_ACTIVE) {
+            a.state = ALARM_STATE_CLEARING;
+            a.sinceMs = now;
+          }
+          if (now - a.sinceMs >= (unsigned long)a.delaySec * 1000UL) {
+            uint8_t was = a.cond;
+            logAlarmTransition(i, "CLEARED", was);
+            if (email && alertSettings.sendClear) queueAlertEvent(i, ALERT_EVENT_CLEARED, was);
+            resetAlarmRuntime(i);
+          }
+        } else {
+          a.state = ALARM_STATE_ACTIVE;  // any re-breach cancels a running clear delay
+          if (renotifyMs > 0 && now - a.lastNotifyMs >= renotifyMs) {
+            a.lastNotifyMs = now;
+            if (email) queueAlertEvent(i, ALERT_EVENT_REMINDER, a.cond);
+          }
+        }
+        break;
+    }
+
+    if (a.state == ALARM_STATE_ACTIVE || a.state == ALARM_STATE_CLEARING) active++;
+  }
+
+  xSemaphoreGive(dataMutex);
+  activeAlarmCount = active;
+}
+
+// Drops every queued email that isn't already being sent - used when
+// alerts are switched off. Caller holds alertMutex. An in-flight entry is
+// left to finish; alertTask frees it when the send returns.
+void clearAlertQueueLocked() {
+  for (int q = 0; q < ALERT_QUEUE_DEPTH; q++) {
+    if (!alertQueue[q].sending) alertQueue[q].inUse = false;
+  }
+}
+
+int alertQueueDepth() {
+  int n = 0;
+  xSemaphoreTake(alertMutex, portMAX_DELAY);
+  for (int q = 0; q < ALERT_QUEUE_DEPTH; q++) {
+    if (alertQueue[q].inUse) n++;
+  }
+  xSemaphoreGive(alertMutex);
+  return n;
+}
+
+// ===================== Email Alerts: Composition & Sending (alertTask) =====================
+gwmail::SmtpClient alertSmtp;      // holds the mbedtls contexts - too big for a task stack
+gwmail::SocketStream alertSocket;
+AlertEntry alertInFlight;          // alertTask's private copy of the entry being sent
+gwmail::EmailConfig alertCfgCopy;  // ditto for the settings it is sent with
+
+// A user-entered name lands in a Subject header and a us-ascii body:
+// replace anything outside printable ASCII rather than send bytes the
+// declared charset says can't be there.
+String asciiSafe(const char *text) {
+  String out;
+  for (; *text != '\0'; text++) {
+    unsigned char c = (unsigned char)*text;
+    out += (c >= 32 && c < 127) ? (char)c : '?';
+  }
+  return out;
+}
+
+String formatAlertTime(unsigned long ts, bool utc) {
+  if (!utc) {
+    return "uptime " + String(ts) + " s (clock not synced)";
+  }
+  time_t t = (time_t)ts;
+  struct tm tmv;
+  gmtime_r(&t, &tmv);
+  char buf[32];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S UTC", &tmv);
+  return String(buf);
+}
+
+// RFC 5322 Date header, or "" before NTP sync (the header is then omitted
+// and the server adds its own).
+String rfc5322Date() {
+  if (!isTimeSynced()) return "";
+  time_t t = time(nullptr);
+  struct tm tmv;
+  gmtime_r(&t, &tmv);
+  char buf[40];
+  strftime(buf, sizeof(buf), "%a, %d %b %Y %H:%M:%S +0000", &tmv);
+  return String(buf);
+}
+
+String alertSubjectPrefix(const char *subjectPrefix, const char *deviceName) {
+  return "[" + asciiSafe(subjectPrefix[0] != '\0' ? subjectPrefix : deviceName) + "] ";
+}
+
+String alertEventDetail(int e) {
+  const AlertEvent &ev = alertInFlight.events[e];
+  String line;
+
+  if (ev.kind == ALERT_EVENT_CLEARED) {
+    line = "CLEARED   " + asciiSafe(ev.name) + ": back to normal (was " + alarmCondText(ev.cond) + ")";
+    if (ev.valueValid) line += " - value " + String(ev.value, 3);
+  } else {
+    line = String(ev.kind == ALERT_EVENT_REMINDER ? "STILL IN  " : "ALARM     ") + asciiSafe(ev.name) + ": " + alarmCondText(ev.cond);
+    if (ev.cond == ALARM_COND_NODATA) {
+      line += " - no valid reading (device not responding or read error)";
+    } else {
+      line += " - value " + (ev.valueValid ? String(ev.value, 3) : String("n/a")) + ", ";
+      line += String(ev.cond == ALARM_COND_HIGH ? "high" : "low") + " limit " + String(ev.limit, 3);
+    }
+  }
+
+  line += " [" + asciiSafe(ev.source) + "] at " + formatAlertTime(ev.timestamp, ev.timeIsUtc);
+  return line;
+}
+
+String composeAlertSubject() {
+  int alarms = 0, reminders = 0;
+  int firstAlarm = -1, firstReminder = -1;
+  for (int e = 0; e < alertInFlight.eventCount; e++) {
+    if (alertInFlight.events[e].kind == ALERT_EVENT_ALARM) {
+      if (firstAlarm < 0) firstAlarm = e;
+      alarms++;
+    } else if (alertInFlight.events[e].kind == ALERT_EVENT_REMINDER) {
+      if (firstReminder < 0) firstReminder = e;
+      reminders++;
+    }
+  }
+
+  // Headline the most urgent kind: new alarms over reminders over clears.
+  int head = (firstAlarm >= 0) ? firstAlarm : (firstReminder >= 0) ? firstReminder : 0;
+  const AlertEvent &ev = alertInFlight.events[head];
+
+  String s = alertSubjectPrefix(alertCfgCopy.subject_prefix, alertInFlight.deviceName);
+  if (ev.kind == ALERT_EVENT_CLEARED) {
+    s += "CLEARED: " + asciiSafe(ev.name);
+  } else {
+    s += String(ev.kind == ALERT_EVENT_ALARM ? "ALARM: " : "STILL IN ALARM: ") + asciiSafe(ev.name) + " " + alarmCondText(ev.cond);
+  }
+
+  int others = alertInFlight.eventCount + alertInFlight.moreCount - 1;
+  if (others > 0) s += " (+" + String(others) + " more)";
+  return s;
+}
+
+String composeAlertBody() {
+  String b = "Modbus Gateway alert from " + asciiSafe(alertInFlight.deviceName) + "\n";
+  b += "Sent: " + formatAlertTime(getTimestamp(), isTimeSynced()) + "\n\n";
+
+  for (int e = 0; e < alertInFlight.eventCount; e++) {
+    b += alertEventDetail(e) + "\n";
+  }
+  if (alertInFlight.moreCount > 0) {
+    b += "... and " + String(alertInFlight.moreCount) + " more event(s) not listed.\n";
+  }
+
+  b += "\nActive alarms on the gateway right now: " + String(activeAlarmCount) + "\n";
+  b += "\nSent automatically by the gateway. Alarm limits are set in the Modbus Settings table; email settings under Settings > Email Alerts.\n";
+  return b;
+}
+
+// Stage-specific advice next to the raw result, so the Settings page tells
+// a technician what to change rather than only where it failed.
+String smtpFailureHint(int stage, int code) {
+  switch (stage) {
+    case gwmail::kSmtpStageDns: return " - check the SMTP server name, and that the site network has DNS/internet access";
+    case gwmail::kSmtpStageConnect: return " - server unreachable: check the port, and that the site firewall allows outbound SMTP";
+    case gwmail::kSmtpStageTlsHandshake: return " - check that Security matches the port (587 = STARTTLS, 465 = SSL/TLS)";
+    case gwmail::kSmtpStageStartTls: return " - the server refused STARTTLS: try SSL/TLS on port 465";
+    case gwmail::kSmtpStageAuth: return (code == 535 || code == 534) ? " - login rejected: check username/password; many providers need an app password or SMTP AUTH enabled for the mailbox" : " - authentication failed";
+    case gwmail::kSmtpStageMailFrom: return " - sender rejected: the From address usually has to match the login account";
+    case gwmail::kSmtpStageRcptTo: return " - every recipient address was rejected";
+    default: return "";
+  }
+}
+
+gwmail::SmtpResult sendAlertEmail(const gwmail::EmailConfig &cfg, const String &subject, const String &body) {
+  const gwmail::EmailRecipient *to[gwmail::kMaxRecipients];
+  int count = gwmail::SelectRecipients(cfg, to, gwmail::kMaxRecipients);
+
+  String date = rfc5322Date();
+
+  gwmail::MimeMessage msg;
+  msg.from = cfg.from;
+  msg.recipients = to;
+  msg.recipient_count = count;
+  msg.subject = subject.c_str();
+  msg.body = body.c_str();
+  msg.date = (date.length() > 0) ? date.c_str() : NULL;
+
+  return alertSmtp.Send(cfg, WiFi.getHostname(), msg, &alertSocket);
+}
+
+// Email only goes out over WiFi. Over TLS it also needs real time:
+// certificate validity dates are checked against the clock, which reads
+// 1970 until NTP syncs.
+bool emailUplinkReady(const gwmail::EmailConfig &cfg, String *whyNot) {
+  if (WiFi.status() != WL_CONNECTED) {
+    if (whyNot) *whyNot = "WiFi is not connected (email is sent over WiFi only)";
+    return false;
+  }
+  if (cfg.security != gwmail::kSmtpSecurityNone && !isTimeSynced()) {
+    if (whyNot) *whyNot = "waiting for NTP time sync (TLS certificate checks need a valid clock)";
+    return false;
+  }
+  return true;
+}
+
+void sendNextQueuedAlert() {
+  int idx = -1;
+
+  xSemaphoreTake(alertMutex, portMAX_DELAY);
+  if (emailConfig.enabled && emailUplinkReady(emailConfig, NULL)) {
+    unsigned long now = millis();
+    for (int q = 0; q < ALERT_QUEUE_DEPTH; q++) {
+      const AlertEntry &e = alertQueue[q];
+      bool ready = e.inUse && !e.sending
+                   && now - e.createdMs >= ALERT_COALESCE_MS
+                   && (long)(now - e.nextAttemptMs) >= 0;
+      if (ready && (idx < 0 || e.createdMs < alertQueue[idx].createdMs)) idx = q;
+    }
+    if (idx >= 0) {
+      alertQueue[idx].sending = true;
+      alertInFlight = alertQueue[idx];
+      alertCfgCopy = emailConfig;
+    }
+  }
+  xSemaphoreGive(alertMutex);
+
+  if (idx < 0) return;
+
+  String subject = composeAlertSubject();
+  String body = composeAlertBody();
+  gwmail::SmtpResult result = sendAlertEmail(alertCfgCopy, subject, body);
+
+  char summary[96];
+  gwmail::FormatSmtpResult(result, summary, sizeof(summary));
+
+  bool dropped = false;
+  uint8_t attempts = 0;
+  xSemaphoreTake(alertMutex, portMAX_DELAY);
+  AlertEntry &e = alertQueue[idx];
+  e.sending = false;
+  if (result.ok) {
+    e.inUse = false;
+    alertSentTotal++;
+  } else {
+    attempts = ++e.attempts;
+    if (e.attempts >= ALERT_MAX_ATTEMPTS) {
+      e.inUse = false;
+      alertDroppedTotal++;
+      dropped = true;
+    } else {
+      e.nextAttemptMs = millis() + (ALERT_RETRY_BACKOFF_MS << (e.attempts - 1));
+    }
+  }
+  xSemaphoreGive(alertMutex);
+
+  if (result.ok) {
+    logKeyEvent("EMAIL SENT: " + subject + " (" + summary + ")");
+  } else if (dropped) {
+    logKeyEvent("EMAIL DROPPED after " + String(ALERT_MAX_ATTEMPTS) + " attempts: " + subject + " - last error: " + summary);
+  } else {
+    logKeyEvent("EMAIL FAILED (attempt " + String(attempts) + "/" + String(ALERT_MAX_ATTEMPTS) + "), will retry: " + summary + smtpFailureHint(result.stage, result.code));
+  }
+}
+
+// Runs the full production path - same client, TLS, recipients and MIME -
+// so a passing test means real alerts will get through.
+void runTestEmail() {
+  gwmail::EmailConfig cfg;
+  char deviceName[40];
+
+  xSemaphoreTake(alertMutex, portMAX_DELAY);
+  cfg = emailConfig;
+  strlcpy(deviceName, emailTestDeviceName, sizeof(deviceName));
+  xSemaphoreGive(alertMutex);
+
+  // Validate the fields as if alerts were on, so the test is useful while
+  // setting up with alerts still switched off.
+  cfg.enabled = true;
+
+  String result;
+  String whyNot;
+  gwmail::EmailValidation v = gwmail::ValidateEmailConfig(cfg);
+
+  if (v != gwmail::kEmailOk) {
+    result = "not sent: " + String(gwmail::EmailValidationText(v));
+  } else if (!emailUplinkReady(cfg, &whyNot)) {
+    result = "not sent: " + whyNot;
+  } else {
+    String subject = alertSubjectPrefix(cfg.subject_prefix, deviceName) + "Test email";
+    String body = "This is a test email from Modbus Gateway " + asciiSafe(deviceName) + ".\n\n";
+    body += "If you can read this, email alerts are configured correctly and will be delivered to this address.\n";
+    body += "Sent: " + formatAlertTime(getTimestamp(), isTimeSynced()) + "\n";
+
+    gwmail::SmtpResult r = sendAlertEmail(cfg, subject, body);
+    char summary[96];
+    gwmail::FormatSmtpResult(r, summary, sizeof(summary));
+    result = String(r.ok ? "OK - " : "FAILED - ") + summary + (r.ok ? "" : smtpFailureHint(r.stage, r.code));
+  }
+
+  xSemaphoreTake(alertMutex, portMAX_DELAY);
+  emailTestResult = result;
+  emailTestTimestamp = getTimestamp();
+  emailTestTimeIsUtc = isTimeSynced();
+  xSemaphoreGive(alertMutex);
+
+  logKeyEvent("EMAIL TEST: " + result);
+}
+
+void alertTask(void *parameter) {
+  for (;;) {
+    if (emailTestRequested) {
+      emailTestRequested = false;
+      runTestEmail();
+    }
+    sendNextQueuedAlert();
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
 // ===================== Web / TCP / WiFi Task (Core 0) =====================
 // Web server, TCP push, and WiFi retry - pinned to Core 0 so Core 1 stays
 // dedicated to modbusTask.
@@ -7934,6 +9004,7 @@ void webTask(void *parameter) {
     }
     pollDigitalIO();
     logFreeHeapPeriodic();
+    evaluateParamAlarms();
     processDoWriteQueue();
 
     // One-time key-log entry the first time SNTP produces real time, so

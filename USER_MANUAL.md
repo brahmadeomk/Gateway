@@ -20,6 +20,8 @@ It also has:
 - An optional SIM7600G-H cellular modem for automatic failover of the MQTT
   uplink when WiFi goes down.
 - Store-and-forward buffering so a temporary uplink outage doesn't lose data.
+- Email alerts when a Modbus parameter leaves its limits or stops updating
+  (§10).
 
 Everything is configured from a web browser — no separate app or CLI tool
 is needed.
@@ -50,11 +52,11 @@ never been connected to a router.
 2. On your phone/laptop, connect to the WiFi network:
    - **SSID**: `ModbusGateway` by default (or the device's configured name — see
      Device Identity in §5)
-   - **Password**: `12345678` by default (changeable — see §11)
+   - **Password**: `12345678` by default (changeable — see §12)
 3. Open a browser to **`http://192.168.4.1`** and log in:
    - **Username**: `admin` / **Password**: `admin` (defaults)
    - A red banner reminds you to change this until you do — set your own
-     under **Settings → Security** (see §11).
+     under **Settings → Security** (see §12).
 4. Click **Settings** to configure Modbus parameters, WiFi, cloud uplink, etc.
 5. To join your site WiFi (so the gateway also gets internet/LAN access),
    set the WiFi SSID/Password under **WiFi & TCP Configuration** in Settings
@@ -74,6 +76,8 @@ The Dashboard is the live-status home page. It refreshes automatically.
 - **Free Heap** — current/minimum-ever free RAM (diagnostic).
 - **Buffered (offline)** — only shown when there's an undelivered backlog
   (see §9, Store & Forward).
+- **Email Alerts / Active alarms** — whether email alerts are on, emails
+  waiting to send, and how many parameters are currently in alarm (§10).
 
 ### Cellular Modem (SIM7600G-H) box
 Only meaningful if a modem is wired in. Shows:
@@ -89,7 +93,8 @@ Only meaningful if a modem is wired in. Shows:
 ### Dashboard table
 One row per enabled Modbus parameter and TCP-target sensor:
 - **Name**, **Source** (which slave/target), **Enabled**, **Value**,
-  **Status** (`OK` / `Disconnected` / `Disabled`), **Last Update**.
+  **Status** (`OK` / `Disconnected` / `Disabled`, plus `ALARM HIGH/LOW/NO
+  DATA` in red while a parameter is in alarm — §10), **Last Update**.
 - **Write** column — for parameters marked writable in Settings, lets you
   type a value and push it directly to the slave (see §7).
 
@@ -99,7 +104,7 @@ Digital Outputs directly from the browser.
 
 ### Status Log
 A rolling, human-readable log of key events (connects/disconnects, saves,
-writes, errors). See §10 for a full glossary of messages.
+writes, errors). See §11 for a full glossary of messages.
 
 ---
 
@@ -124,6 +129,8 @@ One row per Modbus parameter, up to 100 rows. Columns:
 | Register Address | Modbus register/coil address |
 | Writable | Enables the write path for this parameter (Holding Registers and Coils only) |
 | Write Min/Max | Allowed value range for writes (rejected outside this range) |
+| Email Alert: Low / High | Tick to email on this parameter; alarm below Low or above High. Leave either blank for no limit on that side — see §10 |
+| Deadband / Delay (s) | Hysteresis and persistence for the alert — see §10 |
 | Enable | Whether this row is polled at all |
 
 Use **Add Record** / **Insert** / **Delete** to manage rows, then
@@ -147,14 +154,14 @@ add up to 20 custom types, or **Reset Data Types** to restore the defaults.
   Device Name instead of setting it independently.
 - **AP Password** — WPA2 key for the device's own hotspot (min 8 chars;
   blank keeps the current one). Default `12345678` — change it. Forgot it?
-  See §11 (recovery).
+  See §12 (recovery).
 
 ### 5.3a Security
 - **Web Username / New Web Password** — the login for this web UI
   (defaults `admin`/`admin`; a red banner nags until the password is
   changed). Blank password fields keep the current password.
 - Sessions time out after 30 minutes idle; 5 failed logins lock the login
-  page for 60 seconds. See §11 for the full security model and recovery.
+  page for 60 seconds. See §12 for the full security model and recovery.
 
 ### 5.4 WiFi & TCP Configuration
 - **WiFi SSID / Password** — your site network, for the gateway to join
@@ -323,7 +330,68 @@ delivering fresh data during that window (see §8).
 
 ---
 
-## 10. Status Log Message Glossary
+## 10. Email Alerts
+
+The gateway can email you when a Modbus parameter (RTU or TCP) leaves its
+limits or stops updating. Two places to set it up:
+
+**1. Settings → Email Alerts** (the mail server and recipients):
+
+| Field | Notes |
+|---|---|
+| Email Alerts | Master switch. While off, alarms are still tracked and shown on the Dashboard and Status Log, but nothing is emailed. |
+| SMTP Server / Port / Security | e.g. `smtp.office365.com`, port 587, STARTTLS. 465 = SSL/TLS. Choosing a security mode updates the port for you. **None** (port 25) sends the password and alerts unencrypted — only for an internal relay without TLS. |
+| Username / Password | The mail account. Leave Username blank for an internal relay that needs no login. The password is write-only: it is never shown again, and a blank field keeps the saved one. Office 365 and Gmail usually need an **app password**, or SMTP AUTH enabled for the mailbox. |
+| From Address | Usually must be the same as the login account, or the server rejects it. |
+| Recipients 1–4 | Every recipient gets every alert, in a single email. |
+| Subject Prefix | Starts every subject, e.g. `[Panel-7]`. Blank = the Device Name. |
+| Reminder Interval (min) | Re-sends an alarm that is still active after this long. 0 = never. Default 60. |
+| Return to Normal | Also email when an alarm clears. On by default. |
+| No-Data Alarms | Alarm when an alert-enabled parameter has had no valid reading (device not responding / read error) for this many seconds. Default on, 60 s. |
+
+Press **Send Test Email** after saving. It sends a real email the same way
+an alert would, then shows the result under the button (refresh the page
+after ~30 s). A failure names the exact step that failed and what to check:
+
+| Test result says | Check |
+|---|---|
+| failed at DNS lookup | SMTP server name, and that the site network has DNS/internet access |
+| failed at TCP connect | Port number, and that the site firewall allows outbound SMTP |
+| failed at TLS handshake | Security matches the port (587 = STARTTLS, 465 = SSL/TLS) |
+| failed at authentication: server said 535 | Username/password — usually an app password is needed, or SMTP AUTH is disabled for the mailbox |
+| failed at sender address | From must match the login account |
+| not sent: waiting for NTP time sync | The gateway has no internet time yet; secure email checks certificate dates, so it waits |
+
+**2. Settings → Modbus Settings table** (which parameters, and their limits):
+tick **Email Alert** on a row and fill in:
+
+- **Low / High** — alarm when the value goes below Low or above High. Either
+  can be blank. For a Coil or Discrete Input, use High = `0.5` to alarm
+  whenever it reads 1.
+- **Deadband** — hysteresis. A HIGH alarm clears only once the value is back
+  below High − Deadband (LOW: above Low + Deadband), so a reading hovering
+  on the limit doesn't send a stream of alarm/clear emails.
+- **Delay (s)** — how long a breach must last before it alarms, and how long
+  a recovery must last before it clears. Filters out one-poll spikes.
+
+**What gets emailed:** `ALARM` when a limit is breached (or NO DATA),
+`STILL IN ALARM` reminders, and `CLEARED` when it returns to normal. Alarms
+raised within 10 seconds of each other share one email, so a device
+dropping off the bus sends one message listing all of its parameters
+rather than one each. The subject names the most urgent event, e.g.
+`[Panel-7] ALARM: TankTemp HIGH (+2 more)`; the body lists each event with
+its value, limit, source (RTU slave / TCP target) and time.
+
+**Delivery:** email goes out over WiFi only. During a WiFi outage (including
+cellular failover, §8) alerts wait in a queue of up to 8 emails and are sent
+when WiFi returns; each email lists the time each alarm actually happened.
+A failed send is retried twice more (after 30 s and 60 s), then dropped and
+logged. The Dashboard shows active alarms in red in the Status column, and
+the top box shows the active-alarm count and any emails waiting to send.
+
+---
+
+## 11. Status Log Message Glossary
 
 The Status Log (Dashboard) shows a curated history of key events. Common
 messages, grouped by area:
@@ -372,6 +440,13 @@ range, invalid index), `WRITE QUEUE FULL`. Same pattern with `DO WRITE
 (<section>): N write(s) failed - flash may be full` if a save partially
 failed.
 
+**Email alerts**
+`ALARM HIGH/LOW/NO DATA: <name> = <value> (high/low limit <n>)`,
+`CLEARED HIGH/LOW/NO DATA: <name>`, `EMAIL SENT: <subject> (sent to N
+recipients)`, `EMAIL FAILED (attempt N/3), will retry: failed at <step>...`,
+`EMAIL DROPPED after 3 attempts`, `EMAIL QUEUE FULL`, `EMAIL TEST: <result>`,
+`EMAIL SETTINGS SAVED`, `EMAIL ALERT TASK STARTED`.
+
 **Security**
 `WEB LOGIN OK: <user>`, `WEB LOGIN FAILED (attempt N/5)`,
 `WEB LOGIN LOCKED OUT (60s after N failures)`,
@@ -382,7 +457,7 @@ failed.
 
 ---
 
-## 11. Security & Recovery
+## 12. Security & Recovery
 
 - **Everything requires login.** Every page *and* every save/write/reset
   endpoint checks the session — there is no way to change settings or
@@ -411,7 +486,7 @@ failed.
   LAN as the perimeter. The cloud uplink (MQTT) is fully TLS-encrypted
   and unaffected.
 
-## 12. Troubleshooting
+## 13. Troubleshooting
 
 | Symptom | Check |
 |---|---|
