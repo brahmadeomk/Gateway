@@ -9374,13 +9374,23 @@ void runTestEmail(bool viaCellular) {
 
   if (path != EMAIL_PATH_NONE) {
     String subject = alertSubjectPrefix(cfg.subject_prefix, deviceName) + "Test email";
-    String body = "This is a test email from Modbus Gateway " + asciiSafe(deviceName) + ".\n\n";
-    body += "If you can read this, email alerts are configured correctly and will be delivered to this address.\n";
-    body += "Sent over: " + String(viaCellular ? "cellular (forced by the test)" : "the gateway's normal path") + "\n";
-    body += "Sent: " + formatAlertTime(getTimestamp(), isTimeSynced()) + "\n";
+    // Built per attempt so "Sent over" names the path this copy really took,
+    // including the WiFi -> cellular fallback below.
+    auto testBody = [&](int via) {
+      String body = "This is a test email from Modbus Gateway " + asciiSafe(deviceName) + ".\n\n";
+      body += "If you can read this, email alerts are configured correctly and will be delivered to this address.\n";
+      body += "Sent over: " + String(emailPathText(via)) + (viaCellular ? " (forced by the test)" : "") + "\n";
+      body += "Sent: " + formatAlertTime(getTimestamp(), isTimeSynced()) + "\n";
+      return body;
+    };
 
-    gwmail::SmtpResult r = viaCellular ? sendAlertEmail(cfg, subject, body, path)
-                                       : sendAlertEmailWithFallback(cfg, subject, body, &path);
+    gwmail::SmtpResult r = sendAlertEmail(cfg, subject, testBody(path), path);
+    bool unreachable = (r.stage == gwmail::kSmtpStageDns || r.stage == gwmail::kSmtpStageConnect);
+    if (!r.ok && !viaCellular && path == EMAIL_PATH_WIFI && unreachable && cfg.send_on_cellular && cellularDataUp()) {
+      logMessage("EMAIL: server unreachable over WiFi - retrying over cellular");
+      path = EMAIL_PATH_CELLULAR;
+      r = sendAlertEmail(cfg, subject, testBody(path), path);
+    }
     char summary[96];
     gwmail::FormatSmtpResult(r, summary, sizeof(summary));
     result = String(r.ok ? "OK via " : "FAILED via ") + emailPathText(path) + " - " + summary + (r.ok ? "" : smtpFailureHint(r.stage, r.code));
