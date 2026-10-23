@@ -5026,12 +5026,14 @@ void handleRoot() {
   }
   html += "<b>Poll Interval:</b> " + String(pollIntervalMs) + " ms";
   html += "<br><b>Free Heap:</b> " + String(ESP.getFreeHeap()) + " bytes (min ever: " + String(ESP.getMinFreeHeap()) + ")";
+  // The spans are refreshed from /data every 2 s along with the table, so
+  // the count can't disagree with the ALARM tags in the rows below.
   html += "<br><b>Email Alerts:</b> " + String(emailConfig.enabled ? "Enabled" : "Disabled");
-  if (emailConfig.enabled) {
-    int queued = alertQueueDepth();
-    if (queued > 0) html += " (" + String(queued) + " waiting to send)";
+  {
+    int queued = emailConfig.enabled ? alertQueueDepth() : 0;
+    html += "<span id='emailQueued'>" + String(queued > 0 ? (" (" + String(queued) + " waiting to send)") : String("")) + "</span>";
   }
-  html += " &middot; <b>Active alarms:</b> " + String(activeAlarmCount);
+  html += " &middot; <b>Active alarms:</b> <span id='activeAlarms'>" + String(activeAlarmCount) + "</span>";
 
   // Only shown while there is an undelivered backlog (uplink outage).
   if (sfCount > 0) {
@@ -5312,6 +5314,10 @@ function loadData(){
   lastAnalogIn = d.analogIn || [];
   lastServerNowMs = d.nowMs;
   lastFetchClientTime = Date.now();
+  let aEl = document.getElementById('activeAlarms');
+  if (aEl && d.activeAlarms !== undefined) aEl.textContent = d.activeAlarms;
+  let qEl = document.getElementById('emailQueued');
+  if (qEl && d.emailQueued !== undefined) qEl.textContent = d.emailQueued > 0 ? ' (' + d.emailQueued + ' waiting to send)' : '';
   renderTable();
   renderDigitalIO();
  });
@@ -7153,6 +7159,9 @@ void handleData() {
   json.reserve(96 + paramCount * 160);  // avoid repeated reallocation while appending below
   json += "\"device\":\"Modbus RTU Gateway\",";
   json += "\"nowMs\":" + String(millis()) + ",";
+  // Taken before dataMutex: alertQueueDepth() locks alertMutex.
+  json += "\"emailQueued\":" + String(emailConfig.enabled ? alertQueueDepth() : 0) + ",";
+  json += "\"activeAlarms\":" + String(activeAlarmCount) + ",";
 
   xSemaphoreTake(dataMutex, portMAX_DELAY);
 
