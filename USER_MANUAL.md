@@ -436,7 +436,9 @@ alarm would have stayed active and the delay would start again next time.
   turn both into false alarms. Turn **No-Data Alarms** off to have only
   limit alarms.
 - **A slave dropping off the bus** gives one NO DATA alarm per alert-enabled
-  parameter on it, all in a single email (§10.5).
+  parameter on it, all in a single email (§10.5). When it answers again,
+  each one clears with a CLEARED email reading `readings are back - device
+  responding again` (after the row's Delay, if set).
 - **Losing data during a HIGH or LOW alarm** doesn't clear it or turn it
   into NO DATA. The limit breach stays the alarm being reported until a
   valid reading shows the value back inside its limit.
@@ -444,12 +446,19 @@ alarm would have stayed active and the delay would start again next time.
   alarm while out of limits) is reported as a new alarm.
 - **Reminders** repeat a still-active alarm every Reminder Interval, as a
   `STILL IN ALARM` email.
-- **Saving the Modbus Settings table, or restarting the gateway, restarts
-  every alarm from normal.** A parameter that is still out of limits alarms
-  again after its delay, with a new ALARM email, and nothing is sent for
-  the alarm that was replaced.
-- **Unticking a row's Email Alert, or disabling the row,** drops its alarm
-  silently: no CLEARED email.
+- **Saving the Modbus Settings table keeps active alarms.** Each one stays
+  with the row of the same **Name**, even if rows were added, deleted or
+  moved, and clears with a CLEARED email as usual. So you can correct a
+  Slave ID, address or limit while an alarm is open: once readings are
+  back inside the limits, recipients get the CLEARED email. Removing a
+  row's High or Low limit while that alarm is active clears it at the next
+  reading.
+- **Renaming a row, unticking its Email Alert, or disabling the row,**
+  drops its alarm silently: no CLEARED email. A renamed row still out of
+  limits alarms afresh.
+- **Restarting the gateway** (power cycle or Reboot) starts every alarm
+  from normal. A parameter still out of limits alarms again after its
+  delay, with a new ALARM email.
 - **Switching Email Alerts on** while alarms are already active doesn't
   email them straight away. Each one is emailed at its next reminder, or
   when it clears.
@@ -492,7 +501,9 @@ Each event line gives the parameter, the condition, the reading and limit,
 where it comes from (RTU slave number or TCP target name), and **when it
 happened** — which matters for an email that was held back during an
 outage (§10.6). Cleared events read `CLEARED   TankTemp: back to normal
-(was HIGH) - value 77.000 ...`, and reminders start `STILL IN`.
+(was HIGH) - value 77.000 ...` — or, for a device that has started
+answering again, `CLEARED   Flow2: readings are back - device responding
+again - value 3.200 ...` — and reminders start `STILL IN`.
 
 **All times are UTC** (India Standard Time is UTC + 5:30). Before the
 gateway has the correct time they show as `uptime N s (clock not synced)`.

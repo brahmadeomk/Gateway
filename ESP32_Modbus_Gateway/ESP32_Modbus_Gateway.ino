@@ -857,6 +857,18 @@ struct ParamAlarm {
 };
 
 ParamAlarm paramAlarms[MAX_PARAMS];
+
+// Active alarms held across a Modbus Settings save (see handleSave()).
+// Global rather than passed around: a function taking a sketch-defined type
+// breaks the Arduino prototype generator. Only touched on webTask.
+struct CarriedAlarm {
+  String name;
+  uint8_t cond;
+  unsigned long lastNotifyMs;
+  bool used;
+};
+CarriedAlarm carriedAlarms[MAX_PARAMS];
+int carriedAlarmCount = 0;
 int activeAlarmCount = 0;
 
 // Gateway-wide alert behaviour (Settings -> Email Alerts).
@@ -3084,6 +3096,44 @@ void resetAlarmRuntime(int i) {
   paramAlarms[i].cond = ALARM_COND_NONE;
   paramAlarms[i].sinceMs = 0;
   paramAlarms[i].lastNotifyMs = 0;
+}
+
+// Snapshot every active alarm, by parameter name, before handleSave()
+// rewrites the table. Caller holds dataMutex.
+void collectActiveAlarms() {
+  carriedAlarmCount = 0;
+  for (int i = 0; i < paramCount; i++) {
+    const ParamAlarm &a = paramAlarms[i];
+    if (a.state == ALARM_STATE_ACTIVE || a.state == ALARM_STATE_CLEARING) {
+      CarriedAlarm &c = carriedAlarms[carriedAlarmCount++];
+      c.name = params[i].name;
+      c.cond = a.cond;
+      c.lastNotifyMs = a.lastNotifyMs;
+      c.used = false;
+    }
+  }
+}
+
+// Give row i back the active alarm it had before the save, if a row of the
+// same name had one. It carries on as ACTIVE (a running clear delay
+// restarts - every reading is invalid until the next poll anyway) and
+// clears, with its CLEARED email, the usual way; reminders keep their
+// schedule. A row that no longer has its alert on, or isn't polled, gets
+// nothing back, which drops the alarm silently as before. Caller holds
+// dataMutex.
+void reattachCarriedAlarm(int i) {
+  if (!paramAlarms[i].enabled || !params[i].enabled) return;
+  for (int k = 0; k < carriedAlarmCount; k++) {
+    CarriedAlarm &c = carriedAlarms[k];
+    if (!c.used && c.name == params[i].name) {
+      c.used = true;
+      paramAlarms[i].state = ALARM_STATE_ACTIVE;
+      paramAlarms[i].cond = c.cond;
+      paramAlarms[i].sinceMs = millis();
+      paramAlarms[i].lastNotifyMs = c.lastNotifyMs;
+      return;
+    }
+  }
 }
 
 void loadDefaultAlarms() {
@@ -6278,6 +6328,12 @@ void handleSave() {
 
   xSemaphoreTake(dataMutex, portMAX_DELAY);
 
+  // Active alarms survive the save, matched to the new table by name (rows
+  // can be inserted, deleted or moved). Without this, any edit - fixing a
+  // slave ID included - silently dropped an open alarm, so its recipients
+  // never got the CLEARED email that closes it.
+  collectActiveAlarms();
+
   paramCount = rows;
 
   for (int i = 0; i < paramCount; i++) {
@@ -6345,9 +6401,7 @@ void handleSave() {
     if (params[i].slaveId < 1) params[i].slaveId = 1;
     if (params[i].slaveId > 247) params[i].slaveId = 247;
 
-    // Alarm columns. A blank Low/High means "no limit on that side"; any
-    // saved table change restarts every alarm from NORMAL, since rows may
-    // have moved underneath the old runtime state.
+    // Alarm columns. A blank Low/High means "no limit on that side".
     paramAlarms[i].enabled = server.hasArg("alEn" + index);
     paramAlarms[i].hasLow = parseOptionalFloat(server.arg("alLo" + index), &paramAlarms[i].low);
     paramAlarms[i].hasHigh = parseOptionalFloat(server.arg("alHi" + index), &paramAlarms[i].high);
@@ -6358,6 +6412,7 @@ void handleSave() {
     long delaySec = server.arg("alDl" + index).toInt();
     paramAlarms[i].delaySec = (delaySec < 0) ? 0 : (delaySec > ALARM_MAX_DELAY_S) ? ALARM_MAX_DELAY_S : (uint16_t)delaySec;
     resetAlarmRuntime(i);
+    reattachCarriedAlarm(i);
   }
 
   xSemaphoreGive(dataMutex);
@@ -8851,8 +8906,10 @@ bool alarmRecovered(int i, uint8_t cond) {
   if (!params[i].valid) return false;
   float v = params[i].value;
   switch (cond) {
-    case ALARM_COND_HIGH: return v <= paramAlarms[i].high - paramAlarms[i].deadband;
-    case ALARM_COND_LOW: return v >= paramAlarms[i].low + paramAlarms[i].deadband;
+    // A limit blanked while its alarm is active (kept across a save) means
+    // there is nothing left to breach: the next valid reading clears it.
+    case ALARM_COND_HIGH: return !paramAlarms[i].hasHigh || v <= paramAlarms[i].high - paramAlarms[i].deadband;
+    case ALARM_COND_LOW: return !paramAlarms[i].hasLow || v >= paramAlarms[i].low + paramAlarms[i].deadband;
     default: return true;  // NO DATA: any valid reading ends it
   }
 }
@@ -9110,7 +9167,7 @@ String alertEventDetail(int e) {
   String line;
 
   if (ev.kind == ALERT_EVENT_CLEARED) {
-    line = "CLEARED   " + asciiSafe(ev.name) + ": back to normal (was " + alarmCondText(ev.cond) + ")";
+    line = "CLEARED   " + asciiSafe(ev.name) + ": " + (ev.cond == ALARM_COND_NODATA ? String("readings are back - device responding again") : (String("back to normal (was ") + alarmCondText(ev.cond) + ")"));
     if (ev.valueValid) line += " - value " + String(ev.value, 3);
   } else {
     line = String(ev.kind == ALERT_EVENT_REMINDER ? "STILL IN  " : "ALARM     ") + asciiSafe(ev.name) + ": " + alarmCondText(ev.cond);
