@@ -206,6 +206,14 @@ bool SmtpClient::ReadLine(char* out, size_t out_len) {
                                      sizeof(rx_));
                 if (n == MBEDTLS_ERR_SSL_WANT_READ ||
                     n == MBEDTLS_ERR_SSL_WANT_WRITE) {
+                    // A polled transport (the modem) reports "nothing yet"
+                    // as WANT_READ, so this needs the same overall deadline
+                    // as the plaintext branch - without it a server that
+                    // goes silent mid-session holds the caller forever.
+                    if (static_cast<uint32_t>(millis() - started_ms) >=
+                        kSmtpReplyDeadlineMs) {
+                        return false;
+                    }
                     continue;
                 }
             } else {

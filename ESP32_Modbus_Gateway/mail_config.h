@@ -57,6 +57,8 @@ struct EmailConfig {
     char from[kEmailAddressChars];
     EmailRecipient recipients[kMaxRecipients];
     char subject_prefix[kSubjectPrefixChars];
+    // Allow sending over the cellular modem when WiFi is unavailable.
+    bool send_on_cellular;
 
     EmailConfig();
 };

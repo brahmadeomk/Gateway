@@ -18,7 +18,7 @@ It also has:
 - 4 Digital Inputs, 4 Digital Outputs, and 4 Analog Inputs (local GPIO,
   independent of Modbus).
 - An optional SIM7600G-H cellular modem for automatic failover of the MQTT
-  uplink when WiFi goes down.
+  uplink and email alerts when WiFi goes down.
 - Store-and-forward buffering so a temporary uplink outage doesn't lose data.
 - Email alerts when a Modbus parameter leaves its limits or stops updating
   (§10).
@@ -346,12 +346,17 @@ limits or stops updating. Two places to set it up:
 | Recipients 1–4 | Every recipient gets every alert, in a single email. |
 | Subject Prefix | Starts every subject, e.g. `[Panel-7]`. Blank = the Device Name. |
 | Reminder Interval (min) | Re-sends an alarm that is still active after this long. 0 = never. Default 60. |
+| Cellular | **Send over cellular when WiFi is down** (on by default). Uses SIM data, roughly 10–20 KB per email. See *Delivery* below. |
 | Return to Normal | Also email when an alarm clears. On by default. |
 | No-Data Alarms | Alarm when an alert-enabled parameter has had no valid reading (device not responding / read error) for this many seconds. Default on, 60 s. |
 
 Press **Send Test Email** after saving. It sends a real email the same way
 an alert would, then shows the result under the button (refresh the page
-after ~30 s). A failure names the exact step that failed and what to check:
+after ~30 s), including which path it used (`OK via WiFi` / `OK via
+cellular`). **Test via Cellular** forces the modem path even while WiFi is
+up, so you can prove cellular email works during commissioning without
+unplugging anything. A failure names the exact step that failed and what to
+check:
 
 | Test result says | Check |
 |---|---|
@@ -360,7 +365,8 @@ after ~30 s). A failure names the exact step that failed and what to check:
 | failed at TLS handshake | Security matches the port (587 = STARTTLS, 465 = SSL/TLS) |
 | failed at authentication: server said 535 | Username/password — usually an app password is needed, or SMTP AUTH is disabled for the mailbox |
 | failed at sender address | From must match the login account |
-| not sent: waiting for NTP time sync | The gateway has no internet time yet; secure email checks certificate dates, so it waits |
+| not sent: waiting for a valid clock | The gateway has no correct time yet (NTP over WiFi, or the cellular network's time); secure email checks certificate dates, so it waits |
+| not sent: the cellular data session is not up | (Test via Cellular) check the Dashboard's Cellular Modem box: SIM, network, Data Session, APN |
 
 **2. Settings → Modbus Settings table** (which parameters, and their limits):
 tick **Email Alert** on a row and fill in:
@@ -382,12 +388,26 @@ rather than one each. The subject names the most urgent event, e.g.
 `[Panel-7] ALARM: TankTemp HIGH (+2 more)`; the body lists each event with
 its value, limit, source (RTU slave / TCP target) and time.
 
-**Delivery:** email goes out over WiFi only. During a WiFi outage (including
-cellular failover, §8) alerts wait in a queue of up to 8 emails and are sent
-when WiFi returns; each email lists the time each alarm actually happened.
-A failed send is retried twice more (after 30 s and 60 s), then dropped and
-logged. The Dashboard shows active alarms in red in the Status column, and
-the top box shows the active-alarm count and any emails waiting to send.
+**Delivery:** over WiFi whenever WiFi is connected. If WiFi is down — or
+WiFi is up but can't reach the mail server (the site's internet is down) —
+the email goes over the SIM7600 cellular modem instead, with the same
+secure connection and certificate checks. Cellular email doesn't wait for
+the 3-minute MQTT failover (§8): it's used as soon as WiFi can't deliver.
+While a cellular email is sending (usually 10–20 s), cellular MQTT pauses
+and resumes afterwards.
+
+If neither path is available, alerts wait in a queue of up to 8 emails and
+are sent as soon as one is; each email lists the time each alarm actually
+happened. A failed send is retried twice more (after 30 s and 60 s), then
+dropped and logged.
+
+Secure email needs the correct date. The gateway normally gets it from NTP
+over WiFi; if it starts up while WiFi is down, it gets the time over the
+cellular network instead (`CLOCK SET FROM CELLULAR NETWORK` in the Status
+Log), so cellular email still works after a power cut.
+
+The Dashboard shows active alarms in red in the Status column, and the top
+box shows the active-alarm count and any emails waiting to send.
 
 ---
 
@@ -442,10 +462,13 @@ failed.
 
 **Email alerts**
 `ALARM HIGH/LOW/NO DATA: <name> = <value> (high/low limit <n>)`,
-`CLEARED HIGH/LOW/NO DATA: <name>`, `EMAIL SENT: <subject> (sent to N
-recipients)`, `EMAIL FAILED (attempt N/3), will retry: failed at <step>...`,
-`EMAIL DROPPED after 3 attempts`, `EMAIL QUEUE FULL`, `EMAIL TEST: <result>`,
-`EMAIL SETTINGS SAVED`, `EMAIL ALERT TASK STARTED`.
+`CLEARED HIGH/LOW/NO DATA: <name>`, `EMAIL SENT via WiFi/cellular:
+<subject> (sent to N recipients)`, `EMAIL FAILED via WiFi/cellular (attempt
+N/3), will retry: failed at <step>...`, `EMAIL DROPPED after 3 attempts`,
+`EMAIL QUEUE FULL`, `EMAIL TEST: OK/FAILED via WiFi/cellular - ...`,
+`EMAIL SETTINGS SAVED`, `EMAIL ALERT TASK STARTED`,
+`CLOCK SET FROM CELLULAR NETWORK: <time> (modem NTP / network time)`,
+`CELLULAR NETWORK TIME NOT AVAILABLE - retrying in 10 min`.
 
 **Security**
 `WEB LOGIN OK: <user>`, `WEB LOGIN FAILED (attempt N/5)`,

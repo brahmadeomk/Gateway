@@ -14,7 +14,8 @@ void ClearChars(char* out, size_t len) {
 EmailConfig::EmailConfig()
     : enabled(false),
       port(587),  // STARTTLS, what most providers expect
-      security(kSmtpSecurityStartTls) {
+      security(kSmtpSecurityStartTls),
+      send_on_cellular(true) {
     ClearChars(server, kEmailHostChars);
     ClearChars(username, kEmailUserChars);
     ClearChars(password, kEmailPasswordChars);

@@ -155,6 +155,7 @@
 #include <Preferences.h>
 #include <math.h>
 #include <time.h>
+#include <sys/time.h>
 #include <WiFiClient.h>
 #include <WiFiClientSecure.h>
 // External library: "PubSubClient" by Nick O'Leary, v2.8+ (Arduino Library
@@ -427,11 +428,12 @@ TaskHandle_t alertTaskHandle;
 // results turned into something readable - see cellularTask().
 #define CELLULAR_TASK_CORE 0
 #define CELLULAR_TASK_PRIORITY 1
-// 8KB, not the 4KB the other Core-0 tasks get by default: this task's URC
-// path (consumeCellularInboundMessage -> handleMqttCommand -> ArduinoJson
-// + the write-submission helpers) can nest inside an in-flight AT command
-// wait, stacking both call chains at once.
-#define CELLULAR_TASK_STACK 8192
+// 16KB: this task runs email sends over the modem, so an mbedtls handshake
+// with certificate-chain verification runs on this stack - and the URC path
+// (consumeCellularInboundMessage -> handleMqttCommand -> ArduinoJson + the
+// write-submission helpers) can nest inside the modem socket reads that
+// handshake makes, stacking both call chains at once.
+#define CELLULAR_TASK_STACK 16384
 
 struct CellularStatus {
   bool modemResponding;
@@ -918,10 +920,31 @@ unsigned long lastAlertOverflowLogMs = 0;
 // takes a private copy under alertMutex before each send.
 gwmail::EmailConfig emailConfig;
 
+// One SMTP client for every send. Holds the mbedtls contexts, so it lives
+// here rather than on a task stack. Used by alertTask for WiFi sends and by
+// cellularTask for cellular ones - never both at once, because alertTask
+// blocks until a cellular send it handed over has finished.
+gwmail::SmtpClient alertSmtp;
+gwmail::SocketStream alertSocket;
+
+#define EMAIL_PATH_NONE 0
+#define EMAIL_PATH_WIFI 1
+#define EMAIL_PATH_CELLULAR 2
+
+// Email over cellular: alertTask hands the send to cellularTask - the only
+// task allowed to touch the modem UART - and waits on cellularEmailDone.
+// The pointers stay valid because alertTask is blocked for the whole send.
+volatile bool cellularEmailPending = false;
+const gwmail::EmailConfig *cellularEmailCfg = NULL;
+const gwmail::MimeMessage *cellularEmailMsg = NULL;
+gwmail::SmtpResult cellularEmailResult;
+SemaphoreHandle_t cellularEmailDone;
+
 // Test email: requested by the Settings page, run by alertTask (a send can
 // block for tens of seconds - never on webTask). Result guarded by
 // alertMutex.
 volatile bool emailTestRequested = false;
+volatile bool emailTestViaCellular = false;
 String emailTestResult = "";
 unsigned long emailTestTimestamp = 0;
 bool emailTestTimeIsUtc = false;
@@ -3145,6 +3168,7 @@ bool saveEmailConfig() {
     trackNvsWrite(preferences.putString(("to" + String(i)).c_str(), emailConfig.recipients[i].address));
   }
   trackNvsWrite(preferences.putString("pfx", emailConfig.subject_prefix));
+  trackNvsWrite(preferences.putBool("cell", emailConfig.send_on_cellular));
   trackNvsWrite(preferences.putUShort("rnm", alertSettings.renotifyMin));
   trackNvsWrite(preferences.putBool("clr", alertSettings.sendClear));
   trackNvsWrite(preferences.putBool("nd", alertSettings.noDataAlerts));
@@ -3175,6 +3199,7 @@ void loadEmailConfig() {
     strlcpy(emailConfig.recipients[i].address, preferences.getString(("to" + String(i)).c_str(), "").c_str(), sizeof(emailConfig.recipients[i].address));
   }
   strlcpy(emailConfig.subject_prefix, preferences.getString("pfx", "").c_str(), sizeof(emailConfig.subject_prefix));
+  emailConfig.send_on_cellular = preferences.getBool("cell", true);
   alertSettings.renotifyMin = preferences.getUShort("rnm", 60);
   alertSettings.sendClear = preferences.getBool("clr", true);
   alertSettings.noDataAlerts = preferences.getBool("nd", true);
@@ -5860,7 +5885,7 @@ function toggleApSsidField() {
 
     html += "<div class='box' id='email'>";
     html += "<h2>Email Alerts</h2>";
-    html += "<p><small>Emails when a parameter with <b>Email Alert</b> ticked in the Modbus Settings table goes above its High or below its Low limit, or stops updating (NO DATA). Alerts raised within 10 s of each other share one email. Email is sent over WiFi only; alerts raised during a WiFi outage wait and go out when WiFi returns.</small></p>";
+    html += "<p><small>Emails when a parameter with <b>Email Alert</b> ticked in the Modbus Settings table goes above its High or below its Low limit, or stops updating (NO DATA). Alerts raised within 10 s of each other share one email. Sent over WiFi; when WiFi is down (or WiFi is up but can't reach the mail server), over the cellular modem instead.</small></p>";
 
     if (server.hasArg("emailSaveError")) {
       html += "<div class='error'>Save FAILED - flash may be full. Check the Status Log; email settings may not have persisted across reboot.</div>";
@@ -5894,6 +5919,8 @@ function toggleApSsidField() {
     }
     html += "<tr><th>Subject Prefix</th><td><input type='text' name='emPfx' maxlength='32' placeholder='Blank = Device Name (" + htmlEscape(getDeviceName()) + ")' value='" + htmlEscape(emailConfig.subject_prefix) + "'></td></tr>";
     html += "<tr><th>Reminder Interval (min)</th><td><input type='number' name='emRnm' min='0' max='1440' value='" + String(alertSettings.renotifyMin) + "'><br><small>Re-sends an alarm that is still active after this long. 0 = never.</small></td></tr>";
+    html += "<tr><th>Cellular</th><td><label><input type='checkbox' name='emCell'" + String(emailConfig.send_on_cellular ? " checked" : "") + "> Send over cellular when WiFi is down</label>";
+    html += "<br><small>Uses SIM data - roughly 10-20 KB per email including the secure connection setup.</small></td></tr>";
     html += "<tr><th>Return to Normal</th><td><label><input type='checkbox' name='emClr'" + String(alertSettings.sendClear ? " checked" : "") + "> Email when an alarm clears</label></td></tr>";
     html += "<tr><th>No-Data Alarms</th><td><label><input type='checkbox' name='emNd'" + String(alertSettings.noDataAlerts ? " checked" : "") + "> Alarm when an alert-enabled parameter stops updating</label>";
     html += "<br>after <input type='number' name='emNdd' min='0' max='" + String(ALARM_MAX_DELAY_S) + "' style='width:80px' value='" + String(alertSettings.noDataDelaySec) + "'> s without a valid reading</td></tr>";
@@ -5902,7 +5929,9 @@ function toggleApSsidField() {
     html += "</form>";
 
     html += "<form action='/testEmail' method='POST' style='margin-top:10px'>";
-    html += "<button type='submit'>Send Test Email</button> <small>Uses the <b>saved</b> settings - save first. Works while alerts are switched off.</small>";
+    html += "<button type='submit'>Send Test Email</button> ";
+    html += "<button type='submit' name='via' value='cellular'>Test via Cellular</button> ";
+    html += "<small>Uses the <b>saved</b> settings - save first. Works while alerts are switched off. <b>Test via Cellular</b> sends over the modem even while WiFi is up.</small>";
     html += "</form>";
     if (testResult.length() > 0) {
       html += "<p><b>Last test:</b> " + htmlEscape(testResult);
@@ -6788,6 +6817,7 @@ void handleSaveEmail() {
   AlertSettings as = alertSettings;
 
   cfg.enabled = server.hasArg("emEn");
+  cfg.send_on_cellular = server.hasArg("emCell");
 
   bool fits = copyFormField("emSrv", cfg.server, sizeof(cfg.server))
               && copyFormField("emUser", cfg.username, sizeof(cfg.username))
@@ -6859,6 +6889,7 @@ void handleTestEmail() {
     emailTestTimestamp = 0;
     deviceName.toCharArray(emailTestDeviceName, sizeof(emailTestDeviceName));
     xSemaphoreGive(alertMutex);
+    emailTestViaCellular = (server.arg("via") == "cellular");
     emailTestRequested = true;
   }
 
@@ -7228,6 +7259,7 @@ void setup() {
   serialMutex = xSemaphoreCreateMutex();
   cellularMutex = xSemaphoreCreateMutex();
   alertMutex = xSemaphoreCreateMutex();
+  cellularEmailDone = xSemaphoreCreateBinary();
   pollCompleteSem = xSemaphoreCreateBinary();
   tcpSendDoneSem = xSemaphoreCreateBinary();
   logQueue = xQueueCreate(LOG_QUEUE_LEN, sizeof(LogQueueItem));
@@ -7983,27 +8015,50 @@ bool sendAtCommand(const String &cmd, const String &expectedPrefix, unsigned lon
 // sends the command, waits for the ">" prompt, writes the raw payload
 // bytes, then waits for the final response line (optionally captured in
 // resultLine, for callers that need to parse a trailing error code).
+// Waits for the ">" data prompt. The prompt arrives with no line ending, so
+// it is recognised as a '>' at the start of a line - not anywhere in the
+// stream, where a '>' inside an inbound MQTT payload would be mistaken for
+// it. Complete lines seen meanwhile get the same URC handling as
+// waitForAtResponse(), so an inbound command arriving just before the
+// prompt is processed rather than discarded.
+bool waitForAtPrompt(unsigned long timeoutMs) {
+  unsigned long start = millis();
+  String line;
+
+  while (millis() - start < timeoutMs) {
+    while (SerialAT.available()) {
+      char c = (char)SerialAT.read();
+
+      if (c == '>' && line.length() == 0) {
+        return true;
+      }
+      if (c == '\n') {
+        line.trim();
+        if (line.startsWith("+CMQTTRXSTART:")) {
+          consumeCellularInboundMessage(line);
+        } else if (line.startsWith("+CMQTTCONNLOST:") || line.startsWith("+CMQTTNONET")) {
+          cellularMqttConnLost = true;
+        } else if (line == "ERROR" || line.startsWith("+CME ERROR") || line.startsWith("+CMS ERROR")) {
+          return false;
+        }
+        line = "";
+      } else if (c != '\r' && line.length() < AT_LINE_MAX_LEN) {
+        line += c;
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+
+  return false;
+}
+
 bool sendAtCommandWithData(const String &cmd, const uint8_t *data, size_t len, const String &expectedPrefix, unsigned long timeoutMs, String *resultLine = nullptr) {
   syncCellularUartForCommand();
 
   SerialAT.print(cmd);
   SerialAT.print("\r\n");
 
-  unsigned long start = millis();
-  bool gotPrompt = false;
-
-  while (millis() - start < timeoutMs) {
-    if (SerialAT.available()) {
-      if ((char)SerialAT.read() == '>') {
-        gotPrompt = true;
-        break;
-      }
-    } else {
-      vTaskDelay(pdMS_TO_TICKS(5));
-    }
-  }
-
-  if (!gotPrompt) {
+  if (!waitForAtPrompt(timeoutMs)) {
     return false;
   }
 
@@ -8049,6 +8104,266 @@ bool sendMqttCommand(const String &cmd, const String &resultPrefix, unsigned lon
   if (outResultLine) *outResultLine = resultLine;
 
   return atTrailingErrCode(resultLine, resultPrefix) == 0;
+}
+
+// ===================== Cellular Modem: TCP Socket for Email =====================
+// A plain TCP socket on the modem (AT+CIPOPEN/CIPSEND/CIPRXGET), presented
+// as a gwmail::ByteStream so the same SMTP client - including mbedtls,
+// running on the ESP32, with the same certificate verification - works over
+// cellular unchanged. The modem's own TLS isn't used for email: two TLS
+// implementations would mean two certificate setups to keep in step.
+//
+// cellularTask only: every method talks to SerialAT, and cellularTask is the
+// UART's sole owner. Sends reach it as jobs from alertTask (see
+// serviceCellularEmailJob()).
+//
+// Link 1, not 0: TinyGSM has registered link 0 for cellularTcpClient and
+// parses link-0 socket URCs inside its own status calls.
+#define MODEM_MAIL_LINK 1
+#define MODEM_SOCKET_OPEN_TIMEOUT_MS 30000
+#define MODEM_SOCKET_CMD_TIMEOUT_MS 10000
+// One AT+CIPSEND carries at most this much; a MIME stream goes out in
+// slices of it.
+#define MODEM_SOCKET_CHUNK 1360
+
+// readAtLine() plus the URC handling the rest of the cellular code relies
+// on: an inbound MQTT command block surfacing mid-send is consumed and
+// handled, and a connection-lost notice is recorded - neither is returned.
+bool readModemLine(String &line, unsigned long timeoutMs) {
+  unsigned long start = millis();
+  for (;;) {
+    unsigned long elapsed = millis() - start;
+    if (elapsed >= timeoutMs) return false;
+    if (!readAtLine(line, timeoutMs - elapsed)) return false;
+
+    if (line.startsWith("+CMQTTRXSTART:")) {
+      consumeCellularInboundMessage(line);
+      continue;
+    }
+    if (line.startsWith("+CMQTTCONNLOST:") || line.startsWith("+CMQTTNONET")) {
+      cellularMqttConnLost = true;
+      continue;
+    }
+    return true;
+  }
+}
+
+bool isAtErrorLine(const String &line) {
+  return line == "ERROR" || line.startsWith("+CME ERROR") || line.startsWith("+CMS ERROR") || line.startsWith("+IP ERROR");
+}
+
+class ModemMailStream : public gwmail::ByteStream {
+ public:
+  ModemMailStream() : open_(false), rxLen_(0), rxPos_(0) {}
+
+  bool Open(const char *host, uint16_t port) {
+    rxLen_ = 0;
+    rxPos_ = 0;
+
+    // Closed unconditionally first, not only when this object thinks it is
+    // open: the modem has its own supply and survives an ESP32 reset, so a
+    // reboot mid-send leaves the link open on the module. Every later
+    // CIPOPEN on it would then fail until the modem was power-cycled.
+    sendAtCommand("AT+CIPCLOSE=" + String(MODEM_MAIL_LINK), "+CIPCLOSE:", MODEM_SOCKET_CMD_TIMEOUT_MS);
+    open_ = false;
+
+    // Manual receive: data is pulled with AT+CIPRXGET when the SMTP client
+    // wants it, rather than pushed as unsolicited output racing everything
+    // else on the UART.
+    sendAtCommand("AT+CIPRXGET=1", "OK", MODEM_SOCKET_CMD_TIMEOUT_MS);
+
+    // OK acknowledges the command; "+CIPOPEN: <link>,<err>" reports the
+    // connection, and can take many seconds over cellular. The modem
+    // resolves the name itself, so a DNS failure lands here as a connect
+    // failure.
+    String result;
+    String cmd = "AT+CIPOPEN=" + String(MODEM_MAIL_LINK) + ",\"TCP\",\"" + String(host) + "\"," + String(port);
+    if (!sendAtCommand(cmd, "+CIPOPEN:", MODEM_SOCKET_OPEN_TIMEOUT_MS, &result)) {
+      return false;
+    }
+    open_ = (atTrailingErrCode(result, "+CIPOPEN:") == 0);
+    return open_;
+  }
+
+  bool WriteAll(const char *data, size_t len) {
+    if (!open_) return false;
+
+    size_t sent = 0;
+    while (sent < len) {
+      size_t chunk = len - sent;
+      if (chunk > MODEM_SOCKET_CHUNK) chunk = MODEM_SOCKET_CHUNK;
+
+      // ">" prompt, payload, then "+CIPSEND: <link>,<requested>,<sent>".
+      String cmd = "AT+CIPSEND=" + String(MODEM_MAIL_LINK) + "," + String(chunk);
+      if (!sendAtCommandWithData(cmd, (const uint8_t *)&data[sent], chunk, "+CIPSEND:", MODEM_SOCKET_CMD_TIMEOUT_MS)) {
+        open_ = false;
+        return false;
+      }
+      sent += chunk;
+    }
+    return true;
+  }
+
+  // Returns bytes read, 0 on timeout with the socket still open (the SMTP
+  // client keeps waiting up to its own reply deadline), negative once the
+  // peer has closed.
+  int Read(uint8_t *out, size_t len) {
+    if (!open_ || out == NULL || len == 0) return -1;
+
+    if (rxPos_ < rxLen_) {
+      return takeBuffered(out, len);
+    }
+
+    unsigned long start = millis();
+    while (millis() - start < MODEM_SOCKET_CMD_TIMEOUT_MS) {
+      syncCellularUartForCommand();
+      SerialAT.print("AT+CIPRXGET=2," + String(MODEM_MAIL_LINK) + "," + String(sizeof(rx_)) + "\r\n");
+
+      // The reply is "+CIPRXGET: 2,<link>,<returned>,<remaining>" followed
+      // immediately by exactly <returned> raw bytes, then OK. It is NOT the
+      // only line with that prefix: with manual receive on, the modem also
+      // emits "+CIPRXGET: 1,<link>" the moment data arrives, which carries no
+      // length. Matching the prefix alone mistakes that notice for the
+      // reply and leaves every later reply one message out of step - so the
+      // mode field is checked.
+      int returned = -1;
+      String line;
+      while (readModemLine(line, MODEM_SOCKET_CMD_TIMEOUT_MS)) {
+        if (line.startsWith("+IPCLOSE:")) {
+          if (line.substring(9).toInt() == MODEM_MAIL_LINK) {
+            open_ = false;  // the server hung up
+            return -1;
+          }
+          continue;
+        }
+        if (line.startsWith("+CIPRXGET:")) {
+          int mode = 0, link = 0, avail = 0, rest = 0;
+          if (sscanf(line.c_str(), "+CIPRXGET: %d,%d,%d,%d", &mode, &link, &avail, &rest) == 4 && mode == 2) {
+            returned = avail;
+            break;  // payload follows on the wire right now
+          }
+          continue;
+        }
+        // "+IP ERROR: No data" then ERROR is how the module says the
+        // receive buffer is empty - the normal answer while a server is
+        // still composing its greeting, not a failure.
+        if (isAtErrorLine(line) || line == "OK") break;
+      }
+
+      if (returned > 0) {
+        String payload;
+        bool complete = readAtRawBytes(payload, (size_t)returned, MODEM_SOCKET_CMD_TIMEOUT_MS);
+        readModemLine(line, MODEM_SOCKET_CMD_TIMEOUT_MS);  // the OK closing the reply
+        if (!complete) {
+          open_ = false;  // out of step with the modem - can't trust the stream
+          return -1;
+        }
+        size_t n = payload.length();
+        if (n > sizeof(rx_)) n = sizeof(rx_);
+        memcpy(rx_, payload.c_str(), n);
+        rxLen_ = n;
+        rxPos_ = 0;
+        return takeBuffered(out, len);
+      }
+
+      // Nothing yet. Spaced out so waiting on a slow server isn't hundreds
+      // of AT round trips.
+      vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    return 0;
+  }
+
+  void Close() {
+    if (open_) {
+      sendAtCommand("AT+CIPCLOSE=" + String(MODEM_MAIL_LINK), "+CIPCLOSE:", MODEM_SOCKET_CMD_TIMEOUT_MS);
+    }
+    open_ = false;
+    rxLen_ = 0;
+    rxPos_ = 0;
+  }
+
+  bool connected() const { return open_; }
+
+  gwmail::StreamStage stage() const { return open_ ? gwmail::kStreamOpen : gwmail::kStreamConnect; }
+
+ private:
+  int takeBuffered(uint8_t *out, size_t len) {
+    size_t n = rxLen_ - rxPos_;
+    if (n > len) n = len;
+    memcpy(out, &rx_[rxPos_], n);
+    rxPos_ += n;
+    return (int)n;
+  }
+
+  bool open_;
+  uint8_t rx_[512];
+  size_t rxLen_;
+  size_t rxPos_;
+};
+
+ModemMailStream modemMailStream;
+
+// Runs a send handed over by alertTask (see runEmailOnCellular()). Called
+// only at cellularTask loop level, between AT sequences - never from inside
+// a URC handler. Always completes the job, failing it when the data session
+// is down, so alertTask is never left waiting.
+void serviceCellularEmailJob(bool dataUp) {
+  if (!cellularEmailPending) return;
+
+  if (dataUp) {
+    cellularEmailResult = alertSmtp.Send(*cellularEmailCfg, WiFi.getHostname(), *cellularEmailMsg, &modemMailStream);
+  } else {
+    cellularEmailResult = gwmail::SmtpResult();
+    cellularEmailResult.stage = gwmail::kSmtpStageConnect;
+  }
+
+  cellularEmailPending = false;
+  xSemaphoreGive(cellularEmailDone);
+}
+
+// Days since 1970-01-01 for a proleptic Gregorian date - avoids mktime(),
+// whose result depends on whatever TZ the process happens to have.
+long daysFromCivil(int y, int m, int d) {
+  y -= (m <= 2) ? 1 : 0;
+  long era = (y >= 0 ? y : y - 399) / 400;
+  long yoe = y - era * 400;
+  long doy = (153L * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+  long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + doe - 719468;
+}
+
+// Sets the system clock from the cellular network when NTP over WiFi never
+// has (e.g. a reboot during a WiFi outage). TLS certificate checks compare
+// validity dates against this clock, so without it no secure email can go
+// out over cellular until WiFi returns. The modem fetches
+// NTP over its own data session (AT+CNTP); if that fails its RTC may still
+// hold network-supplied time, which the year check below accepts or rejects.
+bool syncClockFromModem() {
+  sendAtCommand("AT+CNTP=\"" + String(NTP_SERVER_1) + "\",0", "OK", AT_DEFAULT_TIMEOUT_MS);
+  String ntpResult;
+  bool viaNtp = sendAtCommand("AT+CNTP", "+CNTP:", 20000, &ntpResult) && atTrailingErrCode(ntpResult, "+CNTP:") == 0;
+
+  // +CCLK: "yy/MM/dd,hh:mm:ss+zz", zz = offset from UTC in quarter hours.
+  String line;
+  if (!sendAtCommand("AT+CCLK?", "+CCLK:", AT_DEFAULT_TIMEOUT_MS, &line)) return false;
+
+  int yy, mo, dd, hh, mi, ss, quarters;
+  char sign;
+  if (sscanf(line.c_str(), "+CCLK: \"%d/%d/%d,%d:%d:%d%c%d\"", &yy, &mo, &dd, &hh, &mi, &ss, &sign, &quarters) != 8) return false;
+  // An RTC nobody has set reads 1980 or 2000-something; anything before the
+  // year this firmware was written can't be real.
+  if (yy < 24 || mo < 1 || mo > 12 || dd < 1 || dd > 31) return false;
+
+  long offsetSec = (long)quarters * 15 * 60 * (sign == '-' ? -1 : 1);
+  time_t utc = (time_t)(daysFromCivil(2000 + yy, mo, dd) * 86400L + hh * 3600L + mi * 60L + ss - offsetSec);
+
+  struct timeval tv;
+  tv.tv_sec = utc;
+  tv.tv_usec = 0;
+  settimeofday(&tv, NULL);
+
+  logKeyEvent("CLOCK SET FROM CELLULAR NETWORK: " + formatAlertTime((unsigned long)utc, true) + (viaNtp ? " (modem NTP)" : " (network time)"));
+  return isTimeSynced();
 }
 
 // ===================== Cellular Modem: MQTT Certificate Provisioning =====================
@@ -8303,6 +8618,7 @@ void cellularTask(void *parameter) {
   // 0 = "never published this session" - the first publish after a
   // session comes up always goes out immediately, regardless of interval.
   unsigned long lastPublishTime = 0;
+  unsigned long lastModemClockAttemptMs = 0;  // 0 = not tried yet
 
   for (;;) {
     if (!everInitialized) {
@@ -8314,6 +8630,7 @@ void cellularTask(void *parameter) {
         everInitialized = true;
       } else {
         logKeyEvent("CELLULAR MODEM NOT RESPONDING - check wiring/power, retrying");
+        serviceCellularEmailJob(false);
         vTaskDelay(pdMS_TO_TICKS(10000));
         continue;
       }
@@ -8388,6 +8705,17 @@ void cellularTask(void *parameter) {
         && cloudConfig.mode == UPLINK_MODE_MQTT
         && certRootCA.length() > 0 && certDevice.length() > 0 && certPrivKey.length() > 0) {
       certsProvisioned = provisionCellularMqttCerts();
+    }
+
+    // Only while NTP over WiFi has never set the clock, and then at most
+    // every 10 minutes - a SIM with no network time doesn't gain it by
+    // asking every cycle.
+    if (dataConnected && !isTimeSynced()
+        && (lastModemClockAttemptMs == 0 || millis() - lastModemClockAttemptMs >= 600000UL)) {
+      lastModemClockAttemptMs = millis();
+      if (!syncClockFromModem()) {
+        logKeyEvent("CELLULAR NETWORK TIME NOT AVAILABLE - retrying in 10 min");
+      }
     }
 
     // Cellular MQTT is only brought up/published while it's actually the
@@ -8473,6 +8801,7 @@ void cellularTask(void *parameter) {
         drainCellularAckTxQueue();
         drainMqttAckQueueCellular();
       }
+      serviceCellularEmailJob(dataConnected);
       vTaskDelay(pdMS_TO_TICKS(200));
     }
   }
@@ -8716,8 +9045,6 @@ int alertQueueDepth() {
 }
 
 // ===================== Email Alerts: Composition & Sending (alertTask) =====================
-gwmail::SmtpClient alertSmtp;      // holds the mbedtls contexts - too big for a task stack
-gwmail::SocketStream alertSocket;
 AlertEntry alertInFlight;          // alertTask's private copy of the entry being sent
 gwmail::EmailConfig alertCfgCopy;  // ditto for the settings it is sent with
 
@@ -8842,7 +9169,18 @@ String smtpFailureHint(int stage, int code) {
   }
 }
 
-gwmail::SmtpResult sendAlertEmail(const gwmail::EmailConfig &cfg, const String &subject, const String &body) {
+// Hands a send to cellularTask and blocks until it's done. cellularTask
+// always completes the job (failing it if the data session has gone), so
+// this never waits forever; a full send's own deadlines bound how long.
+gwmail::SmtpResult runEmailOnCellular(const gwmail::EmailConfig &cfg, const gwmail::MimeMessage &msg) {
+  cellularEmailCfg = &cfg;
+  cellularEmailMsg = &msg;
+  cellularEmailPending = true;
+  xSemaphoreTake(cellularEmailDone, portMAX_DELAY);
+  return cellularEmailResult;
+}
+
+gwmail::SmtpResult sendAlertEmail(const gwmail::EmailConfig &cfg, const String &subject, const String &body, int path) {
   const gwmail::EmailRecipient *to[gwmail::kMaxRecipients];
   int count = gwmail::SelectRecipients(cfg, to, gwmail::kMaxRecipients);
 
@@ -8856,42 +9194,88 @@ gwmail::SmtpResult sendAlertEmail(const gwmail::EmailConfig &cfg, const String &
   msg.body = body.c_str();
   msg.date = (date.length() > 0) ? date.c_str() : NULL;
 
+  if (path == EMAIL_PATH_CELLULAR) {
+    return runEmailOnCellular(cfg, msg);
+  }
   return alertSmtp.Send(cfg, WiFi.getHostname(), msg, &alertSocket);
 }
 
-// Email only goes out over WiFi. Over TLS it also needs real time:
-// certificate validity dates are checked against the clock, which reads
-// 1970 until NTP syncs.
-bool emailUplinkReady(const gwmail::EmailConfig &cfg, String *whyNot) {
-  if (WiFi.status() != WL_CONNECTED) {
-    if (whyNot) *whyNot = "WiFi is not connected (email is sent over WiFi only)";
-    return false;
+const char *emailPathText(int path) {
+  return (path == EMAIL_PATH_CELLULAR) ? "cellular" : "WiFi";
+}
+
+bool cellularDataUp() {
+  bool up;
+  xSemaphoreTake(cellularMutex, portMAX_DELAY);
+  up = cellularStatus.dataConnected;
+  xSemaphoreGive(cellularMutex);
+  return up;
+}
+
+// Over TLS a send also needs real time: certificate validity dates are
+// checked against the clock, which reads 1970 until NTP over WiFi or the
+// cellular network has set it (see syncClockFromModem()).
+bool emailClockReady(const gwmail::EmailConfig &cfg) {
+  return cfg.security == gwmail::kSmtpSecurityNone || isTimeSynced();
+}
+
+// WiFi whenever it's connected; otherwise the modem, if allowed and its
+// data session is up. EMAIL_PATH_NONE means wait - the queued email keeps
+// its retries for when a path exists.
+int chooseEmailPath(const gwmail::EmailConfig &cfg, String *whyNot) {
+  if (!emailClockReady(cfg)) {
+    if (whyNot) *whyNot = "waiting for a valid clock (NTP over WiFi, or the cellular network time) - TLS certificate checks need it";
+    return EMAIL_PATH_NONE;
   }
-  if (cfg.security != gwmail::kSmtpSecurityNone && !isTimeSynced()) {
-    if (whyNot) *whyNot = "waiting for NTP time sync (TLS certificate checks need a valid clock)";
-    return false;
+  if (WiFi.status() == WL_CONNECTED) return EMAIL_PATH_WIFI;
+  if (cfg.send_on_cellular && cellularDataUp()) return EMAIL_PATH_CELLULAR;
+  if (whyNot) {
+    *whyNot = cfg.send_on_cellular ? "WiFi is not connected and the cellular data session is not up"
+                                   : "WiFi is not connected (sending over cellular is switched off)";
   }
-  return true;
+  return EMAIL_PATH_NONE;
+}
+
+// Sends over the chosen path. A WiFi send that can't even resolve or reach
+// the server - WiFi up but the site's internet down - is retried over
+// cellular straight away, rather than spending a retry and waiting.
+gwmail::SmtpResult sendAlertEmailWithFallback(const gwmail::EmailConfig &cfg, const String &subject, const String &body, int *path) {
+  gwmail::SmtpResult r = sendAlertEmail(cfg, subject, body, *path);
+
+  bool unreachable = (r.stage == gwmail::kSmtpStageDns || r.stage == gwmail::kSmtpStageConnect);
+  if (!r.ok && *path == EMAIL_PATH_WIFI && unreachable && cfg.send_on_cellular && cellularDataUp()) {
+    logMessage("EMAIL: server unreachable over WiFi - retrying over cellular");
+    *path = EMAIL_PATH_CELLULAR;
+    r = sendAlertEmail(cfg, subject, body, *path);
+  }
+  return r;
 }
 
 void sendNextQueuedAlert() {
-  int idx = -1;
-
+  bool enabled;
   xSemaphoreTake(alertMutex, portMAX_DELAY);
-  if (emailConfig.enabled && emailUplinkReady(emailConfig, NULL)) {
-    unsigned long now = millis();
-    for (int q = 0; q < ALERT_QUEUE_DEPTH; q++) {
-      const AlertEntry &e = alertQueue[q];
-      bool ready = e.inUse && !e.sending
-                   && now - e.createdMs >= ALERT_COALESCE_MS
-                   && (long)(now - e.nextAttemptMs) >= 0;
-      if (ready && (idx < 0 || e.createdMs < alertQueue[idx].createdMs)) idx = q;
-    }
-    if (idx >= 0) {
-      alertQueue[idx].sending = true;
-      alertInFlight = alertQueue[idx];
-      alertCfgCopy = emailConfig;
-    }
+  enabled = emailConfig.enabled;
+  if (enabled) alertCfgCopy = emailConfig;
+  xSemaphoreGive(alertMutex);
+
+  if (!enabled) return;
+
+  int path = chooseEmailPath(alertCfgCopy, NULL);
+  if (path == EMAIL_PATH_NONE) return;  // wait for a path; no attempt spent
+
+  int idx = -1;
+  xSemaphoreTake(alertMutex, portMAX_DELAY);
+  unsigned long now = millis();
+  for (int q = 0; q < ALERT_QUEUE_DEPTH; q++) {
+    const AlertEntry &e = alertQueue[q];
+    bool ready = e.inUse && !e.sending
+                 && now - e.createdMs >= ALERT_COALESCE_MS
+                 && (long)(now - e.nextAttemptMs) >= 0;
+    if (ready && (idx < 0 || e.createdMs < alertQueue[idx].createdMs)) idx = q;
+  }
+  if (idx >= 0) {
+    alertQueue[idx].sending = true;
+    alertInFlight = alertQueue[idx];
   }
   xSemaphoreGive(alertMutex);
 
@@ -8899,7 +9283,7 @@ void sendNextQueuedAlert() {
 
   String subject = composeAlertSubject();
   String body = composeAlertBody();
-  gwmail::SmtpResult result = sendAlertEmail(alertCfgCopy, subject, body);
+  gwmail::SmtpResult result = sendAlertEmailWithFallback(alertCfgCopy, subject, body, &path);
 
   char summary[96];
   gwmail::FormatSmtpResult(result, summary, sizeof(summary));
@@ -8924,18 +9308,21 @@ void sendNextQueuedAlert() {
   }
   xSemaphoreGive(alertMutex);
 
+  String via = String(" via ") + emailPathText(path);
   if (result.ok) {
-    logKeyEvent("EMAIL SENT: " + subject + " (" + summary + ")");
+    logKeyEvent("EMAIL SENT" + via + ": " + subject + " (" + summary + ")");
   } else if (dropped) {
-    logKeyEvent("EMAIL DROPPED after " + String(ALERT_MAX_ATTEMPTS) + " attempts: " + subject + " - last error: " + summary);
+    logKeyEvent("EMAIL DROPPED after " + String(ALERT_MAX_ATTEMPTS) + " attempts: " + subject + " - last error" + via + ": " + summary);
   } else {
-    logKeyEvent("EMAIL FAILED (attempt " + String(attempts) + "/" + String(ALERT_MAX_ATTEMPTS) + "), will retry: " + summary + smtpFailureHint(result.stage, result.code));
+    logKeyEvent("EMAIL FAILED" + via + " (attempt " + String(attempts) + "/" + String(ALERT_MAX_ATTEMPTS) + "), will retry: " + summary + smtpFailureHint(result.stage, result.code));
   }
 }
 
 // Runs the full production path - same client, TLS, recipients and MIME -
-// so a passing test means real alerts will get through.
-void runTestEmail() {
+// so a passing test means real alerts will get through. viaCellular forces
+// the modem even while WiFi is up, so cellular can be checked during
+// commissioning without unplugging anything.
+void runTestEmail(bool viaCellular) {
   gwmail::EmailConfig cfg;
   char deviceName[40];
 
@@ -8950,22 +9337,36 @@ void runTestEmail() {
 
   String result;
   String whyNot;
+  int path = EMAIL_PATH_NONE;
   gwmail::EmailValidation v = gwmail::ValidateEmailConfig(cfg);
 
   if (v != gwmail::kEmailOk) {
     result = "not sent: " + String(gwmail::EmailValidationText(v));
-  } else if (!emailUplinkReady(cfg, &whyNot)) {
-    result = "not sent: " + whyNot;
+  } else if (viaCellular) {
+    if (!emailClockReady(cfg)) {
+      result = "not sent: waiting for a valid clock (NTP over WiFi, or the cellular network time) - TLS certificate checks need it";
+    } else if (!cellularDataUp()) {
+      result = "not sent: the cellular data session is not up (check the Cellular Modem box on the Dashboard)";
+    } else {
+      path = EMAIL_PATH_CELLULAR;
+    }
   } else {
+    path = chooseEmailPath(cfg, &whyNot);
+    if (path == EMAIL_PATH_NONE) result = "not sent: " + whyNot;
+  }
+
+  if (path != EMAIL_PATH_NONE) {
     String subject = alertSubjectPrefix(cfg.subject_prefix, deviceName) + "Test email";
     String body = "This is a test email from Modbus Gateway " + asciiSafe(deviceName) + ".\n\n";
     body += "If you can read this, email alerts are configured correctly and will be delivered to this address.\n";
+    body += "Sent over: " + String(viaCellular ? "cellular (forced by the test)" : "the gateway's normal path") + "\n";
     body += "Sent: " + formatAlertTime(getTimestamp(), isTimeSynced()) + "\n";
 
-    gwmail::SmtpResult r = sendAlertEmail(cfg, subject, body);
+    gwmail::SmtpResult r = viaCellular ? sendAlertEmail(cfg, subject, body, path)
+                                       : sendAlertEmailWithFallback(cfg, subject, body, &path);
     char summary[96];
     gwmail::FormatSmtpResult(r, summary, sizeof(summary));
-    result = String(r.ok ? "OK - " : "FAILED - ") + summary + (r.ok ? "" : smtpFailureHint(r.stage, r.code));
+    result = String(r.ok ? "OK via " : "FAILED via ") + emailPathText(path) + " - " + summary + (r.ok ? "" : smtpFailureHint(r.stage, r.code));
   }
 
   xSemaphoreTake(alertMutex, portMAX_DELAY);
@@ -8980,8 +9381,9 @@ void runTestEmail() {
 void alertTask(void *parameter) {
   for (;;) {
     if (emailTestRequested) {
+      bool viaCellular = emailTestViaCellular;
       emailTestRequested = false;
-      runTestEmail();
+      runTestEmail(viaCellular);
     }
     sendNextQueuedAlert();
     vTaskDelay(pdMS_TO_TICKS(500));
