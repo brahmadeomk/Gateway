@@ -180,7 +180,14 @@
 // AP_SSID is only the fallback/default - the actual name used is
 // deviceConfig.apSsid (or the computed device name if apMatchesDeviceName
 // is set), both user-settable on the Settings page. See getEffectiveApSsid().
-#define DEFAULT_AP_SSID "ESP32ModbusGateWay"
+#define DEFAULT_AP_SSID "ModbusGateway"
+// The previous default. A device that saved Device Identity settings
+// before the rename has this stored in NVS - loadDeviceConfig() swaps it
+// for the new default so the chip name stops being broadcast.
+#define LEGACY_DEFAULT_AP_SSID "ESP32ModbusGateWay"
+// DHCP hostname, i.e. the name routers list the device under. Without
+// an explicit one the core advertises "esp32-XXXXXX".
+#define HOSTNAME_PREFIX "Gateway-"
 // Default only - the actual AP password is user-settable (deviceConfig.
 // apPassword, Settings -> Device Identity). WPA2 requires >= 8 chars.
 #define DEFAULT_AP_PASSWORD "12345678"
@@ -1888,7 +1895,7 @@ void loadDeviceConfig() {
 
   preferences.end();
 
-  if (deviceConfig.apSsid.length() == 0) {
+  if (deviceConfig.apSsid.length() == 0 || deviceConfig.apSsid == LEGACY_DEFAULT_AP_SSID) {
     deviceConfig.apSsid = DEFAULT_AP_SSID;
   }
 
@@ -4560,7 +4567,7 @@ void handleRoot() {
 <!DOCTYPE html>
 <html>
 <head>
-  <title>ESP32 Modbus Gateway</title>
+  <title>Modbus Gateway</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     body { font-family: Arial; background:#f5f7fa; margin:15px; }
@@ -4578,7 +4585,7 @@ void handleRoot() {
 </head>
 <body>
 
-<h2>ESP32 Modbus Gateway</h2>
+<h2>Modbus Gateway</h2>
 
 <button class="nav" type="button" onclick="location.href='/settings'">Settings</button>
 <button class="danger" type="button" onclick="location.href='/logout'">Log Out</button>
@@ -4957,7 +4964,7 @@ void handleSettings() {
 <!DOCTYPE html>
 <html>
 <head>
-  <title>ESP32 Modbus Gateway - Settings</title>
+  <title>Modbus Gateway - Settings</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     body { font-family: Arial; background:#f5f7fa; margin:15px; }
@@ -6191,7 +6198,7 @@ void handleLoginPage() {
 <!DOCTYPE html>
 <html>
 <head>
-<title>Login - ESP32 Modbus Gateway</title>
+<title>Login - Modbus Gateway</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 body { font-family: Arial; background:#f5f7fa; margin:15px; }
@@ -6205,7 +6212,7 @@ button { width:100%; padding:10px; background:#0099cc; color:white; border:none;
 </head>
 <body>
 <div class="box">
-<h2>ESP32 Modbus Gateway</h2>
+<h2>Modbus Gateway</h2>
 )rawliteral";
 
   if (server.hasArg("locked")) {
@@ -6495,7 +6502,7 @@ void handleData() {
 
   String json = "{";
   json.reserve(96 + paramCount * 160);  // avoid repeated reallocation while appending below
-  json += "\"device\":\"ESP32 Modbus RTU Gateway\",";
+  json += "\"device\":\"Modbus RTU Gateway\",";
   json += "\"nowMs\":" + String(millis()) + ",";
 
   xSemaphoreTake(dataMutex, portMAX_DELAY);
@@ -6734,6 +6741,19 @@ void setup() {
   loadSettings();
   loadTcpTargets();
   loadDigitalIOSettings();
+
+  // Must be set before WiFi starts or it's ignored. Suffix comes from the
+  // factory (efuse) MAC because WiFi.macAddress() can read as all zeros
+  // before WiFi is up on older cores; on this chip the station MAC equals
+  // the factory MAC, so the suffix matches the "Device WiFi MAC" shown in
+  // Settings. Low byte of getEfuseMac() = first MAC byte.
+  {
+    uint64_t efuseMac = ESP.getEfuseMac();
+    char hostname[24];
+    snprintf(hostname, sizeof(hostname), HOSTNAME_PREFIX "%02X%02X%02X",
+             (uint8_t)(efuseMac >> 24), (uint8_t)(efuseMac >> 32), (uint8_t)(efuseMac >> 40));
+    WiFi.setHostname(hostname);
+  }
 
   WiFi.mode(WIFI_AP_STA);
 

@@ -1,7 +1,4 @@
-# ESP32 Modbus Gateway — User Manual
-
-Firmware: `ESP32_Modbus_Gateway/ESP32_Modbus_Gateway.ino`
-Board: Arduino Nano ESP32 (u-blox NORA-W106)
+# Modbus Gateway — User Manual
 
 ---
 
@@ -51,7 +48,7 @@ never been connected to a router.
 
 1. Power on the device.
 2. On your phone/laptop, connect to the WiFi network:
-   - **SSID**: `ESP32ModbusGateWay` by default (or the device's configured name — see
+   - **SSID**: `ModbusGateway` by default (or the device's configured name — see
      Device Identity in §5)
    - **Password**: `12345678` by default (changeable — see §11)
 3. Open a browser to **`http://192.168.4.1`** and log in:
@@ -170,7 +167,9 @@ add up to 20 custom types, or **Reset Data Types** to restore the defaults.
 - **Device WiFi MAC** — the address your router sees when the gateway
   joins as a client. On MAC-filtered networks, add this address to the
   router's allow list. The device's own hotspot uses a different MAC,
-  which the router never sees.
+  which the router never sees. In the router's client list the device
+  appears as `Gateway-XXXXXX`, where `XXXXXX` is the last six characters
+  of this MAC.
 - **Master IP / Master Port** — target for Raw TCP uplink mode (§6.1).
 - **On-Premise NTP Server** — optional local time server, tried before
   public NTP (`pool.ntp.org`, then `time.nist.gov`).
