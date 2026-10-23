@@ -5454,7 +5454,7 @@ void handleSettings() {
 
     {
       const ParamAlarm &al = paramAlarms[i];
-      html += "<td style='white-space:nowrap'><input type='checkbox' name='alEn" + String(i) + "' title='Email alert on this parameter'" + String(al.enabled ? " checked" : "") + "> ";
+      html += "<td style='white-space:nowrap'><input type='checkbox' name='alEn" + String(i) + "' style='width:auto' title='Email alert on this parameter'" + String(al.enabled ? " checked" : "") + "> ";
       html += "<input name='alLo" + String(i) + "' placeholder='Low' style='width:60px' value='" + String(al.hasLow ? String(al.low, 3) : "") + "'> / ";
       html += "<input name='alHi" + String(i) + "' placeholder='High' style='width:60px' value='" + String(al.hasHigh ? String(al.high, 3) : "") + "'></td>";
       html += "<td style='white-space:nowrap'><input name='alDb" + String(i) + "' placeholder='0' style='width:50px' value='" + String(al.deadband, 3) + "'> / ";
@@ -5612,7 +5612,7 @@ function buildParamRow() {
     <td><input name="addrX" value="0"></td>
     <td><input type="checkbox" name="wrX" onchange="updateWritableFields(this)" disabled></td>
     <td><input name="wminX" placeholder="Min" style="width:70px" value="0" disabled> / <input name="wmaxX" placeholder="Max" style="width:70px" value="0" disabled></td>
-    <td style="white-space:nowrap"><input type="checkbox" name="alEnX" title="Email alert on this parameter"> <input name="alLoX" placeholder="Low" style="width:60px" value=""> / <input name="alHiX" placeholder="High" style="width:60px" value=""></td>
+    <td style="white-space:nowrap"><input type="checkbox" name="alEnX" style="width:auto" title="Email alert on this parameter"> <input name="alLoX" placeholder="Low" style="width:60px" value=""> / <input name="alHiX" placeholder="High" style="width:60px" value=""></td>
     <td style="white-space:nowrap"><input name="alDbX" placeholder="0" style="width:50px" value="0"> / <input name="alDlX" placeholder="0" style="width:50px" value="0"></td>
     <td><input type="checkbox" name="enX" checked></td>
     <td>
