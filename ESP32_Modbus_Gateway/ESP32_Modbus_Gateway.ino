@@ -1101,6 +1101,23 @@ void trackNvsWrite(size_t result) {
   }
 }
 
+// putString() returns strlen(value), so a blank field (an open network's
+// password, an unused recipient) returns 0 even when it was stored. For those,
+// confirm the write by reading it back: a failed write leaves the key missing
+// (the sentinel default comes back) or still holding its old, non-empty value.
+void trackNvsString(const char *key, const char *value) {
+  size_t written = preferences.putString(key, value);
+  if (value[0] != '\0') {
+    trackNvsWrite(written);
+  } else if (preferences.getString(key, "\x01").length() != 0) {
+    nvsWriteFailures++;
+  }
+}
+
+void trackNvsString(const char *key, const String &value) {
+  trackNvsString(key, value.c_str());
+}
+
 // ===================== RS485 Direction Control =====================
 void preTransmission() {
   portENTER_CRITICAL(&rs485Mux);
@@ -1819,7 +1836,7 @@ bool saveCommunicationSettings() {
   preferences.begin("comm", false);
 
   trackNvsWrite(preferences.putUInt("baud", commBaudRate));
-  trackNvsWrite(preferences.putString("parity", commParity));
+  trackNvsString("parity", commParity);
   trackNvsWrite(preferences.putUChar("stop", commStopBits));
   trackNvsWrite(preferences.putUInt("pollms", pollIntervalMs));
   trackNvsWrite(preferences.putUInt("recoveryms", slaveRecoveryDelayMs));
@@ -1877,11 +1894,11 @@ bool saveUplinkConfig() {
   nvsWriteFailures = 0;
   preferences.begin("uplink", false);
 
-  trackNvsWrite(preferences.putString("ssid", uplinkConfig.ssid));
-  trackNvsWrite(preferences.putString("pass", uplinkConfig.password));
-  trackNvsWrite(preferences.putString("ip", uplinkConfig.serverIP));
+  trackNvsString("ssid", uplinkConfig.ssid);
+  trackNvsString("pass", uplinkConfig.password);
+  trackNvsString("ip", uplinkConfig.serverIP);
   trackNvsWrite(preferences.putInt("port", uplinkConfig.port));
-  trackNvsWrite(preferences.putString("ntp", uplinkConfig.ntpServer));
+  trackNvsString("ntp", uplinkConfig.ntpServer);
 
   preferences.end();
 
@@ -1952,10 +1969,10 @@ bool saveCloudConfig() {
   preferences.begin("cloud", false);
 
   trackNvsWrite(preferences.putUChar("mode", cloudConfig.mode));
-  trackNvsWrite(preferences.putString("ep", cloudConfig.endpoint));
+  trackNvsString("ep", cloudConfig.endpoint);
   trackNvsWrite(preferences.putInt("port", cloudConfig.port));
-  trackNvsWrite(preferences.putString("cid", cloudConfig.clientId));
-  trackNvsWrite(preferences.putString("topic", cloudConfig.topic));
+  trackNvsString("cid", cloudConfig.clientId);
+  trackNvsString("topic", cloudConfig.topic);
   trackNvsWrite(preferences.putBool("cmdEn", cloudConfig.commandsEnabled));
 
   preferences.end();
@@ -2004,9 +2021,9 @@ bool saveCerts() {
   nvsWriteFailures = 0;
   preferences.begin("certs", false);
 
-  trackNvsWrite(preferences.putString("ca", certRootCA));
-  trackNvsWrite(preferences.putString("cert", certDevice));
-  trackNvsWrite(preferences.putString("key", certPrivKey));
+  trackNvsString("ca", certRootCA);
+  trackNvsString("cert", certDevice);
+  trackNvsString("key", certPrivKey);
 
   preferences.end();
 
@@ -2032,10 +2049,10 @@ bool saveDeviceConfig() {
   nvsWriteFailures = 0;
   preferences.begin("device", false);
 
-  trackNvsWrite(preferences.putString("apssid", deviceConfig.apSsid));
-  trackNvsWrite(preferences.putString("prefix", deviceConfig.deviceNamePrefix));
+  trackNvsString("apssid", deviceConfig.apSsid);
+  trackNvsString("prefix", deviceConfig.deviceNamePrefix);
   trackNvsWrite(preferences.putBool("apmatch", deviceConfig.apMatchesDeviceName));
-  trackNvsWrite(preferences.putString("appass", deviceConfig.apPassword));
+  trackNvsString("appass", deviceConfig.apPassword);
 
   preferences.end();
 
@@ -2076,7 +2093,7 @@ bool saveCellularConfig() {
   nvsWriteFailures = 0;
   preferences.begin("cellular", false);
 
-  trackNvsWrite(preferences.putString("apn", cellularConfig.apn));
+  trackNvsString("apn", cellularConfig.apn);
   trackNvsWrite(preferences.putUInt("pubint", cellularConfig.publishIntervalMs));
 
   preferences.end();
@@ -2219,9 +2236,9 @@ bool saveAuthConfig() {
   nvsWriteFailures = 0;
   preferences.begin("auth", false);
 
-  trackNvsWrite(preferences.putString("user", authConfig.user));
-  trackNvsWrite(preferences.putString("salt", authConfig.salt));
-  trackNvsWrite(preferences.putString("hash", authConfig.passHash));
+  trackNvsString("user", authConfig.user);
+  trackNvsString("salt", authConfig.salt);
+  trackNvsString("hash", authConfig.passHash);
 
   preferences.end();
 
@@ -3158,16 +3175,16 @@ bool saveEmailConfig() {
   preferences.begin("email", false);
 
   trackNvsWrite(preferences.putBool("en", emailConfig.enabled));
-  trackNvsWrite(preferences.putString("srv", emailConfig.server));
+  trackNvsString("srv", emailConfig.server);
   trackNvsWrite(preferences.putUShort("port", emailConfig.port));
   trackNvsWrite(preferences.putUChar("sec", emailConfig.security));
-  trackNvsWrite(preferences.putString("user", emailConfig.username));
-  trackNvsWrite(preferences.putString("pass", emailConfig.password));
-  trackNvsWrite(preferences.putString("from", emailConfig.from));
+  trackNvsString("user", emailConfig.username);
+  trackNvsString("pass", emailConfig.password);
+  trackNvsString("from", emailConfig.from);
   for (int i = 0; i < gwmail::kMaxRecipients; i++) {
-    trackNvsWrite(preferences.putString(("to" + String(i)).c_str(), emailConfig.recipients[i].address));
+    trackNvsString(("to" + String(i)).c_str(), emailConfig.recipients[i].address);
   }
-  trackNvsWrite(preferences.putString("pfx", emailConfig.subject_prefix));
+  trackNvsString("pfx", emailConfig.subject_prefix);
   trackNvsWrite(preferences.putBool("cell", emailConfig.send_on_cellular));
   trackNvsWrite(preferences.putUShort("rnm", alertSettings.renotifyMin));
   trackNvsWrite(preferences.putBool("clr", alertSettings.sendClear));
