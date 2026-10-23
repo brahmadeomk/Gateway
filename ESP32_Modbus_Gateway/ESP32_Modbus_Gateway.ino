@@ -854,6 +854,11 @@ struct ParamAlarm {
   uint8_t cond;   // ALARM_COND_* being timed (PENDING) or in alarm
   unsigned long sinceMs;
   unsigned long lastNotifyMs;
+  // Start of the current run of invalid readings - lets an active HIGH/LOW
+  // alarm be taken over by NO DATA once the device has been silent for the
+  // no-data delay.
+  bool noDataTiming;
+  unsigned long noDataSinceMs;
 };
 
 ParamAlarm paramAlarms[MAX_PARAMS];
@@ -3096,6 +3101,8 @@ void resetAlarmRuntime(int i) {
   paramAlarms[i].cond = ALARM_COND_NONE;
   paramAlarms[i].sinceMs = 0;
   paramAlarms[i].lastNotifyMs = 0;
+  paramAlarms[i].noDataTiming = false;
+  paramAlarms[i].noDataSinceMs = 0;
 }
 
 // Snapshot every active alarm, by parameter name, before handleSave()
@@ -9039,6 +9046,13 @@ void evaluateParamAlarms() {
 
     uint8_t c = alarmConditionNow(i);
 
+    if (c != ALARM_COND_NODATA) {
+      a.noDataTiming = false;
+    } else if (!a.noDataTiming) {
+      a.noDataTiming = true;
+      a.noDataSinceMs = now;
+    }
+
     switch (a.state) {
       case ALARM_STATE_NORMAL:
         if (c == ALARM_COND_NONE) break;
@@ -9066,11 +9080,23 @@ void evaluateParamAlarms() {
 
       case ALARM_STATE_ACTIVE:
       case ALARM_STATE_CLEARING:
+        // A device that stops answering is reported whatever it was doing:
+        // once it has been silent for the no-data delay, NO DATA takes over
+        // a HIGH/LOW alarm (the value is unknown, so that alarm is neither
+        // cleared nor kept). Before then a short dropout leaves it alone.
+        if (c == ALARM_COND_NODATA && a.cond != ALARM_COND_NODATA &&
+            now - a.noDataSinceMs >= alarmRaiseDelayMs(i, ALARM_COND_NODATA)) {
+          a.cond = ALARM_COND_NODATA;
+          a.state = ALARM_STATE_ACTIVE;
+          a.lastNotifyMs = now;
+          logAlarmTransition(i, "ALARM", a.cond);
+          if (email) queueAlertEvent(i, ALERT_EVENT_ALARM, a.cond);
+          break;
+        }
+
         // A jump straight across from HIGH to LOW (or data returning to a
         // NO DATA alarm already out of limits) is a new alarm in its own
-        // right. Losing data while HIGH/LOW is not - it can't clear the
-        // alarm (alarmRecovered() needs a valid reading) and the original
-        // limit breach stays the thing being reported.
+        // right.
         if ((c == ALARM_COND_HIGH || c == ALARM_COND_LOW) && c != a.cond) {
           a.cond = c;
           a.state = ALARM_STATE_ACTIVE;
@@ -9085,7 +9111,10 @@ void evaluateParamAlarms() {
             a.state = ALARM_STATE_CLEARING;
             a.sinceMs = now;
           }
-          if (now - a.sinceMs >= (unsigned long)a.delaySec * 1000UL) {
+          // NO DATA ends as soon as the device answers again; a limit
+          // alarm needs the recovery to last the row's delay.
+          unsigned long clearDelayMs = (a.cond == ALARM_COND_NODATA) ? 0 : (unsigned long)a.delaySec * 1000UL;
+          if (now - a.sinceMs >= clearDelayMs) {
             uint8_t was = a.cond;
             logAlarmTransition(i, "CLEARED", was);
             if (email && alertSettings.sendClear) queueAlertEvent(i, ALERT_EVENT_CLEARED, was);

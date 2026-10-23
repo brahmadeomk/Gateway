@@ -435,13 +435,21 @@ alarm would have stayed active and the delay would start again next time.
   slave goes into its not-responding pause; a short per-row delay would
   turn both into false alarms. Turn **No-Data Alarms** off to have only
   limit alarms.
+- **A device that stops answering always raises NO DATA**, whatever state
+  the parameter was in: normal, waiting out its Delay, or already in a HIGH
+  or LOW alarm. Once there has been no valid reading for the No-Data time,
+  the alarm becomes **NO DATA** and an ALARM email goes out. A dropout
+  shorter than that leaves things as they were. A HIGH/LOW alarm replaced
+  by NO DATA isn't reported as cleared: the value is simply unknown.
+- **A NO DATA alarm stays active until the device answers again**, or the
+  row's Email Alert or the row itself is disabled. It clears on the first
+  valid reading, without waiting for the row's Delay, with a CLEARED email
+  reading `readings are back - device responding again`. If that first
+  reading is already outside a limit, a new HIGH or LOW alarm is raised
+  instead.
 - **A slave dropping off the bus** gives one NO DATA alarm per alert-enabled
-  parameter on it, all in a single email (§10.5). When it answers again,
-  each one clears with a CLEARED email reading `readings are back - device
-  responding again` (after the row's Delay, if set).
-- **Losing data during a HIGH or LOW alarm** doesn't clear it or turn it
-  into NO DATA. The limit breach stays the alarm being reported until a
-  valid reading shows the value back inside its limit.
+  parameter on it, all in a single email (§10.5), and likewise one CLEARED
+  email when it comes back.
 - **Jumping straight from HIGH to LOW** (or data returning to a NO DATA
   alarm while out of limits) is reported as a new alarm.
 - **Reminders** repeat a still-active alarm every Reminder Interval, as a
