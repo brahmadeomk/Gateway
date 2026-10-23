@@ -78,6 +78,7 @@ The Dashboard is the live-status home page. It refreshes automatically.
   (see §9, Store & Forward).
 - **Email Alerts / Active alarms** — whether email alerts are on, emails
   waiting to send, and how many parameters are currently in alarm (§10).
+  The count and the waiting emails refresh live with the table, every 2 s.
 
 ### Cellular Modem (SIM7600G-H) box
 Only meaningful if a modem is wired in. Shows:
@@ -377,7 +378,7 @@ email alerts. Nothing is emailed until you set it up.
 | Reminder Interval (min) | Re-sends an alarm that is still active after this many minutes, then again every interval. 0 = never. Default 60, maximum 1440 (24 h). |
 | Cellular | **Send over cellular when WiFi is down.** On by default. Uses SIM data — roughly 10–20 KB per email. See §10.6. |
 | Return to Normal | Also email when an alarm clears. On by default. |
-| No-Data Alarms | Alarm when an alert-enabled parameter has had no valid reading for this many seconds (0–3600, default 60). See §10.4. |
+| No-Data Alarms | Alarm when an alert-enabled parameter has had no valid reading for this many seconds (0–3600, default 60). Takes priority over a HIGH or LOW alarm already active, and clears as soon as the device answers again. Untick to have only limit alarms. See §10.4. |
 
 If a save is rejected, a red banner says why and **nothing** is changed:
 `SMTP server is missing or invalid`, `From address is not a valid email
@@ -406,7 +407,7 @@ Each row in the Modbus Settings table has two alert columns:
 | **Email Alert: Low / High** | tick box | Watch this parameter. The row must also be **Enabled** (polled) — a row that isn't polled never alarms. |
 | | Low, High | Alarm when the value goes **below Low** or **above High**. Either can be left blank for no limit on that side; with both blank, the row can only raise NO DATA alarms. Limits are in the same engineering units the Dashboard shows (after the Data Type's scaling). |
 | **Deadband / Delay (s)** | Deadband | Hysteresis. A HIGH alarm only clears once the value is back down to **High − Deadband** or below; a LOW alarm once it is back up to **Low + Deadband** or above. Stops a value hovering on the limit from sending a stream of alarm/clear emails. 0 = clear as soon as it's back inside the limit. |
-| | Delay | How long a breach must last, without a break, before it becomes an alarm — and how long a recovery must last before the alarm clears. Filters out one-poll spikes. 0–3600 s. |
+| | Delay | How long a breach must last, without a break, before it becomes a HIGH/LOW alarm — and how long a recovery must last before that alarm clears. Filters out one-poll spikes. 0–3600 s. Doesn't apply to NO DATA, which uses the gateway-wide No-Data time and clears on the first good reading (§10.4). |
 
 For a Coil or Discrete Input (value 0 or 1): High = `0.5` alarms when it reads
 1; Low = `0.5` alarms when it reads 0.
@@ -450,6 +451,18 @@ alarm would have stayed active and the delay would start again next time.
 - **A slave dropping off the bus** gives one NO DATA alarm per alert-enabled
   parameter on it, all in a single email (§10.5), and likewise one CLEARED
   email when it comes back.
+
+  **Worked example** — tank temperature already in a HIGH alarm (High =
+  80, Delay = 10, No-Data time = 60 s) when the RS485 cable is pulled:
+
+  | Time | What happens |
+  |---|---|
+  | 10:00:00 | Cable pulled. Dashboard Status shows **ERR**, still **ALARM HIGH**. No email yet. |
+  | 10:01:00 | 60 s with no reading: **ALARM NO DATA**, and an ALARM email `ALARM: TankTemp NO DATA`. |
+  | 10:30:00 | Cable plugged back in; the slave answers. If it reads 77: **CLEARED** at once, with `readings are back - device responding again` in the email. If it reads 85: a new **ALARM HIGH** email instead. |
+
+  Had the cable gone back in before 10:01:00, nothing would have changed:
+  the HIGH alarm would simply carry on.
 - **Jumping straight from HIGH to LOW** (or data returning to a NO DATA
   alarm while out of limits) is reported as a new alarm.
 - **Reminders** repeat a still-active alarm every Reminder Interval, as a
@@ -702,6 +715,7 @@ N/3), will retry: failed at <step>...`, `EMAIL DROPPED after 3 attempts`,
 | Test email works but no alert emails arrive | Email Alerts ticked and saved? The row's **Email Alert** ticked and the row **Enabled**? Does the Status Log show `ALARM ...` (alarm raised) and `EMAIL SENT ...`? If sent, check spam/junk folders |
 | Alert emails arrive late | WiFi down and **Cellular** unticked, the data session down, or the gateway waiting for the correct time — the Dashboard top box shows emails waiting (§10.6) |
 | Too many alarm/clear emails | Raise the row's **Deadband** and/or **Delay**, or lengthen the **Reminder Interval** (§10.3) |
+| Pulled a cable but no NO DATA email | Wait the full No-Data time (default 60 s) after the last good reading. Check **No-Data Alarms** is ticked, and the row's **Email Alert** and **Enable** are ticked |
 | NO DATA alarms after every restart | The slave takes longer than the No-Data time to answer after power-up: raise **No-Data Alarms** seconds (§10.4) |
 | Cellular email fails at TCP connect | The mobile network may block that port — use 587 or 465. An internal relay can't be reached over cellular at all (§10.6) |
 | Cellular failback never happens despite WiFi showing Connected | Watch the Dashboard's "Active MQTT Uplink" countdown — if the elapsed-seconds figure keeps resetting instead of climbing to 180s, WiFi is flapping (weak signal/AP issue), not a firmware fault |
