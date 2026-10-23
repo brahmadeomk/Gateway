@@ -2154,6 +2154,14 @@ bool webLoginLockedOut() {
 }
 
 // ===================== WiFi Uplink =====================
+// NULL, not "", for an open network: the core picks the minimum accepted
+// auth mode from the passphrase it's given, and on some core versions an
+// empty string means "WPA2 with an empty key" - which never matches an
+// open access point.
+const char *wifiPassphraseOrNull() {
+  return (uplinkConfig.password.length() > 0) ? uplinkConfig.password.c_str() : NULL;
+}
+
 void connectUplinkWiFi() {
   if (uplinkConfig.ssid.length() == 0) {
     logMessage("UPLINK WIFI NOT CONFIGURED");
@@ -2168,7 +2176,7 @@ void connectUplinkWiFi() {
 
   WiFi.begin(
     uplinkConfig.ssid.c_str(),
-    uplinkConfig.password.c_str());
+    wifiPassphraseOrNull());
 }
 
 void handleUplinkWiFiRetry() {
@@ -2198,7 +2206,7 @@ void handleUplinkWiFiRetry() {
 
     WiFi.begin(
       uplinkConfig.ssid.c_str(),
-      uplinkConfig.password.c_str());
+      wifiPassphraseOrNull());
   }
 }
 
